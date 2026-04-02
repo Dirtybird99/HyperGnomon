@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# MUST-HAVE #2: Concurrency control - cancel in-progress runs on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # MUST-HAVE #3: Job timeout
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # MUST-HAVE #1: Caching via setup-go
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      # Additional cache for golangci-lint
+      - name: Cache golangci-lint
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: ${{ runner.os }}-golangci-${{ hashFiles('.golangci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-golangci-
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::Files need formatting:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          # Check go.mod changes
+          if ! git diff --quiet go.mod; then
+            echo "::error::go.mod is not tidy. Run 'go mod tidy' and commit."
+            git diff go.mod
+            exit 1
+          fi
+          # Check go.sum changes (only if file exists)
+          if [ -f go.sum ] && ! git diff --quiet go.sum; then
+            echo "::error::go.sum is not tidy. Run 'go mod tidy' and commit."
+            git diff go.sum
+            exit 1
+          fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # MUST-HAVE #3: Job timeout
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+          verbose: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # MUST-HAVE #3: Job timeout
+    needs: [lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Verify binary runs
+        run: |
+          # Adjust this to your main package location
+          if [ -f main.go ]; then
+            go build -o app .
+            ./app --version || ./app --help || true
+          fi
+
+  verify-signatures:
+    name: Verify Commit Signatures
+    runs-on: ubuntu-latest
+    timeout-minutes: 5  # MUST-HAVE #3: Job timeout
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify commit signatures
+        run: |
+          echo "Checking commits from ${{ github.event.pull_request.base.sha }} to ${{ github.sha }}"
+
+          unsigned_commits=""
+          for commit in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.sha }}); do
+            if ! git verify-commit "$commit" 2>/dev/null; then
+              unsigned_commits="$unsigned_commits $commit"
+            fi
+          done
+
+          if [ -n "$unsigned_commits" ]; then
+            echo "::error::The following commits are not signed:$unsigned_commits"
+            echo "Please sign your commits with GPG or SSH."
+            echo "See: https://docs.github.com/en/authentication/managing-commit-signature-verification"
+            exit 1
+          fi
+
+          echo "All commits are signed"

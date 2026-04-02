@@ -1,0 +1,71 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# MUST-HAVE #2: Concurrency control
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # MUST-HAVE #3: Job timeout
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # MUST-HAVE #1: Caching
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -count=5 ./... | tee benchmark-results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt
+          retention-days: 30
+
+      - name: Download previous benchmark
+        uses: actions/cache@v4
+        with:
+          path: ./cache
+          key: benchmark-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            benchmark-${{ runner.os }}-
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name != 'pull_request'
+        with:
+          tool: 'go'
+          output-file-path: benchmark-results.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          fail-on-alert: false
+          alert-threshold: '150%'
+          comment-on-alert: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare benchmarks (PR)
+        if: github.event_name == 'pull_request'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'go'
+          output-file-path: benchmark-results.txt
+          external-data-json-path: ./cache/benchmark-data.json
+          fail-on-alert: true
+          alert-threshold: '200%'
+          comment-on-alert: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# MUST-HAVE #2: Concurrency - DO NOT cancel releases!
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # NEVER cancel a release in progress
+
+jobs:
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # MUST-HAVE #3: Job timeout
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          TAG="${{ github.ref_name }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG"
+            echo "Expected format: v1.2.3 or v1.2.3-beta.1"
+            exit 1
+          fi
+          echo "Valid tag: $TAG"
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Verify tag is signed
+        run: |
+          if ! git verify-tag "${{ github.ref_name }}" 2>/dev/null; then
+            echo "::warning::Tag ${{ github.ref_name }} is not signed"
+            echo "Consider signing releases: git tag -s v1.0.0 -m 'Release v1.0.0'"
+          else
+            echo "Tag is signed"
+          fi
+
+      - name: Show changelog preview
+        run: |
+          # Preview changelog (GoReleaser generates the actual changelog)
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since $PREV_TAG:"
+            git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ github.ref_name }}
+          else
+            echo "First release - all commits:"
+            git log --pretty=format:"- %s (%h)" | head -20
+          fi
+
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # MUST-HAVE #3: Job timeout (releases take longer)
+    needs: verify
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # MUST-HAVE #1: Caching
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Import GPG key
+        if: env.GPG_PRIVATE_KEY != ''
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT }}
+
+      - name: Generate SBOM for release
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft . -o spdx-json=sbom-${{ needs.verify.outputs.version }}.spdx.json
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sbom-${{ needs.verify.outputs.version }}.spdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

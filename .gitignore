@@ -1,0 +1,34 @@
+# Binaries
+hypergnomon
+hypergnomon.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Database files
+gnomondb/
+*.db
+*.db.bak
+
+# Test output
+*.test
+*.out
+coverage.html
+*.prof
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Segments temp (parallel sync)
+segments/
