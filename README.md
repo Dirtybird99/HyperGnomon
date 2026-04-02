@@ -38,7 +38,7 @@ go build -o hypergnomon ./cmd/hypergnomon/
 ./hypergnomon --fastsync --turbo
 
 # Custom daemon
-./hypergnomon --daemon-rpc-address=203.0.113.10:10102 --fastsync --turbo
+./hypergnomon --daemon-rpc-address=node.derofoundation.org:11012 --fastsync --turbo --tela-only
 ```
 
 Double-click the binary — it auto-connects to local daemon, LAN nodes, or public nodes with interactive fallback.
