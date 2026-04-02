@@ -1,0 +1,317 @@
+# Taskfile for Go project automation
+# Install: go install github.com/go-task/task/v3/cmd/task@latest
+# Docs: https://taskfile.dev
+
+version: "3"
+
+vars:
+  BINARY_NAME: app
+  MAIN_PACKAGE: ./cmd/app
+  COVERAGE_FILE: coverage.out
+  COVERAGE_HTML: coverage.html
+
+env:
+  CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath"
+
+tasks:
+  # ========================
+  # Default & Help
+  # ========================
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list-all
+    silent: true
+
+  # ========================
+  # Development
+  # ========================
+  dev:
+    desc: Run with live reload (requires air)
+    cmds:
+      - air
+    env:
+      CGO_ENABLED: "1"
+
+  run:
+    desc: Run the application
+    cmds:
+      - go run {{.MAIN_PACKAGE}} {{.CLI_ARGS}}
+
+  # ========================
+  # Building
+  # ========================
+  build:
+    desc: Build the binary
+    cmds:
+      - go build -o {{.BINARY_NAME}} {{.MAIN_PACKAGE}}
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BINARY_NAME}}"
+
+  build:all:
+    desc: Build for all platforms
+    cmds:
+      - task: build:linux
+      - task: build:darwin
+      - task: build:windows
+
+  build:linux:
+    desc: Build for Linux
+    cmds:
+      - GOOS=linux GOARCH=amd64 go build -o dist/{{.BINARY_NAME}}-linux-amd64 {{.MAIN_PACKAGE}}
+      - GOOS=linux GOARCH=arm64 go build -o dist/{{.BINARY_NAME}}-linux-arm64 {{.MAIN_PACKAGE}}
+
+  build:darwin:
+    desc: Build for macOS
+    cmds:
+      - GOOS=darwin GOARCH=amd64 go build -o dist/{{.BINARY_NAME}}-darwin-amd64 {{.MAIN_PACKAGE}}
+      - GOOS=darwin GOARCH=arm64 go build -o dist/{{.BINARY_NAME}}-darwin-arm64 {{.MAIN_PACKAGE}}
+
+  build:windows:
+    desc: Build for Windows
+    cmds:
+      - GOOS=windows GOARCH=amd64 go build -o dist/{{.BINARY_NAME}}-windows-amd64.exe {{.MAIN_PACKAGE}}
+
+  # ========================
+  # Testing
+  # ========================
+  test:
+    desc: Run all tests
+    cmds:
+      - go test -v -race ./...
+    env:
+      CGO_ENABLED: "1"
+
+  test:short:
+    desc: Run short tests only
+    cmds:
+      - go test -v -short ./...
+
+  test:coverage:
+    desc: Run tests with coverage report
+    cmds:
+      - go test -v -race -coverprofile={{.COVERAGE_FILE}} -covermode=atomic ./...
+      - go tool cover -html={{.COVERAGE_FILE}} -o {{.COVERAGE_HTML}}
+      - echo "Coverage report generated at {{.COVERAGE_HTML}}"
+    env:
+      CGO_ENABLED: "1"
+
+  test:coverage:view:
+    desc: View coverage in browser
+    deps: [test:coverage]
+    cmds:
+      - open {{.COVERAGE_HTML}} || xdg-open {{.COVERAGE_HTML}} || start {{.COVERAGE_HTML}}
+
+  test:integration:
+    desc: Run integration tests
+    cmds:
+      - go test -v -tags=integration -timeout=15m ./...
+    env:
+      INTEGRATION_TEST: "true"
+
+  # ========================
+  # Benchmarks
+  # ========================
+  bench:
+    desc: Run benchmarks
+    cmds:
+      - go test -bench=. -benchmem -count=5 ./... | tee benchmark-results.txt
+
+  bench:compare:
+    desc: Compare benchmarks with previous run
+    cmds:
+      - |
+        if [ -f benchmark-results-prev.txt ]; then
+          benchstat benchmark-results-prev.txt benchmark-results.txt
+        else
+          echo "No previous benchmark results found. Run 'task bench' first, then 'mv benchmark-results.txt benchmark-results-prev.txt'"
+        fi
+
+  # ========================
+  # Linting & Formatting
+  # ========================
+  lint:
+    desc: Run all linters
+    cmds:
+      - golangci-lint run
+
+  lint:fix:
+    desc: Run linters and fix issues
+    cmds:
+      - golangci-lint run --fix
+
+  fmt:
+    desc: Format all Go files
+    cmds:
+      - gofmt -s -w .
+      - goimports -w .
+
+  fmt:check:
+    desc: Check if code is formatted
+    cmds:
+      - test -z "$(gofmt -l .)" || (echo "Files need formatting:" && gofmt -l . && exit 1)
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  # ========================
+  # Dependencies
+  # ========================
+  deps:
+    desc: Download dependencies
+    cmds:
+      - go mod download
+
+  deps:tidy:
+    desc: Tidy go.mod and go.sum
+    cmds:
+      - go mod tidy
+
+  deps:verify:
+    desc: Verify dependencies
+    cmds:
+      - go mod verify
+
+  deps:update:
+    desc: Update all dependencies
+    cmds:
+      - go get -u ./...
+      - go mod tidy
+
+  deps:vuln:
+    desc: Check for vulnerabilities
+    cmds:
+      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      - govulncheck ./...
+
+  # ========================
+  # Code Generation
+  # ========================
+  generate:
+    desc: Run go generate
+    cmds:
+      - go generate ./...
+
+  # ========================
+  # Security
+  # ========================
+  security:
+    desc: Run all security checks
+    cmds:
+      - task: security:vuln
+      - task: security:gosec
+      - task: security:secrets
+
+  security:vuln:
+    desc: Check for known vulnerabilities
+    cmds:
+      - govulncheck ./...
+
+  security:gosec:
+    desc: Run gosec security scanner
+    cmds:
+      - gosec -quiet ./...
+
+  security:secrets:
+    desc: Scan for secrets with gitleaks
+    cmds:
+      - gitleaks detect --source . --verbose
+
+  # ========================
+  # Documentation
+  # ========================
+  docs:
+    desc: Generate and serve documentation
+    cmds:
+      - go install golang.org/x/pkgsite/cmd/pkgsite@latest
+      - pkgsite -open .
+
+  # ========================
+  # Release
+  # ========================
+  release:snapshot:
+    desc: Create a snapshot release (no publish)
+    cmds:
+      - goreleaser release --snapshot --clean
+
+  release:check:
+    desc: Validate goreleaser config
+    cmds:
+      - goreleaser check
+
+  # ========================
+  # Docker
+  # ========================
+  docker:build:
+    desc: Build Docker image
+    cmds:
+      - docker build -t {{.BINARY_NAME}}:latest .
+
+  docker:run:
+    desc: Run Docker container
+    cmds:
+      - docker run --rm {{.BINARY_NAME}}:latest
+
+  # ========================
+  # Cleaning
+  # ========================
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf {{.BINARY_NAME}} {{.BINARY_NAME}}.exe
+      - rm -rf dist/
+      - rm -rf {{.COVERAGE_FILE}} {{.COVERAGE_HTML}}
+      - rm -rf benchmark-results.txt
+      - go clean -cache -testcache
+
+  clean:all:
+    desc: Clean everything including module cache
+    cmds:
+      - task: clean
+      - go clean -modcache
+
+  # ========================
+  # Install Tools
+  # ========================
+  tools:
+    desc: Install all required tools
+    cmds:
+      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+      - go install golang.org/x/vuln/cmd/govulncheck@latest
+      - go install github.com/securego/gosec/v2/cmd/gosec@latest
+      - go install github.com/goreleaser/goreleaser@latest
+      - go install golang.org/x/tools/cmd/goimports@latest
+      - go install github.com/cosmtrek/air@latest
+      - echo "All tools installed successfully"
+
+  # ========================
+  # CI Pipeline (local)
+  # ========================
+  ci:
+    desc: Run full CI pipeline locally
+    cmds:
+      - task: deps:tidy
+      - task: fmt:check
+      - task: vet
+      - task: lint
+      - task: test:coverage
+      - task: build
+      - echo "CI pipeline completed successfully"
+
+  # ========================
+  # Pre-commit Hook
+  # ========================
+  pre-commit:
+    desc: Run pre-commit checks
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: lint
+      - task: test:short
