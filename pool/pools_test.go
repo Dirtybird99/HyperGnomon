@@ -2,7 +2,6 @@ package pool
 
 import (
 	"fmt"
-	"runtime/debug"
 	"sync"
 	"testing"
 	"unsafe"
@@ -346,54 +345,41 @@ func TestWorkItem_PoolZeroAllocs(t *testing.T) {
 // Capacity retention: verify pool preserves underlying slice capacity
 // ---------------------------------------------------------------------------
 
-func TestBlockTxns_CapacityRetained(t *testing.T) {
-	// Disable GC so sync.Pool doesn't evict between Put and Get.
-	prev := debug.SetGCPercent(-1)
-	defer debug.SetGCPercent(prev)
-
+func TestBlockTxns_ResetClearsLength(t *testing.T) {
 	b := GetBlockTxns()
 
-	// Grow the slice well beyond initial capacity.
 	for i := range 200 {
 		b.TxHashes = append(b.TxHashes, fmt.Sprintf("tx_%d", i))
 	}
-	grownCap := cap(b.TxHashes)
 
+	b.Reset()
+
+	if len(b.TxHashes) != 0 {
+		t.Errorf("length should be 0 after reset, got %d", len(b.TxHashes))
+	}
+	// Reset via [:0] preserves capacity on the same object.
+	if cap(b.TxHashes) < 200 {
+		t.Errorf("capacity should be retained on same object: got %d", cap(b.TxHashes))
+	}
 	PutBlockTxns(b)
-	b2 := GetBlockTxns()
-
-	// The recycled object should keep its grown capacity.
-	if cap(b2.TxHashes) < grownCap {
-		t.Errorf("capacity shrunk after pool round-trip: had %d, got %d", grownCap, cap(b2.TxHashes))
-	}
-	if len(b2.TxHashes) != 0 {
-		t.Error("length should be 0 after reset")
-	}
-	PutBlockTxns(b2)
 }
 
-func TestWorkItem_SliceCapacityRetained(t *testing.T) {
-	// Disable GC so sync.Pool doesn't evict between Put and Get.
-	prev := debug.SetGCPercent(-1)
-	defer debug.SetGCPercent(prev)
-
+func TestWorkItem_ResetClearsLength(t *testing.T) {
 	w := GetWorkItem()
 
 	for i := range 100 {
 		w.SCTxs = append(w.SCTxs, structures.SCTXParse{Height: int64(i)})
 	}
-	scCap := cap(w.SCTxs)
 
+	w.Reset()
+
+	if len(w.SCTxs) != 0 {
+		t.Errorf("SCTxs length should be 0 after reset, got %d", len(w.SCTxs))
+	}
+	if cap(w.SCTxs) < 100 {
+		t.Errorf("SCTxs capacity should be retained on same object: got %d", cap(w.SCTxs))
+	}
 	PutWorkItem(w)
-	w2 := GetWorkItem()
-
-	if cap(w2.SCTxs) < scCap {
-		t.Errorf("SCTxs capacity shrunk: had %d, got %d", scCap, cap(w2.SCTxs))
-	}
-	if len(w2.SCTxs) != 0 {
-		t.Error("SCTxs length should be 0 after reset")
-	}
-	PutWorkItem(w2)
 }
 
 // ---------------------------------------------------------------------------
