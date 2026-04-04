@@ -36,7 +36,7 @@ type Indexer struct {
 	Endpoint       string
 	DBDir          string
 	ParallelBlocks int
-	BatchSize      int  // blocks per DB flush
+	BatchSize      int   // blocks per DB flush
 	TurboMode      bool  // skip GetSC during scan, fetch variables post-scan
 	AdaptBatchSize bool  // dynamically adjust batch size based on flush latency
 	RecentBlocks   int64 // scan only last N blocks (0 = all)

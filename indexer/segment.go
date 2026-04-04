@@ -657,7 +657,7 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 				var n int64
 				fmt.Sscanf(string(v), "%d", &n)
 				batch.NormTxCount += n
-			// lastindexedheight is set by the caller after merge, skip here
+				// lastindexedheight is set by the caller after merge, skip here
 			}
 			return nil
 		})

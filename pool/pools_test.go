@@ -2,6 +2,7 @@ package pool
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"unsafe"
@@ -346,6 +347,10 @@ func TestWorkItem_PoolZeroAllocs(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBlockTxns_CapacityRetained(t *testing.T) {
+	// Disable GC so sync.Pool doesn't evict between Put and Get.
+	prev := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(prev)
+
 	b := GetBlockTxns()
 
 	// Grow the slice well beyond initial capacity.
@@ -368,6 +373,10 @@ func TestBlockTxns_CapacityRetained(t *testing.T) {
 }
 
 func TestWorkItem_SliceCapacityRetained(t *testing.T) {
+	// Disable GC so sync.Pool doesn't evict between Put and Get.
+	prev := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(prev)
+
 	w := GetWorkItem()
 
 	for i := range 100 {

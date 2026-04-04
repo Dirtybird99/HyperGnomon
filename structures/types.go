@@ -81,22 +81,22 @@ type SCIDInfo struct {
 
 // GetInfoResult caches daemon getinfo response.
 type GetInfoResult struct {
-	Height    int64
-	TopoHeight int64
+	Height       int64
+	TopoHeight   int64
 	StableHeight int64
-	Status    string
+	Status       string
 }
 
 // WorkItem flows through the pipeline stages. Recycled via sync.Pool.
 type WorkItem struct {
-	Height     int64
-	BlockTxns  *BlockTxns
-	SCTxs      []SCTXParse
-	RegCount   int64
-	BurnCount  int64
-	NormCount  int64
-	NormalTxs  []NormalTXWithSCIDParse
-	Err        error
+	Height    int64
+	BlockTxns *BlockTxns
+	SCTxs     []SCTXParse
+	RegCount  int64
+	BurnCount int64
+	NormCount int64
+	NormalTxs []NormalTXWithSCIDParse
+	Err       error
 }
 
 func (w *WorkItem) Reset() {
