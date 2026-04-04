@@ -1,12 +1,13 @@
 package storage
 
 import (
-	"github.com/vmihailenco/msgpack/v5"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/hypergnomon/hypergnomon/structures"
 	"github.com/sirupsen/logrus"
@@ -17,15 +18,15 @@ var logger = logrus.WithField("pkg", "storage")
 
 // Bucket names
 var (
-	bucketStats    = []byte("stats")
-	bucketOwners   = []byte("owners")
-	bucketHeaders  = []byte("headers")
-	bucketClass    = []byte("class")
-	bucketTags     = []byte("tags")
-	bucketHeight   = []byte("height")
-	bucketScVars   = []byte("scvars")
-	bucketNormTx   = []byte("normaltxwithscid")
-	bucketInvalid  = []byte("invalidscidinvokes")
+	bucketStats   = []byte("stats")
+	bucketOwners  = []byte("owners")
+	bucketHeaders = []byte("headers")
+	bucketClass   = []byte("class")
+	bucketTags    = []byte("tags")
+	bucketHeight  = []byte("height")
+	bucketScVars  = []byte("scvars")
+	bucketNormTx  = []byte("normaltxwithscid")
+	bucketInvalid = []byte("invalidscidinvokes")
 )
 
 // BboltStore implements Storage backed by BoltDB.
@@ -43,7 +44,7 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 	dbPath := filepath.Join(dbDir, "HYPERGNOMON.db")
 
 	db, err := bolt.Open(dbPath, 0600, &bolt.Options{
-		Timeout:      0, // 0 = wait indefinitely for lock
+		Timeout:      0,    // 0 = wait indefinitely for lock
 		NoGrowSync:   true, // skip fsync on db file growth — safe because NoSync already skips fsync
 		NoSync:       true, // skip fsync during initial sync for speed; call EnableSync() at chain tip
 		FreelistType: bolt.FreelistMapType,

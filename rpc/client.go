@@ -44,9 +44,9 @@ func (c *Client) Connect() error {
 	}
 
 	dialer := websocket.Dialer{
-		ReadBufferSize:   65536, // 64KB (up from 4KB default)
-		WriteBufferSize:  65536,
-		HandshakeTimeout: 3 * time.Second,
+		ReadBufferSize:    65536, // 64KB (up from 4KB default)
+		WriteBufferSize:   65536,
+		HandshakeTimeout:  3 * time.Second,
 		EnableCompression: true,
 	}
 	ws, _, err := dialer.Dial("ws://"+c.Endpoint+"/ws", nil)

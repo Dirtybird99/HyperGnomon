@@ -71,11 +71,11 @@ func NewWSServer(addr string, store storage.Storage) *WSServer {
 		},
 	}
 	ws.methods = map[string]methodHandler{
-		"GetAllOwnersAndSCIDs":              ws.handleGetAllOwnersAndSCIDs,
-		"GetAllSCIDs":                       ws.handleGetAllSCIDs,
+		"GetAllOwnersAndSCIDs":               ws.handleGetAllOwnersAndSCIDs,
+		"GetAllSCIDs":                        ws.handleGetAllSCIDs,
 		"GetSCIDVariableDetailsAtTopoheight": ws.handleGetSCIDVariableDetailsAtTopoheight,
-		"GetSCIDInteractionHeight":          ws.handleGetSCIDInteractionHeight,
-		"GetAllSCIDInvokeDetails":           ws.handleGetAllSCIDInvokeDetails,
+		"GetSCIDInteractionHeight":           ws.handleGetSCIDInteractionHeight,
+		"GetAllSCIDInvokeDetails":            ws.handleGetAllSCIDInvokeDetails,
 	}
 	return ws
 }

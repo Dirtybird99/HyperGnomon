@@ -56,12 +56,12 @@ type Storage interface {
 // This is the arena pattern applied to database writes:
 // accumulate everything, flush once, instead of per-item writes.
 type WriteBatch struct {
-	Owners       map[string]string                          // scid -> owner
-	Invocations  []structures.InvokeRecord                  // all invocations
+	Owners       map[string]string                               // scid -> owner
+	Invocations  []structures.InvokeRecord                       // all invocations
 	Variables    map[string]map[int64][]*structures.SCIDVariable // scid -> height -> vars
-	Heights      map[string][]int64                          // scid -> interaction heights
-	NormalTxs    map[string][]*structures.NormalTXWithSCIDParse // addr -> txs
-	InvalidSCIDs map[string]uint64                           // scid -> fees
+	Heights      map[string][]int64                              // scid -> interaction heights
+	NormalTxs    map[string][]*structures.NormalTXWithSCIDParse  // addr -> txs
+	InvalidSCIDs map[string]uint64                               // scid -> fees
 	RegTxCount   int64
 	BurnTxCount  int64
 	NormTxCount  int64

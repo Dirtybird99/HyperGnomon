@@ -29,8 +29,8 @@ const (
 // These contracts are massive (e.g. SC Market at 47MB) and definitely not TELA apps.
 // Excluding them saves expensive GetSC calls during fastsync probe.
 var DefaultExclusions = []string{
-	NameServiceSCID,      // Nameservice
-	GnomonSCID_Mainnet,   // GnomonSC itself
+	NameServiceSCID,    // Nameservice
+	GnomonSCID_Mainnet, // GnomonSC itself
 }
 
 // Logger is the package-level logger
