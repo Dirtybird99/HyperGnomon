@@ -218,15 +218,17 @@ func main() {
 		idx.Close()
 	}()
 
-	// Start API servers (deferred until after fastsync/segment-sync complete)
-	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress)
+	// Start API servers (deferred until after fastsync/segment-sync complete).
+	// &idx.SafeHeight gives the api package a live read of the finality-lag
+	// height without pulling in an indexer import.
+	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress, &idx.SafeHeight)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			structures.Logger.Errorf("HTTP API server error: %v", err)
 		}
 	}()
 
-	wsServer := api.NewWSServer(*wsAddress, idx.Store)
+	wsServer := api.NewWSServer(*wsAddress, idx.Store, &idx.SafeHeight)
 	go func() {
 		if err := wsServer.Start(); err != nil {
 			structures.Logger.Errorf("WebSocket server error: %v", err)

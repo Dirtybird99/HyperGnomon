@@ -2,10 +2,11 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -21,17 +22,37 @@ type Server struct {
 	pool       *rpc.Pool
 	listenAddr string
 
+	// safeHeight is a pointer to the indexer's atomic.Int64 tracking
+	// max(LastIndexedHeight - FinalityDepth, 0). A pointer keeps the api
+	// package free of an indexer import while still giving clients a live
+	// read. nil is tolerated (returns 0) so callers that don't care can
+	// skip wiring it up.
+	safeHeight *atomic.Int64
+
 	mu         sync.RWMutex
 	cachedInfo *structures.GetInfoResult
 }
 
 // NewServer creates a new API server.
-func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string) *Server {
+//
+// safeHeight may be nil; handlers treat nil as zero. Passing a pointer to
+// indexer.Indexer.SafeHeight lets the API expose live safe-height reads
+// without the api package importing indexer.
+func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string, safeHeight *atomic.Int64) *Server {
 	return &Server{
 		store:      store,
 		pool:       pool,
 		listenAddr: listenAddr,
+		safeHeight: safeHeight,
 	}
+}
+
+// loadSafeHeight returns the current safe height, or 0 if not wired.
+func (s *Server) loadSafeHeight() int64 {
+	if s.safeHeight == nil {
+		return 0
+	}
+	return s.safeHeight.Load()
 }
 
 // Start registers routes and begins serving HTTP requests.
@@ -49,6 +70,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/scidprivtx", s.handleSCIDPrivTx).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela", s.handleGetTELA).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela/count", s.handleGetTELACount).Methods(http.MethodGet)
+	r.HandleFunc("/api/address/{address}/scs", s.handleGetAddress).Methods(http.MethodGet)
 
 	// Start background info caching
 	go s.refreshInfoLoop()
@@ -98,6 +120,11 @@ func (s *Server) refreshInfo() {
 // --- Handlers ---
 
 // handleGetInfo returns cached daemon info.
+//
+// The response is a struct-like map rather than the bare GetInfoResult so we
+// can tack on indexer-specific fields (safe_height) without changing the
+// shared cache type. Existing field names are preserved verbatim for back-
+// compat with callers that learned them from pre-M1 responses.
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	info := s.cachedInfo
@@ -107,7 +134,13 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "daemon info not yet available")
 		return
 	}
-	writeJSON(w, http.StatusOK, info)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"Height":       info.Height,
+		"TopoHeight":   info.TopoHeight,
+		"StableHeight": info.StableHeight,
+		"Status":       info.Status,
+		"safe_height":  s.loadSafeHeight(),
+	})
 }
 
 // handleGetStats returns indexer statistics.
@@ -134,6 +167,7 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		"app_name":       structures.AppName,
 		"version":        structures.Version,
 		"index_height":   indexHeight,
+		"safe_height":    s.loadSafeHeight(),
 		"sc_count":       len(scids),
 		"reg_tx_count":   reg,
 		"burn_tx_count":  burn,
@@ -268,10 +302,18 @@ func (s *Server) handleSCIDPrivTx(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetTELA returns all discovered TELA SCIDs with their metadata.
+// Uses the class index (Route B) for an O(1) prefix scan instead of the old
+// O(N * 3-reads) iteration over every SCID. Accepts an optional ?class= query
+// param (defaults to "TELA-INDEX-1"; "TELA-DOC-1" is the other common value).
 func (s *Server) handleGetTELA(w http.ResponseWriter, r *http.Request) {
-	scids, err := s.store.GetAllSCIDs()
+	class := r.URL.Query().Get("class")
+	if class == "" {
+		class = "TELA-INDEX-1"
+	}
+
+	installs, err := s.store.GetClassInstalls(class, 0)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get SCIDs: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to get class installs: "+err.Error())
 		return
 	}
 
@@ -284,41 +326,78 @@ func (s *Server) handleGetTELA(w http.ResponseWriter, r *http.Request) {
 		Owner       string `json:"owner,omitempty"`
 	}
 
-	apps := make([]telaApp, 0)
-	for _, scid := range scids {
-		owner, _ := s.store.GetOwner(scid)
-		heights, _ := s.store.GetSCIDInteractionHeights(scid)
-		if len(heights) == 0 {
-			continue
+	apps := make([]telaApp, 0, len(installs))
+	for _, inst := range installs {
+		owner, _ := s.store.GetOwner(inst.SCID)
+		app := telaApp{
+			SCID:  inst.SCID,
+			Owner: owner,
 		}
-		latestHeight := heights[len(heights)-1]
-		vars, _ := s.store.GetSCIDVariableDetailsAtHeight(scid, latestHeight)
-
-		app := telaApp{SCID: scid, Owner: owner}
-		for _, v := range vars {
-			key, _ := v.Key.(string)
-			val := fmt.Sprintf("%v", v.Value)
-			switch key {
-			case "nameHdr":
-				app.Name = val
-			case "descrHdr":
-				app.Description = val
-			case "dURL":
-				app.DURL = val
-			case "telaVersion":
-				app.Version = val
-			case "docVersion":
-				app.Version = val
-			}
+		if inst.Meta != nil {
+			app.Name = inst.Meta.Name
+			app.Description = inst.Meta.Desc
 		}
-		if app.Name != "" || app.DURL != "" || app.Version != "" {
-			apps = append(apps, app)
-		}
+		// DURL and Version are not yet captured on ClassMeta (M0); leave blank.
+		apps = append(apps, app)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"tela_apps": apps,
 		"count":     len(apps),
+	})
+}
+
+// handleGetAddress returns the list of SCIDs an address has interacted with,
+// enriched with class + name. Sorted by last_height descending so the most
+// recently-touched SCIDs come first.
+func (s *Server) handleGetAddress(w http.ResponseWriter, r *http.Request) {
+	addr := mux.Vars(r)["address"]
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing required path parameter: address")
+		return
+	}
+
+	entries, err := s.store.GetAddressSCIDs(addr)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get address SCIDs: "+err.Error())
+		return
+	}
+
+	type scidEntry struct {
+		SCID        string `json:"scid"`
+		FirstHeight int64  `json:"first_height"`
+		LastHeight  int64  `json:"last_height"`
+		Count       int64  `json:"count"`
+		Class       string `json:"class,omitempty"`
+		Name        string `json:"name,omitempty"`
+	}
+
+	out := make([]scidEntry, 0, len(entries))
+	for scid, e := range entries {
+		if e == nil {
+			continue
+		}
+		item := scidEntry{
+			SCID:        scid,
+			FirstHeight: e.FirstHeight,
+			LastHeight:  e.LastHeight,
+			Count:       e.Count,
+		}
+		if meta, _ := s.store.GetSCIDClass(scid); meta != nil {
+			item.Class = meta.Class
+			item.Name = meta.Name
+		}
+		out = append(out, item)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastHeight > out[j].LastHeight
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"address": addr,
+		"scids":   out,
+		"count":   len(out),
 	})
 }
 

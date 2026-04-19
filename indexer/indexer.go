@@ -40,11 +40,22 @@ type Indexer struct {
 	TurboMode      bool  // skip GetSC during scan, fetch variables post-scan
 	AdaptBatchSize bool  // dynamically adjust batch size based on flush latency
 	RecentBlocks   int64 // scan only last N blocks (0 = all)
+	FinalityDepth  int64 // blocks behind tip considered "safe" (default 10)
 
 	// Backends
 	RPCPool *hgrpc.Pool
 	Store   storage.Storage
 	Closing atomic.Bool
+
+	// Route B finality: SafeHeight = max(LastIndexedHeight - FinalityDepth, 0).
+	// Exposed in every API response so clients can distinguish "indexed"
+	// from "confirmed beyond reorg risk."
+	SafeHeight atomic.Int64
+
+	// reorgDetectedCount tallies how many times CheckReorgAt has fired a
+	// mismatch. M1 only observes; M2 will actually truncate+replay. Exposed
+	// via metrics so we can tell "chain is noisy" from "our code is broken".
+	reorgDetectedCount atomic.Int64
 
 	// syncedOnce ensures EnableSync + postScanVariableFetch run exactly once
 	// after the initial fastsync catch-up, even if the caught-up condition
@@ -64,6 +75,7 @@ type Config struct {
 	TurboMode      bool
 	AdaptBatchSize bool
 	RecentBlocks   int64 // scan only the last N blocks from chain tip (0 = scan all)
+	FinalityDepth  int64 // blocks behind tip considered safe (0 = default 10)
 }
 
 // New creates a new Indexer with the given configuration.
@@ -110,8 +122,12 @@ func New(cfg Config) (*Indexer, error) {
 		TurboMode:      cfg.TurboMode,
 		AdaptBatchSize: cfg.AdaptBatchSize,
 		RecentBlocks:   cfg.RecentBlocks,
+		FinalityDepth:  cfg.FinalityDepth,
 		Store:          store,
 		RPCPool:        pool,
+	}
+	if idx.FinalityDepth <= 0 {
+		idx.FinalityDepth = structures.DefaultFinalityDepth
 	}
 
 	// Restore last indexed height
@@ -120,6 +136,12 @@ func New(cfg Config) (*Indexer, error) {
 		logger.Warnf("Could not read last index height: %v", err)
 	}
 	idx.LastIndexedHeight.Store(lastHeight)
+	// On startup SafeHeight is lastIndexed - FinalityDepth; safe if unknown.
+	safe := lastHeight - idx.FinalityDepth
+	if safe < 0 {
+		safe = 0
+	}
+	idx.SafeHeight.Store(safe)
 
 	return idx, nil
 }
@@ -220,10 +242,13 @@ type fetchedBatch struct {
 	regCount int64
 }
 
-// blockInfo holds parsed TX hashes for a single block height.
+// blockInfo holds parsed TX hashes and the block hash for a single height.
+// The block hash is committed atomically with the batch in FlushBatch; a
+// mismatch against stored hash at h-1 is the reorg signal (DESIGN.md §6).
 type blockInfo struct {
-	height   int64
-	txHashes []string
+	height    int64
+	blockHash string // 64-hex; empty only on parse failure
+	txHashes  []string
 }
 
 // processedBatch carries indexed data from the processor to the flusher.
@@ -349,6 +374,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		blocks := make([]blockInfo, 0, fetchCount)
 		allTxHashes := make([]string, 0, fetchCount*10)
 		var regCount int64
+		firstBlockChecked := false
 
 		for i, result := range blockResults {
 			if result == nil {
@@ -368,6 +394,24 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			} else if err := json.Unmarshal([]byte(result.Json), &bl); err != nil {
 				logger.Errorf("parse block %d: %v", heights[i], err)
 				continue
+			}
+
+			// Block hash — committed atomically with batch data for reorg detection.
+			bi.blockHash = bl.GetHash().String()
+
+			// M1 reorg detection: on the FIRST successfully-parsed block of each
+			// batch, verify the block's parent tip chains onto the stored hash
+			// at h-1. DERO blocks are a DAG (Tips is a slice), but in the linear
+			// portion of the chain we care about there is exactly one tip — the
+			// direct ancestor. If Tips is empty (genesis or malformed) we skip.
+			// Cheap (one bbolt read per batch) and it runs in the fetcher so the
+			// processor never sees a bad chain. Mismatch only logs+counts in M1;
+			// M2 will truncate+replay.
+			if !firstBlockChecked && len(bl.Tips) > 0 {
+				firstBlockChecked = true
+				if ok, storedAt := idx.CheckReorgAt(int64(heights[i]), bl.Tips[0].String()); !ok {
+					idx.onReorgDetected(storedAt, int64(heights[i]))
+				}
 			}
 
 			for _, h := range bl.Tx_hashes {
@@ -427,6 +471,8 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 		logger.Errorf("parse speculative block %d: %v", height, err)
 		return nil
 	}
+
+	bi.blockHash = bl.GetHash().String()
 
 	allTxHashes := make([]string, 0, len(bl.Tx_hashes))
 	for _, h := range bl.Tx_hashes {
@@ -507,6 +553,15 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 
 		// Decode and index all transactions
 		var burnCount, normCount int64
+
+		// Route B: record the per-block hashes atomically with the batch.
+		// Empty hashes (parse failed) are skipped — downstream reorg logic
+		// tolerates gaps and will verify on the next successful fetch.
+		for _, bi := range fb.blocks {
+			if bi.blockHash != "" {
+				batch.AddBlockHash(bi.height, bi.blockHash)
+			}
+		}
 
 		if fb.txResult != nil && len(fb.txResult.Txs_as_hex) > 0 {
 			txMap := make(map[string]int, len(fb.allTxHashes))
@@ -628,6 +683,12 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 			// If the process dies between here and the next flush, restart resumes
 			// from this point — we never claim progress we haven't persisted.
 			idx.LastIndexedHeight.Store(pb.newHeight)
+			// SafeHeight = indexed - finality_depth, bounded at 0.
+			safe := pb.newHeight - idx.FinalityDepth
+			if safe < 0 {
+				safe = 0
+			}
+			idx.SafeHeight.Store(safe)
 			chainHeight := idx.ChainHeight.Load()
 			elapsed := time.Since(startTime)
 			// bps was previously float64(pb.newHeight)/elapsed, i.e. absolute chain
@@ -780,7 +841,9 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 
 	if method == structures.MethodInstallSC {
 		if idx.TurboMode {
-			// Turbo: record install from TX data, skip GetSC
+			// Turbo: record install from TX data, skip GetSC.
+			// We still have SC_CODE in scArgs — classify from that alone
+			// (no variables yet, but code is enough for class detection).
 			idx.ValidatedSCs.Store(scid, struct{}{})
 			batch.AddOwner(scid, sender)
 			batch.AddInvocation(structures.InvokeRecord{
@@ -792,12 +855,23 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 				},
 			})
 			batch.AddInteractionHeight(scid, height)
+			batch.AddInstall(scid, height, &structures.InstallRecord{
+				Owner: sender, Entrypoint: entrypoint, Fees: scFees,
+			})
+			// Classify from code only (turbo skips variable fetch).
+			code := fmt.Sprintf("%v", scArgs.Value("SC_CODE", "S"))
+			sc := ClassifySC(scid, code, nil)
+			batch.AddClass(scid, &structures.ClassMeta{
+				Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+				InstallHeight: height, LastHeight: height,
+			})
+			batch.AddAddrSCID(sender, scid, height)
 		} else {
 			idx.handleInstallSC(scid, sender, entrypoint, height, scArgs, scFees, tx, batch)
 		}
 	} else {
 		if idx.TurboMode {
-			// Turbo: record invoke from TX data, skip GetSC
+			// Turbo: record invoke from TX data, skip GetSC.
 			idx.ValidatedSCs.Store(scid, struct{}{})
 			batch.AddInvocation(structures.InvokeRecord{
 				Scid: scid, Sender: sender, Entrypoint: entrypoint,
@@ -808,10 +882,23 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 				},
 			})
 			batch.AddInteractionHeight(scid, height)
+			batch.AddAddrSCID(sender, scid, height)
 		} else {
 			idx.handleInvokeSC(scid, sender, entrypoint, height, scArgs, scFees, txid, batch)
 		}
 	}
+}
+
+// varsToMap converts parseSCVariables output to the string-keyed map
+// ClassifySC expects. Non-string keys are ignored.
+func varsToMap(vars []*structures.SCIDVariable) map[string]interface{} {
+	m := make(map[string]interface{}, len(vars))
+	for _, v := range vars {
+		if k, ok := v.Key.(string); ok {
+			m[k] = v.Value
+		}
+	}
+	return m
 }
 
 // handleInstallSC processes a new SC deployment.
@@ -862,6 +949,17 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 	})
 	batch.AddVariables(scid, height, scVars)
 	batch.AddInteractionHeight(scid, height)
+
+	// Route B: classify, record install, record addr→scid edge.
+	batch.AddInstall(scid, height, &structures.InstallRecord{
+		Owner: sender, Entrypoint: entrypoint, Fees: fees,
+	})
+	sc := ClassifySC(scid, code, varsToMap(scVars))
+	batch.AddClass(scid, &structures.ClassMeta{
+		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+		InstallHeight: height, LastHeight: height,
+	})
+	batch.AddAddrSCID(sender, scid, height)
 }
 
 // handleInvokeSC processes an SC invocation.
@@ -909,6 +1007,23 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 		batch.AddVariables(scid, height, scVars)
 	}
 	batch.AddInteractionHeight(scid, height)
+
+	// Route B: refresh class metadata (TELA apps bump version via STORE) and
+	// record addr→scid edge.
+	if len(scVars) > 0 {
+		sc := ClassifySC(scid, "", varsToMap(scVars))
+		// Preserve InstallHeight if we have prior meta; this is a refresh.
+		existingMeta, _ := idx.Store.GetSCIDClass(scid)
+		installH := height
+		if existingMeta != nil {
+			installH = existingMeta.InstallHeight
+		}
+		batch.AddClass(scid, &structures.ClassMeta{
+			Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+			InstallHeight: installH, LastHeight: height,
+		})
+	}
+	batch.AddAddrSCID(sender, scid, height)
 }
 
 // processNormalTx handles a normal transaction with SCID payload.
@@ -919,8 +1034,13 @@ func (idx *Indexer) processNormalTx(tx *transaction.Transaction, txInfo rpc.Tx_R
 		if scidStr == "0000000000000000000000000000000000000000000000000000000000000000" {
 			continue
 		}
+		scidStr = hgpool.InternSCID(scidStr)
 		for _, addr := range txInfo.Ring[j] {
 			addr = hgpool.InternAddress(addr)
+			// Route B: ring member touched this SCID. Useful for "this address
+			// might be a participant of this SCID." Heavy but cardinality is
+			// bounded by ring size.
+			batch.AddAddrSCID(addr, scidStr, height)
 			ntx := &structures.NormalTXWithSCIDParse{
 				Txid:   txid,
 				Scid:   scidStr,

@@ -20,13 +20,67 @@ var (
 	bucketStats   = []byte("stats")
 	bucketOwners  = []byte("owners")
 	bucketHeaders = []byte("headers")
-	bucketClass   = []byte("class")
-	bucketTags    = []byte("tags")
+	bucketClass   = []byte("class") // Route B: "<class>|<BE8:h>|<scid>" -> ClassMeta msgpack
+	bucketTags    = []byte("tags")  // reserved; populated when tag indexes ship
 	bucketHeight  = []byte("height")
 	bucketScVars  = []byte("scvars")
 	bucketNormTx  = []byte("normaltxwithscid")
 	bucketInvalid = []byte("invalidscidinvokes")
+
+	// Route B (DESIGN.md §3) buckets.
+	bucketBlockHash   = []byte("blockhashes")    // BE8 height -> 64-hex block hash
+	bucketInstalls    = []byte("installs")       // "<BE8:h>|<scid>" -> InstallRecord msgpack
+	bucketClassIdx    = []byte("class_scid")     // scid -> ClassMeta msgpack (O(1) lookup)
+	bucketAddrSCIDs   = []byte("addr_scids")     // parent; per-addr sub-bucket created on demand
+	bucketTELAContent = []byte("tela_content")   // scid|path -> {body, mime, sha256}
 )
+
+// Key layout helpers: keep binary big-endian so bbolt's byte-order cursor
+// walk matches numeric order. Height 0..2^63-1 packs into 8 bytes.
+
+// encHeight BE-encodes a uint64 height into an 8-byte slice.
+func encHeight(h int64) []byte {
+	var b [8]byte
+	u := uint64(h)
+	b[0] = byte(u >> 56)
+	b[1] = byte(u >> 48)
+	b[2] = byte(u >> 40)
+	b[3] = byte(u >> 32)
+	b[4] = byte(u >> 24)
+	b[5] = byte(u >> 16)
+	b[6] = byte(u >> 8)
+	b[7] = byte(u)
+	return b[:]
+}
+
+// decHeight reverses encHeight.
+func decHeight(b []byte) int64 {
+	if len(b) < 8 {
+		return 0
+	}
+	return int64(uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
+		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7]))
+}
+
+// installKey packs <BE8:h>|<scid> for prefix scans by height.
+func installKey(h int64, scid string) []byte {
+	k := make([]byte, 0, 8+1+len(scid))
+	k = append(k, encHeight(h)...)
+	k = append(k, '|')
+	k = append(k, scid...)
+	return k
+}
+
+// classKey packs <class>|<BE8:h>|<scid> for prefix scans by class.
+func classKey(class string, h int64, scid string) []byte {
+	k := make([]byte, 0, len(class)+1+8+1+len(scid))
+	k = append(k, class...)
+	k = append(k, '|')
+	k = append(k, encHeight(h)...)
+	k = append(k, '|')
+	k = append(k, scid...)
+	return k
+}
 
 // BboltStore implements Storage backed by BoltDB.
 //
@@ -63,6 +117,9 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 			bucketStats, bucketOwners, bucketHeaders,
 			bucketClass, bucketTags, bucketHeight,
 			bucketScVars, bucketNormTx, bucketInvalid,
+			// Route B M0
+			bucketBlockHash, bucketInstalls, bucketClassIdx,
+			bucketAddrSCIDs, bucketTELAContent,
 		}
 		for _, b := range buckets {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
@@ -418,7 +475,97 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			return err
 		}
 
-		// Store last indexed height (crash recovery point)
+		// === Route B (DESIGN.md §3) — new buckets, same atomic txn ===
+
+		// Block hashes for reorg detection.
+		if len(batch.BlockHashes) > 0 {
+			bhBucket := tx.Bucket(bucketBlockHash)
+			for h, hash := range batch.BlockHashes {
+				if err := bhBucket.Put(encHeight(h), []byte(hash)); err != nil {
+					return fmt.Errorf("batch blockhash h=%d: %w", h, err)
+				}
+			}
+		}
+
+		// Installs: height-prefixed, range-scannable.
+		if len(batch.Installs) > 0 {
+			insBucket := tx.Bucket(bucketInstalls)
+			for mapKey, rec := range batch.Installs {
+				scid, h, ok := parseSCIDHeightKey(mapKey)
+				if !ok {
+					continue
+				}
+				val, err := msgpack.Marshal(rec)
+				if err != nil {
+					return fmt.Errorf("batch install marshal: %w", err)
+				}
+				if err := insBucket.Put(installKey(h, scid), val); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Class metadata: two writes per SCID.
+		//   1. classIdx:  scid -> ClassMeta  (O(1) lookup)
+		//   2. class:     <class>|<BE8 h>|<scid> -> ClassMeta  (prefix-scan by class)
+		if len(batch.Classes) > 0 {
+			classIdx := tx.Bucket(bucketClassIdx)
+			classPrefix := tx.Bucket(bucketClass)
+			for scid, meta := range batch.Classes {
+				if meta == nil || meta.Class == "" {
+					continue
+				}
+				val, err := msgpack.Marshal(meta)
+				if err != nil {
+					return fmt.Errorf("batch class marshal: %w", err)
+				}
+				if err := classIdx.Put([]byte(scid), val); err != nil {
+					return err
+				}
+				if err := classPrefix.Put(classKey(meta.Class, meta.InstallHeight, scid), val); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Address reverse index: nested bucket per address, scid as key.
+		// Merge with any existing entry (min/max/sum).
+		if len(batch.AddrSCIDs) > 0 {
+			parent := tx.Bucket(bucketAddrSCIDs)
+			for addr, scids := range batch.AddrSCIDs {
+				subBucket, err := parent.CreateBucketIfNotExists([]byte(addr))
+				if err != nil {
+					return fmt.Errorf("batch addr bucket %s: %w", addr, err)
+				}
+				for scid, delta := range scids {
+					existing := subBucket.Get([]byte(scid))
+					merged := delta
+					if existing != nil {
+						var cur structures.AddrSCIDEntry
+						if err := msgpack.Unmarshal(existing, &cur); err != nil {
+							logger.Warnf("addr_scids decode %s/%s: %v (overwriting)", addr, scid, err)
+						} else {
+							merged = &structures.AddrSCIDEntry{
+								FirstHeight: minInt64(cur.FirstHeight, delta.FirstHeight),
+								LastHeight:  maxInt64(cur.LastHeight, delta.LastHeight),
+								Count:       cur.Count + delta.Count,
+							}
+						}
+					}
+					val, err := msgpack.Marshal(merged)
+					if err != nil {
+						return err
+					}
+					if err := subBucket.Put([]byte(scid), val); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		// Store last indexed height (crash recovery point). Keeping decimal
+		// for backward compat with existing DBs; binary encoding will come in
+		// the v1→v2 migration.
 		if batch.LastHeight > 0 {
 			if err := statsBucket.Put(
 				[]byte("lastindexedheight"),
@@ -430,6 +577,207 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 
 		return nil
 	})
+}
+
+// parseSCIDHeightKey inverts scidHeightKey. Returns (scid, height, ok).
+func parseSCIDHeightKey(k string) (string, int64, bool) {
+	at := -1
+	for i := len(k) - 1; i >= 0; i-- {
+		if k[i] == '@' {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return "", 0, false
+	}
+	h, err := strconv.ParseInt(k[at+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return k[:at], h, true
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ========================================================================
+// Route B — storage.Storage interface additions
+// ========================================================================
+
+// StoreBlockHash writes a block hash outside a FlushBatch. Prefer
+// WriteBatch.AddBlockHash for the normal path — this method exists for
+// recovery/truncate tools.
+func (s *BboltStore) StoreBlockHash(height int64, hash string) error {
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketBlockHash).Put(encHeight(height), []byte(hash))
+	})
+}
+
+// GetBlockHash returns the hash stored at the given height, or "" if absent.
+func (s *BboltStore) GetBlockHash(height int64) (string, error) {
+	var hash string
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketBlockHash).Get(encHeight(height))
+		if v != nil {
+			hash = string(v)
+		}
+		return nil
+	})
+	return hash, err
+}
+
+// GetClassInstalls returns classified SCIDs for a given class, ordered by
+// install height ascending. limit<=0 means unlimited.
+func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.ClassInstall, error) {
+	if class == "" {
+		return nil, nil
+	}
+	prefix := append([]byte(class), '|')
+	var out []structures.ClassInstall
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketClass).Cursor()
+		for k, v := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, v = c.Next() {
+			// k = "<class>|<BE8 h>|<scid>"
+			rem := k[len(prefix):]
+			if len(rem) < 8+1 {
+				continue
+			}
+			h := decHeight(rem[:8])
+			scid := string(rem[9:])
+			var meta structures.ClassMeta
+			if err := msgpack.Unmarshal(v, &meta); err != nil {
+				logger.Warnf("GetClassInstalls decode %s/%d/%s: %v", class, h, scid, err)
+				continue
+			}
+			out = append(out, structures.ClassInstall{
+				SCID:          scid,
+				InstallHeight: h,
+				Meta:          &meta,
+			})
+			if limit > 0 && len(out) >= limit {
+				return nil
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// GetSCIDClass returns the classifier's stored metadata for a SCID, or nil.
+func (s *BboltStore) GetSCIDClass(scid string) (*structures.ClassMeta, error) {
+	var meta *structures.ClassMeta
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketClassIdx).Get([]byte(scid))
+		if v == nil {
+			return nil
+		}
+		var m structures.ClassMeta
+		if err := msgpack.Unmarshal(v, &m); err != nil {
+			return fmt.Errorf("class_scid decode %s: %w", scid, err)
+		}
+		meta = &m
+		return nil
+	})
+	return meta, err
+}
+
+// GetInstallsInRange returns installs with height in [fromHeight, toHeight).
+// limit<=0 means unlimited.
+func (s *BboltStore) GetInstallsInRange(fromHeight, toHeight int64, limit int) ([]structures.ClassInstall, error) {
+	if toHeight <= fromHeight {
+		return nil, nil
+	}
+	start := encHeight(fromHeight)
+	var out []structures.ClassInstall
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketInstalls).Cursor()
+		classBucket := tx.Bucket(bucketClassIdx)
+		for k, v := c.Seek(start); k != nil; k, v = c.Next() {
+			if len(k) < 8+1 {
+				continue
+			}
+			h := decHeight(k[:8])
+			if h >= toHeight {
+				break
+			}
+			scid := string(k[9:])
+			var rec structures.InstallRecord
+			if err := msgpack.Unmarshal(v, &rec); err != nil {
+				logger.Warnf("GetInstallsInRange decode h=%d scid=%s: %v", h, scid, err)
+				continue
+			}
+			// Pull class metadata if classified.
+			var meta *structures.ClassMeta
+			if cv := classBucket.Get([]byte(scid)); cv != nil {
+				var m structures.ClassMeta
+				if err := msgpack.Unmarshal(cv, &m); err == nil {
+					meta = &m
+				}
+			}
+			out = append(out, structures.ClassInstall{
+				SCID:          scid,
+				InstallHeight: h,
+				Meta:          meta,
+			})
+			if limit > 0 && len(out) >= limit {
+				return nil
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// GetAddressSCIDs returns the SCIDs an address has interacted with.
+// Map value holds first/last interaction heights + count.
+func (s *BboltStore) GetAddressSCIDs(addr string) (map[string]*structures.AddrSCIDEntry, error) {
+	if addr == "" {
+		return nil, nil
+	}
+	out := make(map[string]*structures.AddrSCIDEntry)
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		parent := tx.Bucket(bucketAddrSCIDs)
+		sub := parent.Bucket([]byte(addr))
+		if sub == nil {
+			return nil
+		}
+		return sub.ForEach(func(k, v []byte) error {
+			var e structures.AddrSCIDEntry
+			if err := msgpack.Unmarshal(v, &e); err != nil {
+				logger.Warnf("addr_scids decode %s/%s: %v", addr, string(k), err)
+				return nil
+			}
+			out[string(k)] = &e
+			return nil
+		})
+	})
+	return out, err
+}
+
+// hasPrefix is a 2-operand []byte prefix test; avoids bytes.HasPrefix import
+// in a module that already imports it indirectly via bbolt.
+func hasPrefix(b, prefix []byte) bool {
+	if len(b) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if b[i] != p {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *BboltStore) GetInvalidSCIDDeploys() (map[string]uint64, error) {

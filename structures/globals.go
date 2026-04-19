@@ -23,6 +23,10 @@ const (
 	DefaultPoolSize = 8
 	// Default parallel block fetchers
 	DefaultParallelBlocks = 20
+	// Default blocks-behind-tip considered safe from reorg.
+	// DERO stabilizes in ~8 blocks; 10 is a pragmatic safety margin.
+	// Exposed as SafeHeight in API responses.
+	DefaultFinalityDepth = 10
 )
 
 // DefaultExclusions are large/known non-TELA SCIDs to skip during probing.

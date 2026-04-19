@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -51,6 +52,11 @@ type WSServer struct {
 	upgrader websocket.Upgrader
 	addr     string
 
+	// safeHeight mirrors api.Server.safeHeight: a pointer to the indexer's
+	// atomic.Int64 so the ws GetSafeHeight method returns a live value
+	// without this package importing indexer. nil is tolerated (returns 0).
+	safeHeight *atomic.Int64
+
 	// dispatch table: method name -> handler func
 	methods map[string]methodHandler
 }
@@ -60,10 +66,15 @@ type methodHandler func(params json.RawMessage) (interface{}, *jsonRPCError)
 
 // NewWSServer creates a WSServer bound to the given address.
 // The storage backend must already be open.
-func NewWSServer(addr string, store storage.Storage) *WSServer {
+//
+// safeHeight may be nil; GetSafeHeight returns 0 in that case. Passing a
+// pointer to indexer.Indexer.SafeHeight gives live finality reads without
+// pulling an indexer import into this package.
+func NewWSServer(addr string, store storage.Storage, safeHeight *atomic.Int64) *WSServer {
 	ws := &WSServer{
-		store: store,
-		addr:  addr,
+		store:      store,
+		addr:       addr,
+		safeHeight: safeHeight,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -76,8 +87,17 @@ func NewWSServer(addr string, store storage.Storage) *WSServer {
 		"GetSCIDVariableDetailsAtTopoheight": ws.handleGetSCIDVariableDetailsAtTopoheight,
 		"GetSCIDInteractionHeight":           ws.handleGetSCIDInteractionHeight,
 		"GetAllSCIDInvokeDetails":            ws.handleGetAllSCIDInvokeDetails,
+		"GetSafeHeight":                      ws.handleGetSafeHeight,
 	}
 	return ws
+}
+
+// loadSafeHeight returns the live safe-height, or 0 if not wired.
+func (ws *WSServer) loadSafeHeight() int64 {
+	if ws.safeHeight == nil {
+		return 0
+	}
+	return ws.safeHeight.Load()
 }
 
 // Start begins listening for WebSocket connections. Blocks until the
@@ -228,6 +248,13 @@ func (ws *WSServer) handleGetSCIDInteractionHeight(raw json.RawMessage) (interfa
 		return nil, internalErr(err)
 	}
 	return heights, nil
+}
+
+// handleGetSafeHeight returns the current finality-lag "safe" height as
+// {"safe_height": N}. Zero-param method; clients poll it to know the
+// greatest height they can trust past reorg risk.
+func (ws *WSServer) handleGetSafeHeight(_ json.RawMessage) (interface{}, *jsonRPCError) {
+	return map[string]int64{"safe_height": ws.loadSafeHeight()}, nil
 }
 
 func (ws *WSServer) handleGetAllSCIDInvokeDetails(raw json.RawMessage) (interface{}, *jsonRPCError) {
