@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hypergnomon/hypergnomon/api"
+	"github.com/hypergnomon/hypergnomon/eventbus"
 	"github.com/hypergnomon/hypergnomon/indexer"
 	hgrpc "github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/structures"
@@ -104,6 +105,12 @@ func main() {
 		}
 	}
 
+	// Event bus for subscription fan-out (DESIGN.md M1). One per process.
+	// Started before Indexer so New() can take it via Config.
+	bus := eventbus.New(1024)
+	go bus.Run()
+	defer bus.Close()
+
 	var idx *indexer.Indexer
 	var err error
 	var connectedEndpoint string
@@ -120,6 +127,7 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Bus:            bus,
 		})
 		if err == nil {
 			connectedEndpoint = node
@@ -158,6 +166,7 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Bus:            bus,
 		})
 		if err == nil {
 			connectedEndpoint = input
@@ -228,7 +237,7 @@ func main() {
 		}
 	}()
 
-	wsServer := api.NewWSServer(*wsAddress, idx.Store, &idx.SafeHeight)
+	wsServer := api.NewWSServer(*wsAddress, idx.Store, &idx.SafeHeight, bus, idx)
 	go func() {
 		if err := wsServer.Start(); err != nil {
 			structures.Logger.Errorf("WebSocket server error: %v", err)

@@ -15,6 +15,7 @@ import (
 	"github.com/deroproject/derohe/transaction"
 	"github.com/sirupsen/logrus"
 
+	"github.com/hypergnomon/hypergnomon/eventbus"
 	hgpool "github.com/hypergnomon/hypergnomon/pool"
 	hgrpc "github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/storage"
@@ -57,6 +58,10 @@ type Indexer struct {
 	// via metrics so we can tell "chain is noisy" from "our code is broken".
 	reorgDetectedCount atomic.Int64
 
+	// Bus is the optional event fan-out. nil => publishing is a no-op
+	// (library embeddings that don't need realtime push can pass nil).
+	Bus *eventbus.Bus
+
 	// syncedOnce ensures EnableSync + postScanVariableFetch run exactly once
 	// after the initial fastsync catch-up, even if the caught-up condition
 	// is detected multiple times.
@@ -76,6 +81,10 @@ type Config struct {
 	AdaptBatchSize bool
 	RecentBlocks   int64 // scan only the last N blocks from chain tip (0 = scan all)
 	FinalityDepth  int64 // blocks behind tip considered safe (0 = default 10)
+
+	// Bus is the optional event bus for subscription fan-out.
+	// If nil, indexing still works; just no push notifications.
+	Bus *eventbus.Bus
 }
 
 // New creates a new Indexer with the given configuration.
@@ -125,6 +134,7 @@ func New(cfg Config) (*Indexer, error) {
 		FinalityDepth:  cfg.FinalityDepth,
 		Store:          store,
 		RPCPool:        pool,
+		Bus:            cfg.Bus,
 	}
 	if idx.FinalityDepth <= 0 {
 		idx.FinalityDepth = structures.DefaultFinalityDepth
@@ -684,11 +694,14 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 			// from this point — we never claim progress we haven't persisted.
 			idx.LastIndexedHeight.Store(pb.newHeight)
 			// SafeHeight = indexed - finality_depth, bounded at 0.
+			prevSafe := idx.SafeHeight.Load()
 			safe := pb.newHeight - idx.FinalityDepth
 			if safe < 0 {
 				safe = 0
 			}
 			idx.SafeHeight.Store(safe)
+			// Route B M1: publish events AFTER durable commit. Bus is nil-safe.
+			idx.publishBatchEvents(pb.batch, pb.newHeight, safe, prevSafe)
 			chainHeight := idx.ChainHeight.Load()
 			elapsed := time.Since(startTime)
 			// bps was previously float64(pb.newHeight)/elapsed, i.e. absolute chain
@@ -1097,3 +1110,183 @@ func (idx *Indexer) Close() {
 		idx.Store.Close()
 	}
 }
+
+// IndexSingleSCIDResult is returned by IndexSingleSCID. It mirrors the WS
+// method's JSON response shape but in Go-native types so additional callers
+// (HTTP handlers, tests) can consume it without a second parse.
+type IndexSingleSCIDResult struct {
+	SCID      string            `json:"scid"`
+	ClassMeta *structures.ClassMeta `json:"-"`
+	VarsCount int               `json:"vars_count"`
+	// FromCache indicates this SCID was already in the class bucket and
+	// skipfsrecheck=true caused us to return cached metadata without hitting
+	// the daemon.
+	FromCache bool `json:"-"`
+}
+
+// IndexSingleSCID imports a single SCID on demand, bypassing the normal scan
+// pipeline. This is the counterpart to civilware/Gnomon's "addscid_toindex":
+// useful for SCs that don't show up in the GnomonSC registry (the usual
+// discovery mechanism) but that a client still wants indexed.
+//
+// Flow:
+//  1. If skipfsrecheck && meta already in class bucket, return cached.
+//  2. GetSC(scid, -1, nil, nil, !varsonly) via the RPC pool. -1 means "tip".
+//  3. If vars empty, return ErrSCIDNotFound (SC doesn't exist on-chain).
+//  4. ClassifySC(scid, code, varsToMap(vars)) → class meta.
+//  5. Persist: owner (if extractable), variables at tip height, class, install.
+//  6. Publish an EventInstall via the bus so subscribers learn about it.
+//
+// varsonly skips the SC_CODE fetch (smaller/faster, but class will typically
+// be UNKNOWN since most classifiers need code). skipfsrecheck short-circuits
+// the fetch entirely if we already have class metadata.
+//
+// This path does not use the scan-loop WriteBatch pool — it allocates a fresh
+// batch, fills it, flushes it, and publishes. One-shot. Height used is the
+// current chain tip (idx.ChainHeight); LastIndexedHeight is NOT advanced
+// because we haven't actually scanned the block at tip.
+func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (*IndexSingleSCIDResult, error) {
+	// Skip recheck fast-path: if we already have class metadata for this
+	// SCID, return it without contacting the daemon. Variables are not
+	// reloaded; callers that want fresh variables should pass
+	// skipfsrecheck=false.
+	if skipfsrecheck {
+		if meta, err := idx.Store.GetSCIDClass(scid); err == nil && meta != nil {
+			// Count stored variables at the last known height to fill vars_count.
+			vars, _ := idx.Store.GetSCIDVariableDetailsAtHeight(scid, meta.LastHeight)
+			return &IndexSingleSCIDResult{
+				SCID:      scid,
+				ClassMeta: meta,
+				VarsCount: len(vars),
+				FromCache: true,
+			}, nil
+		}
+	}
+
+	// Fetch from the daemon at chain tip (-1). Code is fetched unless varsonly.
+	var result *rpc.GetSC_Result
+	err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		var e error
+		result, e = c.GetSC(scid, -1, nil, nil, !varsonly)
+		return e
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetSC: %w", err)
+	}
+
+	scVars := parseSCVariables(result)
+	if len(scVars) == 0 {
+		return nil, ErrSCIDNotFound
+	}
+
+	// Height used for all stored records. Chain tip is best-effort; falls back
+	// to LastIndexedHeight if the tip monitor hasn't populated yet.
+	height := idx.ChainHeight.Load()
+	if height <= 0 {
+		height = idx.LastIndexedHeight.Load()
+	}
+
+	varsMap := varsToMap(scVars)
+
+	// Owner from variables if present. ClassifySC headers and the classifier
+	// both read from the same map so we only build it once.
+	owner := ""
+	if v, ok := varsMap["owner"]; ok {
+		owner = fmt.Sprintf("%v", v)
+	}
+
+	// Code is only present when !varsonly. ClassifySC handles "" gracefully.
+	code := ""
+	if result != nil {
+		code = result.Code
+	}
+
+	sc := ClassifySC(scid, code, varsMap)
+
+	// Preserve an earlier install height if one was previously recorded. This
+	// matters when addscid_toindex is called multiple times against the same
+	// SCID or after it was discovered by the normal scan path.
+	installH := height
+	if existing, err := idx.Store.GetSCIDClass(scid); err == nil && existing != nil {
+		if existing.InstallHeight > 0 {
+			installH = existing.InstallHeight
+		}
+	}
+
+	meta := &structures.ClassMeta{
+		Class:         sc.Class,
+		Tags:          sc.Tags,
+		Name:          sc.Name,
+		Desc:          sc.Desc,
+		IconURL:       sc.IconURL,
+		InstallHeight: installH,
+		LastHeight:    height,
+	}
+
+	// Build a one-shot batch — same shape as the scan-loop path so we benefit
+	// from the same atomic commit semantics (all or nothing).
+	batch := storage.NewWriteBatch()
+	defer storage.PutWriteBatch(batch)
+
+	batch.LastHeight = height
+	if owner != "" {
+		batch.AddOwner(scid, owner)
+	}
+	batch.AddVariables(scid, height, scVars)
+	batch.AddInteractionHeight(scid, height)
+	batch.AddInstall(scid, installH, &structures.InstallRecord{
+		Owner:      owner,
+		Entrypoint: "",
+		Fees:       0,
+	})
+	batch.AddClass(scid, meta)
+	if owner != "" {
+		batch.AddAddrSCID(owner, scid, height)
+	}
+
+	if err := idx.Store.FlushBatch(batch); err != nil {
+		return nil, fmt.Errorf("FlushBatch: %w", err)
+	}
+
+	// Mark the SCID as validated so subsequent invoke processing skips a
+	// redundant GetSC validation round-trip.
+	idx.ValidatedSCs.Store(scid, struct{}{})
+
+	// Publish an install event for subscribers. Matches the shape published
+	// by the scan loop's flusher so subscribe filters stay consistent.
+	if idx.Bus != nil {
+		safe := idx.SafeHeight.Load()
+		idx.Bus.Publish(eventbus.Event{
+			Type:       eventbus.EventInstall,
+			Height:     installH,
+			SafeHeight: safe,
+			SCID:       scid,
+			Owner:      owner,
+			Payload: &structures.InstallRecord{
+				Owner: owner,
+			},
+		})
+		if meta.Class != "" && meta.Class != "UNKNOWN" {
+			idx.Bus.Publish(eventbus.Event{
+				Type:       eventbus.EventClassMatch,
+				Height:     height,
+				SafeHeight: safe,
+				SCID:       scid,
+				Class:      meta.Class,
+				Tags:       meta.Tags,
+				Payload:    meta,
+			})
+		}
+	}
+
+	return &IndexSingleSCIDResult{
+		SCID:      scid,
+		ClassMeta: meta,
+		VarsCount: len(scVars),
+	}, nil
+}
+
+// ErrSCIDNotFound signals that GetSC returned no variables for the requested
+// SCID, i.e. the SC doesn't exist on-chain. Callers (the WS handler) translate
+// this to a JSON-RPC application error rather than an internal error.
+var ErrSCIDNotFound = fmt.Errorf("scid not found")
