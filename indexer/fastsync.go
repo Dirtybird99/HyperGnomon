@@ -550,7 +550,15 @@ func telaCachePath(dbDir string) string {
 	return filepath.Join(dbDir, "tela_cache.bin")
 }
 
+// telaCacheMu serializes concurrent reads/writes of tela_cache.bin.
+// Writers: probeTELA (full refresh), monitorChainHeight (height bump),
+// fastsync-cache-hit (no-op). A plain sync.Mutex is enough — the file is tiny
+// and contention is low.
+var telaCacheMu sync.Mutex
+
 func loadTELACache(dbDir string) (*telaCache, error) {
+	telaCacheMu.Lock()
+	defer telaCacheMu.Unlock()
 	data, err := os.ReadFile(telaCachePath(dbDir))
 	if err != nil {
 		return nil, err
@@ -563,6 +571,8 @@ func loadTELACache(dbDir string) (*telaCache, error) {
 }
 
 func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) error {
+	telaCacheMu.Lock()
+	defer telaCacheMu.Unlock()
 	cache := telaCache{
 		IndexSCIDs: indexSCIDs,
 		DocSCIDs:   docSCIDs,
@@ -573,7 +583,9 @@ func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) er
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(telaCachePath(dbDir), data, 0644)
+	// 0600 matches BoltDB permissions — cache contains indexer-derived data only,
+	// but tighter is fine.
+	return os.WriteFile(telaCachePath(dbDir), data, 0600)
 }
 
 // hexTable is a lookup table for hex character validation.

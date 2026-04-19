@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
 
@@ -30,10 +29,13 @@ var (
 )
 
 // BboltStore implements Storage backed by BoltDB.
+//
+// No external mutex: bbolt is already single-writer internally (db.rwlock in
+// bolt.Tx.WriteBatch path serializes Update calls). Wrapping Update in another
+// Lock/Unlock is pure overhead.
 type BboltStore struct {
 	DB   *bolt.DB
 	Path string
-	mu   sync.Mutex // Proper mutex, not the 20ms spin-lock from original Gnomon
 }
 
 // NewBboltStore opens or creates a BoltDB database.
@@ -111,8 +113,6 @@ func (s *BboltStore) GetLastIndexHeight() (int64, error) {
 }
 
 func (s *BboltStore) StoreLastIndexHeight(height int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketStats).Put(
 			[]byte("lastindexedheight"),
@@ -122,8 +122,6 @@ func (s *BboltStore) StoreLastIndexHeight(height int64) error {
 }
 
 func (s *BboltStore) StoreOwner(scid, owner string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketOwners).Put([]byte(scid), []byte(owner))
 	})
@@ -142,14 +140,13 @@ func (s *BboltStore) GetOwner(scid string) (string, error) {
 }
 
 func (s *BboltStore) StoreInvokeDetails(scid, sender, entrypoint string, height int64, details *structures.SCTXParse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(scid))
 		if err != nil {
 			return err
 		}
-		key := fmt.Sprintf("%s:%s:%d:%s", sender, details.Txid[:8], height, entrypoint)
+		// Full Txid: 8-char prefix only gives 32 bits of entropy and collides at scale.
+		key := fmt.Sprintf("%s:%s:%d:%s", sender, details.Txid, height, entrypoint)
 		val, err := msgpack.Marshal(details)
 		if err != nil {
 			return err
@@ -178,8 +175,6 @@ func (s *BboltStore) GetInvokeDetailsBySCID(scid string) ([]*structures.SCTXPars
 }
 
 func (s *BboltStore) StoreSCIDVariableDetails(scid string, vars []*structures.SCIDVariable, height int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketScVars)
 		key := fmt.Sprintf("%s:%d", scid, height)
@@ -206,14 +201,15 @@ func (s *BboltStore) GetSCIDVariableDetailsAtHeight(scid string, height int64) (
 }
 
 func (s *BboltStore) StoreSCIDInteractionHeight(scid string, height int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketHeight)
 		existing := b.Get([]byte(scid))
 		var heights []int64
 		if existing != nil {
-			msgpack.Unmarshal(existing, &heights)
+			if err := msgpack.Unmarshal(existing, &heights); err != nil {
+				logger.Warnf("heights decode for %s: %v (starting fresh list)", scid, err)
+				heights = nil
+			}
 		}
 		heights = append(heights, height)
 		val, err := msgpack.Marshal(heights)
@@ -237,14 +233,15 @@ func (s *BboltStore) GetSCIDInteractionHeights(scid string) ([]int64, error) {
 }
 
 func (s *BboltStore) StoreNormalTxWithSCIDByAddr(addr string, ntx *structures.NormalTXWithSCIDParse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNormTx)
 		existing := b.Get([]byte(addr))
 		var txs []*structures.NormalTXWithSCIDParse
 		if existing != nil {
-			msgpack.Unmarshal(existing, &txs)
+			if err := msgpack.Unmarshal(existing, &txs); err != nil {
+				logger.Warnf("normaltx decode for %s: %v (starting fresh list)", addr, err)
+				txs = nil
+			}
 		}
 		txs = append(txs, ntx)
 		val, err := msgpack.Marshal(txs)
@@ -256,16 +253,12 @@ func (s *BboltStore) StoreNormalTxWithSCIDByAddr(addr string, ntx *structures.No
 }
 
 func (s *BboltStore) StoreInvalidSCIDDeploys(scid string, fees uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketInvalid).Put([]byte(scid), []byte(strconv.FormatUint(fees, 10)))
 	})
 }
 
 func (s *BboltStore) StoreTxCounts(reg, burn, norm int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketStats)
 		// Atomic increment: read existing + add new
@@ -312,9 +305,6 @@ func (s *BboltStore) GetAllOwnersAndSCIDs() (map[string]string, error) {
 // FlushBatch atomically writes all accumulated data in a single BoltDB transaction.
 // This is the arena-pattern payoff: one lock acquisition for potentially thousands of records.
 func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		// Store owners
 		ownerBucket := tx.Bucket(bucketOwners)
@@ -330,7 +320,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			if err != nil {
 				return fmt.Errorf("batch invoke bucket %s: %w", inv.Scid, err)
 			}
-			key := fmt.Sprintf("%s:%s:%d:%s", inv.Sender, inv.Details.Txid[:8], inv.Height, inv.Entrypoint)
+			key := fmt.Sprintf("%s:%s:%d:%s", inv.Sender, inv.Details.Txid, inv.Height, inv.Entrypoint)
 			val, err := msgpack.Marshal(inv.Details)
 			if err != nil {
 				return fmt.Errorf("batch invoke marshal: %w", err)
@@ -361,7 +351,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			existing := heightBucket.Get([]byte(scid))
 			var current []int64
 			if existing != nil {
-				msgpack.Unmarshal(existing, &current)
+				if err := msgpack.Unmarshal(existing, &current); err != nil {
+					logger.Warnf("batch heights decode for %s: %v (starting fresh list)", scid, err)
+					current = nil
+				}
 			}
 			current = append(current, heights...)
 			val, err := msgpack.Marshal(current)
@@ -379,7 +372,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			existing := normBucket.Get([]byte(addr))
 			var current []*structures.NormalTXWithSCIDParse
 			if existing != nil {
-				msgpack.Unmarshal(existing, &current)
+				if err := msgpack.Unmarshal(existing, &current); err != nil {
+					logger.Warnf("batch normaltx decode for %s: %v (starting fresh list)", addr, err)
+					current = nil
+				}
 			}
 			current = append(current, txs...)
 			val, err := msgpack.Marshal(current)

@@ -161,8 +161,14 @@ func (idx *Indexer) StartDaemonMode() error {
 	return nil
 }
 
+// telaCacheHeightThrottle is how many blocks must pass before monitorChainHeight
+// rewrites the tela_cache.bin height field. At chain tip (~1 block per 18s)
+// this means a rewrite every ~30 minutes instead of every block.
+const telaCacheHeightThrottle = 100
+
 // monitorChainHeight polls daemon for current chain height.
 func (idx *Indexer) monitorChainHeight() {
+	var lastCacheHeight int64
 	for !idx.Closing.Load() {
 		err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			info, err := c.GetInfo()
@@ -173,11 +179,15 @@ func (idx *Indexer) monitorChainHeight() {
 			oldHeight := idx.ChainHeight.Load()
 			idx.ChainHeight.Store(newHeight)
 
-			// Update TELA cache height whenever chain grows (keep cache fresh)
-			if newHeight > oldHeight && oldHeight > 0 {
+			// Throttle tela_cache height rewrites: full-file rewrite every block
+			// is gratuitous I/O when the only change is the Height field.
+			if newHeight > oldHeight && oldHeight > 0 &&
+				newHeight-lastCacheHeight >= telaCacheHeightThrottle {
 				if cached, err := loadTELACache(idx.DBDir); err == nil {
 					cached.Height = newHeight
-					saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, newHeight)
+					if err := saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, newHeight); err == nil {
+						lastCacheHeight = newHeight
+					}
 				}
 			}
 			return nil
@@ -272,9 +282,13 @@ func (idx *Indexer) scanLoop() {
 func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 	batchBlockCount := idx.ParallelBlocks
 	caughtUp := false
+	// fetcher advances its own cursor so it doesn't race against the lagging
+	// LastIndexedHeight atomic (which is now only advanced by the flusher on
+	// successful commit). Reorg detection & restart still read the atomic.
+	nextHeight := idx.LastIndexedHeight.Load()
 
 	for !idx.Closing.Load() {
-		lastHeight := idx.LastIndexedHeight.Load()
+		lastHeight := nextHeight
 		chainHeight := idx.ChainHeight.Load()
 
 		// --- Speculative prefetch when caught up ---
@@ -301,6 +315,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			if fb != nil {
 				caughtUp = false
 				out <- fb
+				nextHeight++
 			}
 			continue
 		}
@@ -390,6 +405,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			blocks:       blocks,
 			regCount:     regCount,
 		}
+		nextHeight += int64(fetchCount)
 	}
 }
 
@@ -448,11 +464,17 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 // WriteBatch objects, and sends them to the flusher. All CPU-bound work
 // (hex decode, protobuf deserialize, SC argument parsing) lives here,
 // isolated from I/O stages.
+//
+// Progress invariant: processorLoop tracks a local runningHeight but does NOT
+// update idx.LastIndexedHeight. Only flusherLoop advances the atomic, and only
+// after FlushBatch commits. This prevents the indexer from skipping blocks on
+// restart after a mid-flight flush error.
 func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processedBatch) {
 	batchSize := idx.BatchSize
 	batch := storage.NewWriteBatch()
 	blocksInBatch := 0
 	syncSignaled := false
+	runningHeight := idx.LastIndexedHeight.Load()
 
 	for fb := range in {
 		if idx.Closing.Load() {
@@ -529,9 +551,8 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 		batch.BurnTxCount += burnCount
 		batch.NormTxCount += normCount
 
-		lastHeight := idx.LastIndexedHeight.Load()
-		newHeight := lastHeight + int64(fb.fetchCount)
-		idx.LastIndexedHeight.Store(newHeight)
+		newHeight := runningHeight + int64(fb.fetchCount)
+		runningHeight = newHeight
 		batch.LastHeight = newHeight
 		blocksInBatch += fb.fetchCount
 
@@ -563,6 +584,7 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 // so neither the fetcher nor the processor blocks on bbolt commits.
 func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 	startTime := time.Now()
+	scanStartHeight := idx.LastIndexedHeight.Load()
 	batchSize := idx.BatchSize
 	syncEnabled := false
 
@@ -573,6 +595,7 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 				if err := idx.Store.FlushBatch(pb.batch); err != nil {
 					logger.Errorf("FlushBatch (drain): %v", err)
 				}
+				storage.PutWriteBatch(pb.batch)
 			}
 			continue
 		}
@@ -601,13 +624,31 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 		if err := idx.Store.FlushBatch(pb.batch); err != nil {
 			logger.Errorf("FlushBatch: %v", err)
 		} else {
+			// Only advance the durable progress atomic after the DB commit succeeds.
+			// If the process dies between here and the next flush, restart resumes
+			// from this point — we never claim progress we haven't persisted.
+			idx.LastIndexedHeight.Store(pb.newHeight)
 			chainHeight := idx.ChainHeight.Load()
 			elapsed := time.Since(startTime)
-			bps := float64(pb.newHeight) / elapsed.Seconds()
-			eta := time.Duration(float64(chainHeight-pb.newHeight)/bps) * time.Second
-			logger.Infof("Height: %d/%d | %.0f blk/s | ETA: %v | Batch: %d",
+			// bps was previously float64(pb.newHeight)/elapsed, i.e. absolute chain
+			// height divided by uptime — reporting 177,000 blk/s on mainnet when
+			// the real rate was 70. Subtract the scan start so the number means
+			// "blocks this process has scanned per second."
+			scanned := pb.newHeight - scanStartHeight
+			var bps float64
+			if elapsed.Seconds() > 0 {
+				bps = float64(scanned) / elapsed.Seconds()
+			}
+			var eta time.Duration
+			if bps > 0 && pb.newHeight < chainHeight {
+				eta = time.Duration(float64(chainHeight-pb.newHeight)/bps) * time.Second
+			}
+			logger.Infof("Height: %d/%d | %.1f blk/s | ETA: %v | Batch: %d",
 				pb.newHeight, chainHeight, bps, eta.Round(time.Second), batchSize)
 		}
+		// Recycle the batch whether flush succeeded or failed — either way we're
+		// done with it. Losing one batch to GC on error is cheap; leaking is not.
+		storage.PutWriteBatch(pb.batch)
 
 		// Adaptive batch sizing
 		if idx.AdaptBatchSize {
@@ -824,24 +865,27 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 }
 
 // handleInvokeSC processes an SC invocation.
+//
+// This does exactly one GetSC regardless of whether the SCID is already
+// validated: the result is used both to validate (non-empty vars) and to
+// record the post-invoke variable snapshot. The previous implementation fetched
+// twice on first encounter of an unknown SCID.
 func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, txid string, batch *storage.WriteBatch) {
-	// Validate this SCID is known or discover it
-	if _, ok := idx.ValidatedSCs.Load(scid); !ok {
-		// Try to validate
-		var scVars []*structures.SCIDVariable
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-			result, err := c.GetSC(scid, height, nil, nil, false)
-			if err != nil {
-				return err
-			}
-			scVars = parseSCVariables(result)
-			return nil
-		})
-		if len(scVars) > 0 {
-			idx.ValidatedSCs.Store(scid, struct{}{})
-		} else {
-			return // invalid SCID
+	var scVars []*structures.SCIDVariable
+	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		result, err := c.GetSC(scid, height, nil, nil, false)
+		if err != nil {
+			return err
 		}
+		scVars = parseSCVariables(result)
+		return nil
+	})
+
+	if _, known := idx.ValidatedSCs.Load(scid); !known {
+		if len(scVars) == 0 {
+			return // unknown and invalid; drop
+		}
+		idx.ValidatedSCs.Store(scid, struct{}{})
 	}
 
 	batch.AddInvocation(structures.InvokeRecord{
@@ -861,16 +905,6 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 		},
 	})
 
-	// Fetch updated variables
-	var scVars []*structures.SCIDVariable
-	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-		result, err := c.GetSC(scid, height, nil, nil, false)
-		if err != nil {
-			return err
-		}
-		scVars = parseSCVariables(result)
-		return nil
-	})
 	if len(scVars) > 0 {
 		batch.AddVariables(scid, height, scVars)
 	}

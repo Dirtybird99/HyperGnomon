@@ -16,6 +16,7 @@ import (
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
 	"github.com/sirupsen/logrus"
+	"github.com/vmihailenco/msgpack/v5"
 	bolt "go.etcd.io/bbolt"
 
 	hgpool "github.com/hypergnomon/hypergnomon/pool"
@@ -598,8 +599,10 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 			var height int64
 			fmt.Sscanf(parts[1], "%d", &height)
 			var vars []*structures.SCIDVariable
-			if err := json.Unmarshal(v, &vars); err != nil {
-				return nil // skip corrupt entries
+			// Storage writes msgpack via storage.FlushBatch — decode with the same codec.
+			if err := msgpack.Unmarshal(v, &vars); err != nil {
+				segLog.Warnf("merge scvars: %s: %v", string(k), err)
+				return nil
 			}
 			batch.AddVariables(scid, height, vars)
 			return nil
@@ -609,7 +612,8 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 		return b.ForEach(func(k, v []byte) error {
 			scid := string(k)
 			var heights []int64
-			if err := json.Unmarshal(v, &heights); err != nil {
+			if err := msgpack.Unmarshal(v, &heights); err != nil {
+				segLog.Warnf("merge heights: %s: %v", scid, err)
 				return nil
 			}
 			for _, h := range heights {
@@ -622,7 +626,8 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 		return b.ForEach(func(k, v []byte) error {
 			addr := string(k)
 			var txs []*structures.NormalTXWithSCIDParse
-			if err := json.Unmarshal(v, &txs); err != nil {
+			if err := msgpack.Unmarshal(v, &txs); err != nil {
+				segLog.Warnf("merge normaltx: %s: %v", addr, err)
 				return nil
 			}
 			if batch.NormalTxs[addr] == nil {
@@ -666,7 +671,8 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 		// Per-SCID invocation buckets: bucket name is the SCID itself
 		return b.ForEach(func(k, v []byte) error {
 			var detail structures.SCTXParse
-			if err := json.Unmarshal(v, &detail); err != nil {
+			if err := msgpack.Unmarshal(v, &detail); err != nil {
+				segLog.Warnf("merge invoke %s/%s: %v", bucketName, string(k), err)
 				return nil
 			}
 			batch.AddInvocation(structures.InvokeRecord{

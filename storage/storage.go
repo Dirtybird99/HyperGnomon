@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"sync"
+
 	"github.com/hypergnomon/hypergnomon/structures"
 )
 
@@ -68,8 +70,17 @@ type WriteBatch struct {
 	LastHeight   int64
 }
 
-// NewWriteBatch creates a fresh batch with pre-allocated maps.
-func NewWriteBatch() *WriteBatch {
+// batchPool recycles WriteBatch instances. At steady state, a batch is pulled,
+// filled with a flush worth of data, passed to FlushBatch, then returned. This
+// is the one "arena" gap in an otherwise arena-pure design: NewWriteBatch
+// allocates 5 maps + 1 slice header per call, and the hot loop calls it ~14/s.
+var batchPool = sync.Pool{
+	New: func() interface{} {
+		return newEmptyBatch()
+	},
+}
+
+func newEmptyBatch() *WriteBatch {
 	return &WriteBatch{
 		Owners:       make(map[string]string, 32),
 		Invocations:  make([]structures.InvokeRecord, 0, 128),
@@ -78,6 +89,25 @@ func NewWriteBatch() *WriteBatch {
 		NormalTxs:    make(map[string][]*structures.NormalTXWithSCIDParse, 16),
 		InvalidSCIDs: make(map[string]uint64, 4),
 	}
+}
+
+// NewWriteBatch returns a zeroed batch from the pool. Callers should invoke
+// PutWriteBatch(batch) after FlushBatch to return it. NewWriteBatch always
+// hands back a Reset() batch — safe even if a caller forgets to Put.
+func NewWriteBatch() *WriteBatch {
+	b := batchPool.Get().(*WriteBatch)
+	b.Reset()
+	return b
+}
+
+// PutWriteBatch returns a batch to the pool after Reset. Call after every
+// successful (or unsuccessful) FlushBatch. Passing nil is a no-op.
+func PutWriteBatch(b *WriteBatch) {
+	if b == nil {
+		return
+	}
+	b.Reset()
+	batchPool.Put(b)
 }
 
 // AddOwner adds an owner record to the batch.

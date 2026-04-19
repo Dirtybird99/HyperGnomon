@@ -214,13 +214,21 @@ func (c *Client) BatchGetBlocks(heights []uint64) ([]*rpc.GetBlock_Result, error
 		return nil, fmt.Errorf("BatchGetBlocks(%d heights): %w", len(heights), err)
 	}
 
+	// Partial success: a single bad block in a batch of 50 should not poison
+	// the other 49. Callers already handle nil entries (fetcherLoop skips them).
 	results := make([]*rpc.GetBlock_Result, len(responses))
+	failures := 0
 	for i, resp := range responses {
 		var result rpc.GetBlock_Result
 		if err := resp.UnmarshalResult(&result); err != nil {
-			return nil, fmt.Errorf("BatchGetBlocks unmarshal %d: %w", heights[i], err)
+			logger.Warnf("BatchGetBlocks: skipping height %d: %v", heights[i], err)
+			failures++
+			continue
 		}
 		results[i] = &result
+	}
+	if failures == len(responses) {
+		return results, fmt.Errorf("BatchGetBlocks: all %d responses failed to unmarshal", len(responses))
 	}
 	return results, nil
 }
