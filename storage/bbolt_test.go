@@ -454,3 +454,22 @@ func BenchmarkFlushBatch_Scaling(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkBatchAlloc measures only the cost of acquiring + discarding a
+// WriteBatch, which is exactly the per-flush churn in processorLoop.
+// Pool_Pair uses the new batchPool; Direct_New bypasses it.
+func BenchmarkBatchAlloc(b *testing.B) {
+	b.Run("Pool_Pair", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			batch := NewWriteBatch()
+			PutWriteBatch(batch)
+		}
+	})
+	b.Run("Direct_New", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_ = newEmptyBatch()
+		}
+	})
+}

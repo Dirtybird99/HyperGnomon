@@ -15,6 +15,7 @@ import (
 	"github.com/deroproject/derohe/transaction"
 	"github.com/sirupsen/logrus"
 
+	"github.com/hypergnomon/hypergnomon/eventbus"
 	hgpool "github.com/hypergnomon/hypergnomon/pool"
 	hgrpc "github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/storage"
@@ -40,11 +41,26 @@ type Indexer struct {
 	TurboMode      bool  // skip GetSC during scan, fetch variables post-scan
 	AdaptBatchSize bool  // dynamically adjust batch size based on flush latency
 	RecentBlocks   int64 // scan only last N blocks (0 = all)
+	FinalityDepth  int64 // blocks behind tip considered "safe" (default 10)
 
 	// Backends
 	RPCPool *hgrpc.Pool
 	Store   storage.Storage
 	Closing atomic.Bool
+
+	// Route B finality: SafeHeight = max(LastIndexedHeight - FinalityDepth, 0).
+	// Exposed in every API response so clients can distinguish "indexed"
+	// from "confirmed beyond reorg risk."
+	SafeHeight atomic.Int64
+
+	// reorgDetectedCount tallies how many times CheckReorgAt has fired a
+	// mismatch. M1 only observes; M2 will actually truncate+replay. Exposed
+	// via metrics so we can tell "chain is noisy" from "our code is broken".
+	reorgDetectedCount atomic.Int64
+
+	// Bus is the optional event fan-out. nil => publishing is a no-op
+	// (library embeddings that don't need realtime push can pass nil).
+	Bus *eventbus.Bus
 
 	// syncedOnce ensures EnableSync + postScanVariableFetch run exactly once
 	// after the initial fastsync catch-up, even if the caught-up condition
@@ -64,6 +80,11 @@ type Config struct {
 	TurboMode      bool
 	AdaptBatchSize bool
 	RecentBlocks   int64 // scan only the last N blocks from chain tip (0 = scan all)
+	FinalityDepth  int64 // blocks behind tip considered safe (0 = default 10)
+
+	// Bus is the optional event bus for subscription fan-out.
+	// If nil, indexing still works; just no push notifications.
+	Bus *eventbus.Bus
 }
 
 // New creates a new Indexer with the given configuration.
@@ -110,8 +131,13 @@ func New(cfg Config) (*Indexer, error) {
 		TurboMode:      cfg.TurboMode,
 		AdaptBatchSize: cfg.AdaptBatchSize,
 		RecentBlocks:   cfg.RecentBlocks,
+		FinalityDepth:  cfg.FinalityDepth,
 		Store:          store,
 		RPCPool:        pool,
+		Bus:            cfg.Bus,
+	}
+	if idx.FinalityDepth <= 0 {
+		idx.FinalityDepth = structures.DefaultFinalityDepth
 	}
 
 	// Restore last indexed height
@@ -120,13 +146,18 @@ func New(cfg Config) (*Indexer, error) {
 		logger.Warnf("Could not read last index height: %v", err)
 	}
 	idx.LastIndexedHeight.Store(lastHeight)
+	// On startup SafeHeight is lastIndexed - FinalityDepth; safe if unknown.
+	safe := lastHeight - idx.FinalityDepth
+	if safe < 0 {
+		safe = 0
+	}
+	idx.SafeHeight.Store(safe)
 
 	return idx, nil
 }
 
 // StartDaemonMode connects to the daemon and begins indexing.
 func (idx *Indexer) StartDaemonMode() error {
-
 	// Start background chain height monitor
 	go idx.monitorChainHeight()
 
@@ -161,8 +192,14 @@ func (idx *Indexer) StartDaemonMode() error {
 	return nil
 }
 
+// telaCacheHeightThrottle is how many blocks must pass before monitorChainHeight
+// rewrites the tela_cache.bin height field. At chain tip (~1 block per 18s)
+// this means a rewrite every ~30 minutes instead of every block.
+const telaCacheHeightThrottle = 100
+
 // monitorChainHeight polls daemon for current chain height.
 func (idx *Indexer) monitorChainHeight() {
+	var lastCacheHeight int64
 	for !idx.Closing.Load() {
 		err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			info, err := c.GetInfo()
@@ -173,11 +210,15 @@ func (idx *Indexer) monitorChainHeight() {
 			oldHeight := idx.ChainHeight.Load()
 			idx.ChainHeight.Store(newHeight)
 
-			// Update TELA cache height whenever chain grows (keep cache fresh)
-			if newHeight > oldHeight && oldHeight > 0 {
+			// Throttle tela_cache height rewrites: full-file rewrite every block
+			// is gratuitous I/O when the only change is the Height field.
+			if newHeight > oldHeight && oldHeight > 0 &&
+				newHeight-lastCacheHeight >= telaCacheHeightThrottle {
 				if cached, err := loadTELACache(idx.DBDir); err == nil {
 					cached.Height = newHeight
-					saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, newHeight)
+					if err := saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, newHeight); err == nil {
+						lastCacheHeight = newHeight
+					}
 				}
 			}
 			return nil
@@ -210,10 +251,13 @@ type fetchedBatch struct {
 	regCount int64
 }
 
-// blockInfo holds parsed TX hashes for a single block height.
+// blockInfo holds parsed TX hashes and the block hash for a single height.
+// The block hash is committed atomically with the batch in FlushBatch; a
+// mismatch against stored hash at h-1 is the reorg signal (DESIGN.md §6).
 type blockInfo struct {
-	height   int64
-	txHashes []string
+	height    int64
+	blockHash string // 64-hex; empty only on parse failure
+	txHashes  []string
 }
 
 // processedBatch carries indexed data from the processor to the flusher.
@@ -272,9 +316,13 @@ func (idx *Indexer) scanLoop() {
 func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 	batchBlockCount := idx.ParallelBlocks
 	caughtUp := false
+	// fetcher advances its own cursor so it doesn't race against the lagging
+	// LastIndexedHeight atomic (which is now only advanced by the flusher on
+	// successful commit). Reorg detection & restart still read the atomic.
+	nextHeight := idx.LastIndexedHeight.Load()
 
 	for !idx.Closing.Load() {
-		lastHeight := idx.LastIndexedHeight.Load()
+		lastHeight := nextHeight
 		chainHeight := idx.ChainHeight.Load()
 
 		// --- Speculative prefetch when caught up ---
@@ -301,6 +349,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			if fb != nil {
 				caughtUp = false
 				out <- fb
+				nextHeight++
 			}
 			continue
 		}
@@ -334,6 +383,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		blocks := make([]blockInfo, 0, fetchCount)
 		allTxHashes := make([]string, 0, fetchCount*10)
 		var regCount int64
+		firstBlockChecked := false
 
 		for i, result := range blockResults {
 			if result == nil {
@@ -353,6 +403,24 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			} else if err := json.Unmarshal([]byte(result.Json), &bl); err != nil {
 				logger.Errorf("parse block %d: %v", heights[i], err)
 				continue
+			}
+
+			// Block hash — committed atomically with batch data for reorg detection.
+			bi.blockHash = bl.GetHash().String()
+
+			// M1 reorg detection: on the FIRST successfully-parsed block of each
+			// batch, verify the block's parent tip chains onto the stored hash
+			// at h-1. DERO blocks are a DAG (Tips is a slice), but in the linear
+			// portion of the chain we care about there is exactly one tip — the
+			// direct ancestor. If Tips is empty (genesis or malformed) we skip.
+			// Cheap (one bbolt read per batch) and it runs in the fetcher so the
+			// processor never sees a bad chain. Mismatch only logs+counts in M1;
+			// M2 will truncate+replay.
+			if !firstBlockChecked && len(bl.Tips) > 0 {
+				firstBlockChecked = true
+				if ok, storedAt := idx.CheckReorgAt(int64(heights[i]), bl.Tips[0].String()); !ok {
+					idx.onReorgDetected(storedAt, int64(heights[i]))
+				}
 			}
 
 			for _, h := range bl.Tx_hashes {
@@ -390,6 +458,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			blocks:       blocks,
 			regCount:     regCount,
 		}
+		nextHeight += int64(fetchCount)
 	}
 }
 
@@ -412,6 +481,8 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 		return nil
 	}
 
+	bi.blockHash = bl.GetHash().String()
+
 	allTxHashes := make([]string, 0, len(bl.Tx_hashes))
 	for _, h := range bl.Tx_hashes {
 		hashStr := h.String()
@@ -426,7 +497,7 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 
 	var txResult *rpc.GetTransaction_Result
 	if len(allTxHashes) > 0 {
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			var e error
 			txResult, e = c.GetTransaction(allTxHashes)
 			return e
@@ -448,11 +519,17 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 // WriteBatch objects, and sends them to the flusher. All CPU-bound work
 // (hex decode, protobuf deserialize, SC argument parsing) lives here,
 // isolated from I/O stages.
+//
+// Progress invariant: processorLoop tracks a local runningHeight but does NOT
+// update idx.LastIndexedHeight. Only flusherLoop advances the atomic, and only
+// after FlushBatch commits. This prevents the indexer from skipping blocks on
+// restart after a mid-flight flush error.
 func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processedBatch) {
 	batchSize := idx.BatchSize
 	batch := storage.NewWriteBatch()
 	blocksInBatch := 0
 	syncSignaled := false
+	runningHeight := idx.LastIndexedHeight.Load()
 
 	for fb := range in {
 		if idx.Closing.Load() {
@@ -485,6 +562,15 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 
 		// Decode and index all transactions
 		var burnCount, normCount int64
+
+		// Route B: record the per-block hashes atomically with the batch.
+		// Empty hashes (parse failed) are skipped — downstream reorg logic
+		// tolerates gaps and will verify on the next successful fetch.
+		for _, bi := range fb.blocks {
+			if bi.blockHash != "" {
+				batch.AddBlockHash(bi.height, bi.blockHash)
+			}
+		}
 
 		if fb.txResult != nil && len(fb.txResult.Txs_as_hex) > 0 {
 			txMap := make(map[string]int, len(fb.allTxHashes))
@@ -529,9 +615,8 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 		batch.BurnTxCount += burnCount
 		batch.NormTxCount += normCount
 
-		lastHeight := idx.LastIndexedHeight.Load()
-		newHeight := lastHeight + int64(fb.fetchCount)
-		idx.LastIndexedHeight.Store(newHeight)
+		newHeight := runningHeight + int64(fb.fetchCount)
+		runningHeight = newHeight
 		batch.LastHeight = newHeight
 		blocksInBatch += fb.fetchCount
 
@@ -563,6 +648,7 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 // so neither the fetcher nor the processor blocks on bbolt commits.
 func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 	startTime := time.Now()
+	scanStartHeight := idx.LastIndexedHeight.Load()
 	batchSize := idx.BatchSize
 	syncEnabled := false
 
@@ -573,6 +659,7 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 				if err := idx.Store.FlushBatch(pb.batch); err != nil {
 					logger.Errorf("FlushBatch (drain): %v", err)
 				}
+				storage.PutWriteBatch(pb.batch)
 			}
 			continue
 		}
@@ -601,13 +688,40 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 		if err := idx.Store.FlushBatch(pb.batch); err != nil {
 			logger.Errorf("FlushBatch: %v", err)
 		} else {
+			// Only advance the durable progress atomic after the DB commit succeeds.
+			// If the process dies between here and the next flush, restart resumes
+			// from this point — we never claim progress we haven't persisted.
+			idx.LastIndexedHeight.Store(pb.newHeight)
+			// SafeHeight = indexed - finality_depth, bounded at 0.
+			prevSafe := idx.SafeHeight.Load()
+			safe := pb.newHeight - idx.FinalityDepth
+			if safe < 0 {
+				safe = 0
+			}
+			idx.SafeHeight.Store(safe)
+			// Route B M1: publish events AFTER durable commit. Bus is nil-safe.
+			idx.publishBatchEvents(pb.batch, pb.newHeight, safe, prevSafe)
 			chainHeight := idx.ChainHeight.Load()
 			elapsed := time.Since(startTime)
-			bps := float64(pb.newHeight) / elapsed.Seconds()
-			eta := time.Duration(float64(chainHeight-pb.newHeight)/bps) * time.Second
-			logger.Infof("Height: %d/%d | %.0f blk/s | ETA: %v | Batch: %d",
+			// bps was previously float64(pb.newHeight)/elapsed, i.e. absolute chain
+			// height divided by uptime — reporting 177,000 blk/s on mainnet when
+			// the real rate was 70. Subtract the scan start so the number means
+			// "blocks this process has scanned per second."
+			scanned := pb.newHeight - scanStartHeight
+			var bps float64
+			if elapsed.Seconds() > 0 {
+				bps = float64(scanned) / elapsed.Seconds()
+			}
+			var eta time.Duration
+			if bps > 0 && pb.newHeight < chainHeight {
+				eta = time.Duration(float64(chainHeight-pb.newHeight)/bps) * time.Second
+			}
+			logger.Infof("Height: %d/%d | %.1f blk/s | ETA: %v | Batch: %d",
 				pb.newHeight, chainHeight, bps, eta.Round(time.Second), batchSize)
 		}
+		// Recycle the batch whether flush succeeded or failed — either way we're
+		// done with it. Losing one batch to GC on error is cheap; leaking is not.
+		storage.PutWriteBatch(pb.batch)
 
 		// Adaptive batch sizing
 		if idx.AdaptBatchSize {
@@ -653,7 +767,7 @@ func (idx *Indexer) postScanVariableFetch() {
 		go func() {
 			defer wg.Done()
 			for scid := range work {
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					result, err := c.GetSC(scid, -1, nil, nil, false)
 					if err != nil {
 						return err
@@ -675,35 +789,6 @@ func (idx *Indexer) postScanVariableFetch() {
 		logger.Errorf("post-scan flush: %v", err)
 	}
 	logger.Info("Post-scan variable fetch complete")
-}
-
-// processTxResults processes batch transaction results.
-func (idx *Indexer) processTxResults(wi *structures.WorkItem, txResult *rpc.GetTransaction_Result, hashes []string, batch *storage.WriteBatch) {
-	for i, txHex := range txResult.Txs_as_hex {
-		txBin, err := hex.DecodeString(txHex)
-		if err != nil {
-			logger.Errorf("decode tx hex: %v", err)
-			continue
-		}
-
-		var tx transaction.Transaction
-		if err := tx.Deserialize(txBin); err != nil {
-			logger.Errorf("deserialize tx: %v", err)
-			continue
-		}
-
-		switch tx.TransactionType {
-		case transaction.SC_TX:
-			idx.processSCTx(&tx, txResult.Txs[i], hashes[i], wi.Height, batch)
-		case transaction.REGISTRATION:
-			wi.RegCount++
-		case transaction.BURN_TX:
-			wi.BurnCount++
-		case transaction.NORMAL:
-			wi.NormCount++
-			idx.processNormalTx(&tx, txResult.Txs[i], hashes[i], wi.Height, batch)
-		}
-	}
 }
 
 // processSCTx handles a smart contract transaction.
@@ -739,7 +824,9 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 
 	if method == structures.MethodInstallSC {
 		if idx.TurboMode {
-			// Turbo: record install from TX data, skip GetSC
+			// Turbo: record install from TX data, skip GetSC.
+			// We still have SC_CODE in scArgs — classify from that alone
+			// (no variables yet, but code is enough for class detection).
 			idx.ValidatedSCs.Store(scid, struct{}{})
 			batch.AddOwner(scid, sender)
 			batch.AddInvocation(structures.InvokeRecord{
@@ -751,12 +838,23 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 				},
 			})
 			batch.AddInteractionHeight(scid, height)
+			batch.AddInstall(scid, height, &structures.InstallRecord{
+				Owner: sender, Entrypoint: entrypoint, Fees: scFees,
+			})
+			// Classify from code only (turbo skips variable fetch).
+			code := fmt.Sprintf("%v", scArgs.Value("SC_CODE", "S"))
+			sc := ClassifySC(scid, code, nil)
+			batch.AddClass(scid, &structures.ClassMeta{
+				Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+				InstallHeight: height, LastHeight: height,
+			})
+			batch.AddAddrSCID(sender, scid, height)
 		} else {
 			idx.handleInstallSC(scid, sender, entrypoint, height, scArgs, scFees, tx, batch)
 		}
 	} else {
 		if idx.TurboMode {
-			// Turbo: record invoke from TX data, skip GetSC
+			// Turbo: record invoke from TX data, skip GetSC.
 			idx.ValidatedSCs.Store(scid, struct{}{})
 			batch.AddInvocation(structures.InvokeRecord{
 				Scid: scid, Sender: sender, Entrypoint: entrypoint,
@@ -767,10 +865,23 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 				},
 			})
 			batch.AddInteractionHeight(scid, height)
+			batch.AddAddrSCID(sender, scid, height)
 		} else {
 			idx.handleInvokeSC(scid, sender, entrypoint, height, scArgs, scFees, txid, batch)
 		}
 	}
+}
+
+// varsToMap converts parseSCVariables output to the string-keyed map
+// ClassifySC expects. Non-string keys are ignored.
+func varsToMap(vars []*structures.SCIDVariable) map[string]interface{} {
+	m := make(map[string]interface{}, len(vars))
+	for _, v := range vars {
+		if k, ok := v.Key.(string); ok {
+			m[k] = v.Value
+		}
+	}
+	return m
 }
 
 // handleInstallSC processes a new SC deployment.
@@ -784,7 +895,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 
 	// Fetch SC variables
 	var scVars []*structures.SCIDVariable
-	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 		result, err := c.GetSC(scid, height, nil, nil, false)
 		if err != nil {
 			return err
@@ -821,27 +932,41 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 	})
 	batch.AddVariables(scid, height, scVars)
 	batch.AddInteractionHeight(scid, height)
+
+	// Route B: classify, record install, record addr→scid edge.
+	batch.AddInstall(scid, height, &structures.InstallRecord{
+		Owner: sender, Entrypoint: entrypoint, Fees: fees,
+	})
+	sc := ClassifySC(scid, code, varsToMap(scVars))
+	batch.AddClass(scid, &structures.ClassMeta{
+		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+		InstallHeight: height, LastHeight: height,
+	})
+	batch.AddAddrSCID(sender, scid, height)
 }
 
 // handleInvokeSC processes an SC invocation.
+//
+// This does exactly one GetSC regardless of whether the SCID is already
+// validated: the result is used both to validate (non-empty vars) and to
+// record the post-invoke variable snapshot. The previous implementation fetched
+// twice on first encounter of an unknown SCID.
 func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, txid string, batch *storage.WriteBatch) {
-	// Validate this SCID is known or discover it
-	if _, ok := idx.ValidatedSCs.Load(scid); !ok {
-		// Try to validate
-		var scVars []*structures.SCIDVariable
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-			result, err := c.GetSC(scid, height, nil, nil, false)
-			if err != nil {
-				return err
-			}
-			scVars = parseSCVariables(result)
-			return nil
-		})
-		if len(scVars) > 0 {
-			idx.ValidatedSCs.Store(scid, struct{}{})
-		} else {
-			return // invalid SCID
+	var scVars []*structures.SCIDVariable
+	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		result, err := c.GetSC(scid, height, nil, nil, false)
+		if err != nil {
+			return err
 		}
+		scVars = parseSCVariables(result)
+		return nil
+	})
+
+	if _, known := idx.ValidatedSCs.Load(scid); !known {
+		if len(scVars) == 0 {
+			return // unknown and invalid; drop
+		}
+		idx.ValidatedSCs.Store(scid, struct{}{})
 	}
 
 	batch.AddInvocation(structures.InvokeRecord{
@@ -861,20 +986,27 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 		},
 	})
 
-	// Fetch updated variables
-	var scVars []*structures.SCIDVariable
-	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-		result, err := c.GetSC(scid, height, nil, nil, false)
-		if err != nil {
-			return err
-		}
-		scVars = parseSCVariables(result)
-		return nil
-	})
 	if len(scVars) > 0 {
 		batch.AddVariables(scid, height, scVars)
 	}
 	batch.AddInteractionHeight(scid, height)
+
+	// Route B: refresh class metadata (TELA apps bump version via STORE) and
+	// record addr→scid edge.
+	if len(scVars) > 0 {
+		sc := ClassifySC(scid, "", varsToMap(scVars))
+		// Preserve InstallHeight if we have prior meta; this is a refresh.
+		existingMeta, _ := idx.Store.GetSCIDClass(scid)
+		installH := height
+		if existingMeta != nil {
+			installH = existingMeta.InstallHeight
+		}
+		batch.AddClass(scid, &structures.ClassMeta{
+			Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+			InstallHeight: installH, LastHeight: height,
+		})
+	}
+	batch.AddAddrSCID(sender, scid, height)
 }
 
 // processNormalTx handles a normal transaction with SCID payload.
@@ -885,8 +1017,13 @@ func (idx *Indexer) processNormalTx(tx *transaction.Transaction, txInfo rpc.Tx_R
 		if scidStr == "0000000000000000000000000000000000000000000000000000000000000000" {
 			continue
 		}
+		scidStr = hgpool.InternSCID(scidStr)
 		for _, addr := range txInfo.Ring[j] {
 			addr = hgpool.InternAddress(addr)
+			// Route B: ring member touched this SCID. Useful for "this address
+			// might be a participant of this SCID." Heavy but cardinality is
+			// bounded by ring size.
+			batch.AddAddrSCID(addr, scidStr, height)
 			ntx := &structures.NormalTXWithSCIDParse{
 				Txid:   txid,
 				Scid:   scidStr,
@@ -943,3 +1080,183 @@ func (idx *Indexer) Close() {
 		idx.Store.Close()
 	}
 }
+
+// IndexSingleSCIDResult is returned by IndexSingleSCID. It mirrors the WS
+// method's JSON response shape but in Go-native types so additional callers
+// (HTTP handlers, tests) can consume it without a second parse.
+type IndexSingleSCIDResult struct {
+	SCID      string                `json:"scid"`
+	ClassMeta *structures.ClassMeta `json:"-"`
+	VarsCount int                   `json:"vars_count"`
+	// FromCache indicates this SCID was already in the class bucket and
+	// skipfsrecheck=true caused us to return cached metadata without hitting
+	// the daemon.
+	FromCache bool `json:"-"`
+}
+
+// IndexSingleSCID imports a single SCID on demand, bypassing the normal scan
+// pipeline. This is the counterpart to civilware/Gnomon's "addscid_toindex":
+// useful for SCs that don't show up in the GnomonSC registry (the usual
+// discovery mechanism) but that a client still wants indexed.
+//
+// Flow:
+//  1. If skipfsrecheck && meta already in class bucket, return cached.
+//  2. GetSC(scid, -1, nil, nil, !varsonly) via the RPC pool. -1 means "tip".
+//  3. If vars empty, return ErrSCIDNotFound (SC doesn't exist on-chain).
+//  4. ClassifySC(scid, code, varsToMap(vars)) → class meta.
+//  5. Persist: owner (if extractable), variables at tip height, class, install.
+//  6. Publish an EventInstall via the bus so subscribers learn about it.
+//
+// varsonly skips the SC_CODE fetch (smaller/faster, but class will typically
+// be UNKNOWN since most classifiers need code). skipfsrecheck short-circuits
+// the fetch entirely if we already have class metadata.
+//
+// This path does not use the scan-loop WriteBatch pool — it allocates a fresh
+// batch, fills it, flushes it, and publishes. One-shot. Height used is the
+// current chain tip (idx.ChainHeight); LastIndexedHeight is NOT advanced
+// because we haven't actually scanned the block at tip.
+func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (*IndexSingleSCIDResult, error) {
+	// Skip recheck fast-path: if we already have class metadata for this
+	// SCID, return it without contacting the daemon. Variables are not
+	// reloaded; callers that want fresh variables should pass
+	// skipfsrecheck=false.
+	if skipfsrecheck {
+		if meta, err := idx.Store.GetSCIDClass(scid); err == nil && meta != nil {
+			// Count stored variables at the last known height to fill vars_count.
+			vars, _ := idx.Store.GetSCIDVariableDetailsAtHeight(scid, meta.LastHeight)
+			return &IndexSingleSCIDResult{
+				SCID:      scid,
+				ClassMeta: meta,
+				VarsCount: len(vars),
+				FromCache: true,
+			}, nil
+		}
+	}
+
+	// Fetch from the daemon at chain tip (-1). Code is fetched unless varsonly.
+	var result *rpc.GetSC_Result
+	err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		var e error
+		result, e = c.GetSC(scid, -1, nil, nil, !varsonly)
+		return e
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetSC: %w", err)
+	}
+
+	scVars := parseSCVariables(result)
+	if len(scVars) == 0 {
+		return nil, ErrSCIDNotFound
+	}
+
+	// Height used for all stored records. Chain tip is best-effort; falls back
+	// to LastIndexedHeight if the tip monitor hasn't populated yet.
+	height := idx.ChainHeight.Load()
+	if height <= 0 {
+		height = idx.LastIndexedHeight.Load()
+	}
+
+	varsMap := varsToMap(scVars)
+
+	// Owner from variables if present. ClassifySC headers and the classifier
+	// both read from the same map so we only build it once.
+	owner := ""
+	if v, ok := varsMap["owner"]; ok {
+		owner = fmt.Sprintf("%v", v)
+	}
+
+	// Code is only present when !varsonly. ClassifySC handles "" gracefully.
+	code := ""
+	if result != nil {
+		code = result.Code
+	}
+
+	sc := ClassifySC(scid, code, varsMap)
+
+	// Preserve an earlier install height if one was previously recorded. This
+	// matters when addscid_toindex is called multiple times against the same
+	// SCID or after it was discovered by the normal scan path.
+	installH := height
+	if existing, err := idx.Store.GetSCIDClass(scid); err == nil && existing != nil {
+		if existing.InstallHeight > 0 {
+			installH = existing.InstallHeight
+		}
+	}
+
+	meta := &structures.ClassMeta{
+		Class:         sc.Class,
+		Tags:          sc.Tags,
+		Name:          sc.Name,
+		Desc:          sc.Desc,
+		IconURL:       sc.IconURL,
+		InstallHeight: installH,
+		LastHeight:    height,
+	}
+
+	// Build a one-shot batch — same shape as the scan-loop path so we benefit
+	// from the same atomic commit semantics (all or nothing).
+	batch := storage.NewWriteBatch()
+	defer storage.PutWriteBatch(batch)
+
+	batch.LastHeight = height
+	if owner != "" {
+		batch.AddOwner(scid, owner)
+	}
+	batch.AddVariables(scid, height, scVars)
+	batch.AddInteractionHeight(scid, height)
+	batch.AddInstall(scid, installH, &structures.InstallRecord{
+		Owner:      owner,
+		Entrypoint: "",
+		Fees:       0,
+	})
+	batch.AddClass(scid, meta)
+	if owner != "" {
+		batch.AddAddrSCID(owner, scid, height)
+	}
+
+	if err := idx.Store.FlushBatch(batch); err != nil {
+		return nil, fmt.Errorf("FlushBatch: %w", err)
+	}
+
+	// Mark the SCID as validated so subsequent invoke processing skips a
+	// redundant GetSC validation round-trip.
+	idx.ValidatedSCs.Store(scid, struct{}{})
+
+	// Publish an install event for subscribers. Matches the shape published
+	// by the scan loop's flusher so subscribe filters stay consistent.
+	if idx.Bus != nil {
+		safe := idx.SafeHeight.Load()
+		idx.Bus.Publish(eventbus.Event{
+			Type:       eventbus.EventInstall,
+			Height:     installH,
+			SafeHeight: safe,
+			SCID:       scid,
+			Owner:      owner,
+			Payload: &structures.InstallRecord{
+				Owner: owner,
+			},
+		})
+		if meta.Class != "" && meta.Class != "UNKNOWN" {
+			idx.Bus.Publish(eventbus.Event{
+				Type:       eventbus.EventClassMatch,
+				Height:     height,
+				SafeHeight: safe,
+				SCID:       scid,
+				Class:      meta.Class,
+				Tags:       meta.Tags,
+				Payload:    meta,
+			})
+		}
+	}
+
+	return &IndexSingleSCIDResult{
+		SCID:      scid,
+		ClassMeta: meta,
+		VarsCount: len(scVars),
+	}, nil
+}
+
+// ErrSCIDNotFound signals that GetSC returned no variables for the requested
+// SCID, i.e. the SC doesn't exist on-chain. Callers (the WS handler) translate
+// this to a JSON-RPC application error rather than an internal error.
+var ErrSCIDNotFound = fmt.Errorf("scid not found")

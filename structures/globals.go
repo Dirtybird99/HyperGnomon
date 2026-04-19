@@ -6,8 +6,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Version is set via -ldflags -X at release build time (goreleaser).
+// Default value below is what unreleased/development builds report.
+var Version = "0.8.0-dev"
+
 const (
-	Version = "0.7.0"
 	AppName = "HyperGnomon"
 
 	// Mainnet GnomonSC SCID for fastsync
@@ -23,6 +26,10 @@ const (
 	DefaultPoolSize = 8
 	// Default parallel block fetchers
 	DefaultParallelBlocks = 20
+	// Default blocks-behind-tip considered safe from reorg.
+	// DERO stabilizes in ~8 blocks; 10 is a pragmatic safety margin.
+	// Exposed as SafeHeight in API responses.
+	DefaultFinalityDepth = 10
 )
 
 // DefaultExclusions are large/known non-TELA SCIDs to skip during probing.

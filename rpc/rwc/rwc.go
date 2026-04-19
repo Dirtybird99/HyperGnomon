@@ -10,7 +10,6 @@ import (
 type ReadWriteCloser struct {
 	ws *websocket.Conn
 	r  io.Reader
-	w  io.WriteCloser
 }
 
 // New wraps a websocket connection as a ReadWriteCloser.

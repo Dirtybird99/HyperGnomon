@@ -1,20 +1,19 @@
-# GoReleaser configuration
-# Run: goreleaser release --clean
+# GoReleaser configuration for HyperGnomon
+# Run:  goreleaser release --clean
 # Docs: https://goreleaser.com/customization/
 
 version: 2
 
-project_name: go-workflow-template
+project_name: hypergnomon
 
 before:
   hooks:
     - go mod tidy
-    - go generate ./...
 
 builds:
-  - id: main
-    main: ./cmd/app
-    binary: app
+  - id: hypergnomon
+    main: ./cmd/hypergnomon
+    binary: hypergnomon
     env:
       - CGO_ENABLED=0
     goos:
@@ -24,19 +23,36 @@ builds:
     goarch:
       - amd64
       - arm64
-    goarm:
-      - "7"
     ldflags:
       - -s -w
-      - -X main.version={{.Version}}
-      - -X main.commit={{.Commit}}
-      - -X main.date={{.Date}}
-      - -X main.builtBy=goreleaser
+      - -X github.com/hypergnomon/hypergnomon/structures.Version={{.Version}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  # wstest is a small WS smoke-test CLI bundled in the archive so operators
+  # can exercise the subscribe API against a running node without building
+  # from source. Not the primary binary.
+  - id: wstest
+    main: ./cmd/wstest
+    binary: wstest
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
   - id: default
-    format: tar.gz
+    ids:
+      - hypergnomon
+      - wstest
+    formats: ["tar.gz"]
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
@@ -44,15 +60,15 @@ archives:
       {{- if eq .Arch "amd64" }}x86_64
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
-      {{- if .Arm }}v{{ .Arm }}{{ end }}
     format_overrides:
       - goos: windows
-        format: zip
+        formats: ["zip"]
     files:
       - LICENSE*
       - README*
-      - CHANGELOG*
-      - docs/*
+      - SECURITY*
+      - DESIGN*
+      - CLAUDE*
 
 checksum:
   name_template: "checksums.txt"
@@ -68,21 +84,24 @@ changelog:
     - title: "🚀 Features"
       regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
       order: 0
+    - title: "⚡ Performance"
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 1
     - title: "🐛 Bug Fixes"
       regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
-      order: 1
+      order: 2
     - title: "📚 Documentation"
       regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
-      order: 2
+      order: 3
     - title: "🧪 Tests"
       regexp: '^.*?test(\([[:word:]]+\))??!?:.+$'
-      order: 3
+      order: 4
+    - title: "📊 Benchmarks"
+      regexp: '^.*?bench(\([[:word:]]+\))??!?:.+$'
+      order: 5
     - title: "🔧 Maintenance"
       regexp: '^.*?(chore|ci|build)(\([[:word:]]+\))??!?:.+$'
-      order: 4
-    - title: "⬆️ Dependencies"
-      regexp: '^.*?deps(\([[:word:]]+\))??!?:.+$'
-      order: 5
+      order: 6
     - title: Others
       order: 999
   filters:
@@ -92,86 +111,24 @@ changelog:
       - "typo"
 
 release:
-  # Auto-detect from git remote (no need to specify owner/name)
   draft: false
   prerelease: auto
   mode: append
   header: |
-    ## What's Changed in {{ .Tag }}
+    ## HyperGnomon {{ .Tag }}
+
+    Arena-accelerated DERO blockchain indexer. Finds all TELA apps on the
+    entire chain in under 5s (cold), 14ms (cached).
+
+    ### Install (pre-built)
+    Grab the archive for your OS below, extract, and run:
+    ```
+    ./hypergnomon --daemon-rpc-address=127.0.0.1:10102 --fastsync --turbo
+    ```
+
+    ### Install (from source)
+    ```
+    go install github.com/hypergnomon/hypergnomon/cmd/hypergnomon@{{ .Tag }}
+    ```
   footer: |
     **Full Changelog**: {{ .GitURL }}/compare/{{ .PreviousTag }}...{{ .Tag }}
-
-# Optional features below are disabled by default.
-# Uncomment and configure when you have the required infrastructure.
-
-# # Optional: Sign artifacts with GPG
-# signs:
-#   - cmd: gpg
-#     args:
-#       - "--batch"
-#       - "--local-user"
-#       - "{{ .Env.GPG_FINGERPRINT }}"
-#       - "--output"
-#       - "${signature}"
-#       - "--detach-sign"
-#       - "${artifact}"
-#     artifacts: checksum
-#     output: true
-
-# # Optional: Docker images (requires Dockerfile)
-# dockers:
-#   - image_templates:
-#       - "ghcr.io/your-org/{{ .ProjectName }}:{{ .Version }}"
-#       - "ghcr.io/your-org/{{ .ProjectName }}:latest"
-#     dockerfile: Dockerfile
-#     build_flag_templates:
-#       - "--pull"
-#       - "--label=org.opencontainers.image.created={{.Date}}"
-#       - "--label=org.opencontainers.image.title={{.ProjectName}}"
-#       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-#       - "--label=org.opencontainers.image.version={{.Version}}"
-#       - "--platform=linux/amd64"
-
-# # Optional: Homebrew tap (requires homebrew-tap repo)
-# brews:
-#   - repository:
-#       owner: your-org
-#       name: homebrew-tap
-#     directory: Formula
-#     homepage: https://github.com/your-org/your-repo
-#     description: "Your project description"
-#     license: "MIT"
-#     test: |
-#       system "#{bin}/your-app", "--version"
-#     install: |
-#       bin.install "your-app"
-
-# # Optional: Scoop manifest for Windows (requires scoop-bucket repo)
-# scoops:
-#   - repository:
-#       owner: your-org
-#       name: scoop-bucket
-#     homepage: https://github.com/your-org/your-repo
-#     description: "Your project description"
-#     license: MIT
-
-# # Optional: AUR package for Arch Linux (requires AUR account)
-# aurs:
-#   - name: your-app-bin
-#     homepage: https://github.com/your-org/your-repo
-#     description: "Your project description"
-#     maintainers:
-#       - "Your Name <your@email.com>"
-#     license: MIT
-#     private_key: "{{ .Env.AUR_KEY }}"
-#     git_url: "ssh://aur@aur.archlinux.org/your-app-bin.git"
-#     package: |-
-#       install -Dm755 "./your-app" "${pkgdir}/usr/bin/your-app"
-#       install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/your-app/LICENSE"
-
-# # Announce releases (optional)
-# announce:
-#   skip: true
-#   discord:
-#     enabled: true
-#     message_template: "🎉 {{ .ProjectName }} {{ .Tag }} released! {{ .ReleaseURL }}"

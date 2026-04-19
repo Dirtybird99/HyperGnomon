@@ -109,3 +109,43 @@ func (w *WorkItem) Reset() {
 	w.NormalTxs = w.NormalTxs[:0]
 	w.Err = nil
 }
+
+// ----- Route B (DESIGN.md §3) additions -----
+
+// ClassMeta is stored in the class bucket under key
+// "<class>:<BE8 install_height>:<scid>" and also on a per-SCID lookup bucket.
+// Populated at index time by ClassifySC.
+type ClassMeta struct {
+	Class         string   `msgpack:"class"`
+	Tags          []string `msgpack:"tags"`
+	Name          string   `msgpack:"name,omitempty"`
+	Desc          string   `msgpack:"desc,omitempty"`
+	IconURL       string   `msgpack:"icon,omitempty"`
+	InstallHeight int64    `msgpack:"install_h"`
+	LastHeight    int64    `msgpack:"last_h"`
+}
+
+// InstallRecord is stored in the installs bucket under key
+// "<BE8 height>:<scid>". Enables "SCs installed in [h1,h2)" in a prefix scan.
+type InstallRecord struct {
+	Owner      string `msgpack:"owner"`
+	Entrypoint string `msgpack:"entrypoint,omitempty"`
+	Fees       uint64 `msgpack:"fees"`
+}
+
+// AddrSCIDEntry is the value of a nested addr_scids/<addr>/<scid> record.
+// Tracks first/last interaction and count; doubles as a per-address activity
+// rollup for /api/address/{addr}/scs.
+type AddrSCIDEntry struct {
+	FirstHeight int64 `msgpack:"first"`
+	LastHeight  int64 `msgpack:"last"`
+	Count       int64 `msgpack:"count"`
+}
+
+// ClassInstall pairs a classified SCID with its install height. Returned by
+// GetClassInstalls for the class index prefix scan.
+type ClassInstall struct {
+	SCID          string
+	InstallHeight int64
+	Meta          *ClassMeta
+}
