@@ -371,32 +371,53 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			}
 		}
 
-		// Store invocations
+		// keyBuf is reused across both the invocation and variable loops below.
+		// bbolt.Bucket.Put copies the key internally (see bolt.Bucket.Put → node.put
+		// which copies into its own arena), so reusing a single backing slice is safe.
+		// Pre-size for the worst common case: 64-char addr + ':' + 64-char txid +
+		// ':' + up to 20-char int + ':' + ~32-char entrypoint ≈ 184 bytes.
+		keyBuf := make([]byte, 0, 192)
+
+		// Store invocations.
+		// Old path used fmt.Sprintf("%s:%s:%d:%s", ...) which allocates a fresh string
+		// per invocation. Replaced with append + strconv.AppendInt to produce the
+		// exact same key bytes without any per-iteration allocation.
 		for _, inv := range batch.Invocations {
 			b, err := tx.CreateBucketIfNotExists([]byte(inv.Scid))
 			if err != nil {
 				return fmt.Errorf("batch invoke bucket %s: %w", inv.Scid, err)
 			}
-			key := fmt.Sprintf("%s:%s:%d:%s", inv.Sender, inv.Details.Txid, inv.Height, inv.Entrypoint)
+			keyBuf = keyBuf[:0]
+			keyBuf = append(keyBuf, inv.Sender...)
+			keyBuf = append(keyBuf, ':')
+			keyBuf = append(keyBuf, inv.Details.Txid...)
+			keyBuf = append(keyBuf, ':')
+			keyBuf = strconv.AppendInt(keyBuf, inv.Height, 10)
+			keyBuf = append(keyBuf, ':')
+			keyBuf = append(keyBuf, inv.Entrypoint...)
 			val, err := msgpack.Marshal(inv.Details)
 			if err != nil {
 				return fmt.Errorf("batch invoke marshal: %w", err)
 			}
-			if err := b.Put([]byte(key), val); err != nil {
+			if err := b.Put(keyBuf, val); err != nil {
 				return err
 			}
 		}
 
-		// Store variables
+		// Store variables.
+		// Same treatment: fmt.Sprintf("%s:%d", scid, height) → append + AppendInt.
 		varBucket := tx.Bucket(bucketScVars)
 		for scid, heightVars := range batch.Variables {
 			for height, vars := range heightVars {
-				key := fmt.Sprintf("%s:%d", scid, height)
+				keyBuf = keyBuf[:0]
+				keyBuf = append(keyBuf, scid...)
+				keyBuf = append(keyBuf, ':')
+				keyBuf = strconv.AppendInt(keyBuf, height, 10)
 				val, err := msgpack.Marshal(vars)
 				if err != nil {
 					return fmt.Errorf("batch vars marshal: %w", err)
 				}
-				if err := varBucket.Put([]byte(key), val); err != nil {
+				if err := varBucket.Put(keyBuf, val); err != nil {
 					return err
 				}
 			}
