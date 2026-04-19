@@ -551,8 +551,16 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 
 		// Address reverse index: nested bucket per address, scid as key.
 		// Merge with any existing entry (min/max/sum).
+		//
+		// v1 typed encoding (DESIGN.md §3 optimization C6): 25-byte fixed
+		// layout, tag byte 0x01. Legacy msgpack records (tag 0x80-0x8f
+		// fixmap) are still readable — we dispatch on byte[0]. Writes are
+		// always v1, so legacy blobs get upgraded on next touch.
 		if len(batch.AddrSCIDs) > 0 {
 			parent := tx.Bucket(bucketAddrSCIDs)
+			// Reusable encode buffer — bbolt.Put copies, so one slice serves
+			// every Put across the whole addr_scids block.
+			valBuf := make([]byte, 0, structures.EncodedAddrSCIDEntrySize)
 			for addr, scids := range batch.AddrSCIDs {
 				subBucket, err := parent.CreateBucketIfNotExists([]byte(addr))
 				if err != nil {
@@ -563,8 +571,14 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 					merged := delta
 					if existing != nil {
 						var cur structures.AddrSCIDEntry
-						if err := msgpack.Unmarshal(existing, &cur); err != nil {
-							logger.Warnf("addr_scids decode %s/%s: %v (overwriting)", addr, scid, err)
+						var decErr error
+						if structures.IsAddrSCIDEntryTyped(existing) {
+							decErr = cur.UnmarshalTyped(existing)
+						} else {
+							decErr = msgpack.Unmarshal(existing, &cur)
+						}
+						if decErr != nil {
+							logger.Warnf("addr_scids decode %s/%s: %v (overwriting)", addr, scid, decErr)
 						} else {
 							merged = &structures.AddrSCIDEntry{
 								FirstHeight: minInt64(cur.FirstHeight, delta.FirstHeight),
@@ -573,11 +587,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 							}
 						}
 					}
-					val, err := msgpack.Marshal(merged)
-					if err != nil {
-						return err
-					}
-					if err := subBucket.Put([]byte(scid), val); err != nil {
+					valBuf = valBuf[:0]
+					valBuf = merged.MarshalTypedAppend(valBuf)
+					if err := subBucket.Put([]byte(scid), valBuf); err != nil {
 						return err
 					}
 				}
@@ -776,8 +788,16 @@ func (s *BboltStore) GetAddressSCIDs(addr string) (map[string]*structures.AddrSC
 		}
 		return sub.ForEach(func(k, v []byte) error {
 			var e structures.AddrSCIDEntry
-			if err := msgpack.Unmarshal(v, &e); err != nil {
-				logger.Warnf("addr_scids decode %s/%s: %v", addr, string(k), err)
+			var decErr error
+			// Tag-byte dispatch: 0x01 is typed v1, 0x80-0x8f is legacy
+			// msgpack fixmap. New writes always land as v1.
+			if structures.IsAddrSCIDEntryTyped(v) {
+				decErr = e.UnmarshalTyped(v)
+			} else {
+				decErr = msgpack.Unmarshal(v, &e)
+			}
+			if decErr != nil {
+				logger.Warnf("addr_scids decode %s/%s: %v", addr, string(k), decErr)
 				return nil
 			}
 			out[string(k)] = &e
