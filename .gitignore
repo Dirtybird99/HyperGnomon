@@ -42,3 +42,4 @@ vendor/
 
 # Segments temp (parallel sync)
 segments/
+bench-*.txt
