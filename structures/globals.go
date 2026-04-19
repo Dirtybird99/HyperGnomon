@@ -6,8 +6,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Version is set via -ldflags -X at release build time (goreleaser).
+// Default value below is what unreleased/development builds report.
+var Version = "0.8.0-dev"
+
 const (
-	Version = "0.7.0"
 	AppName = "HyperGnomon"
 
 	// Mainnet GnomonSC SCID for fastsync
