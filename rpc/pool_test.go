@@ -223,7 +223,7 @@ func TestPool_Put_AfterClose(t *testing.T) {
 
 func TestPool_ZeroSize(t *testing.T) {
 	p := &Pool{
-		conns:    make(chan *Client, 0),
+		conns:    make(chan *Client),
 		endpoint: "test",
 		size:     0,
 	}

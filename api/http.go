@@ -104,9 +104,9 @@ func (s *Server) refreshInfo() {
 		}
 		s.mu.Lock()
 		s.cachedInfo = &structures.GetInfoResult{
-			Height:       int64(info.Height),
-			TopoHeight:   int64(info.TopoHeight),
-			StableHeight: int64(info.StableHeight),
+			Height:       info.Height,
+			TopoHeight:   info.TopoHeight,
+			StableHeight: info.StableHeight,
 			Status:       info.Status,
 		}
 		s.mu.Unlock()

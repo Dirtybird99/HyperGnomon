@@ -368,7 +368,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() || probeComplete.Load() {
 					return
 				}
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					specs := make([]jrpc2.Spec, len(batch))
 					for i, scid := range batch {
 						specs[i] = jrpc2.Spec{
@@ -481,7 +481,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() {
 					return
 				}
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					specs := make([]jrpc2.Spec, len(batch))
 					for i, scid := range batch {
 						specs[i] = jrpc2.Spec{

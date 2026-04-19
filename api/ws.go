@@ -548,7 +548,7 @@ func stringField(m map[string]interface{}, key string) (string, bool) {
 
 // forwardEvents drains a subscription channel and writes each event as a
 // JSON-RPC notification on the connection. Exits when:
-//   - the events channel is closed (bus cancelled the sub), or
+//   - the events channel is closed (bus canceled the sub), or
 //   - the connection's done channel closes (shutdown), or
 //   - safeWrite errors (peer is gone — tear down the whole connection).
 func (ws *WSServer) forwardEvents(cctx *connContext, id string, ch <-chan eventbus.Event) {

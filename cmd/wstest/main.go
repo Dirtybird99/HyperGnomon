@@ -29,7 +29,7 @@ func main() {
 	path := flag.String("path", "/ws", "WebSocket path")
 	eventsCSV := flag.String("events", "", "Comma-separated event types to subscribe to (empty = all)")
 	scidFilter := flag.String("scid", "", "Optional SCID filter")
-	max := flag.Int("max", 5, "Number of events to print before exiting")
+	maxEvents := flag.Int("max", 5, "Number of events to print before exiting")
 	timeoutSec := flag.Int("timeout", 120, "Total timeout in seconds before giving up")
 	flag.Parse()
 
@@ -90,11 +90,11 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "subscribed: id=%s safe_height=%d; waiting for %d events ...\n",
-		subResp.Result.SubscriptionID, subResp.Result.SafeHeight, *max)
+		subResp.Result.SubscriptionID, subResp.Result.SafeHeight, *maxEvents)
 
-	c.SetReadDeadline(time.Now().Add(time.Duration(*timeoutSec) * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(time.Duration(*timeoutSec) * time.Second))
 
-	for n := 0; n < *max; {
+	for n := 0; n < *maxEvents; {
 		var raw json.RawMessage
 		if err := c.ReadJSON(&raw); err != nil {
 			fmt.Fprintf(os.Stderr, "read: %v\n", err)

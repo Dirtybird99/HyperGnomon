@@ -1,0 +1,30 @@
+=== run 1 ===
+    2461	   1583413 ns/op	      1000 addr_scid_pairs	  607290 B/op	   10047 allocs/op
+    1256	  11230416 ns/op	       100.0 records/flush	 4136572 B/op	    7709 allocs/op
+     147	  33112423 ns/op	      1000 records/flush	11491344 B/op	   79105 allocs/op
+      25	 131938428 ns/op	     10000 records/flush	88274216 B/op	  814300 allocs/op
+    2444	  16010558 ns/op	       100.0 records/flush	 7375247 B/op	    8027 allocs/op
+     432	  14636281 ns/op	       500.0 records/flush	 9548113 B/op	   39465 allocs/op
+     285	  18287264 ns/op	      1000 records/flush	15812789 B/op	   80320 allocs/op
+      73	  54494653 ns/op	      5000 records/flush	47190208 B/op	  394142 allocs/op
+      16	 221162506 ns/op	     10000 records/flush	92753381 B/op	  843116 allocs/op
+=== run 2 ===
+    2721	   1582578 ns/op	      1000 addr_scid_pairs	  607294 B/op	   10046 allocs/op
+    1303	   7891623 ns/op	       100.0 records/flush	 4258709 B/op	    7725 allocs/op
+     294	  17785774 ns/op	      1000 records/flush	16061670 B/op	   80358 allocs/op
+      34	 165091841 ns/op	     10000 records/flush	87893734 B/op	  802173 allocs/op
+    1366	  11463088 ns/op	       100.0 records/flush	 4400057 B/op	    7726 allocs/op
+     286	  17986347 ns/op	       500.0 records/flush	 7559856 B/op	   38978 allocs/op
+     145	  25296673 ns/op	      1000 records/flush	11274391 B/op	   78971 allocs/op
+      40	  90408972 ns/op	      5000 records/flush	42782197 B/op	  395972 allocs/op
+      13	 334338738 ns/op	     10000 records/flush	93082056 B/op	  866099 allocs/op
+=== run 3 ===
+    2916	   1464954 ns/op	      1000 addr_scid_pairs	  607440 B/op	   10045 allocs/op
+    1498	  11976942 ns/op	       100.0 records/flush	 4702262 B/op	    7764 allocs/op
+     158	  26070516 ns/op	      1000 records/flush	11485682 B/op	   79053 allocs/op
+      19	 235533011 ns/op	     10000 records/flush	86523607 B/op	  828602 allocs/op
+    1030	  10265678 ns/op	       100.0 records/flush	 3438522 B/op	    7626 allocs/op
+     304	  19082154 ns/op	       500.0 records/flush	 7843850 B/op	   39046 allocs/op
+     162	  29040085 ns/op	      1000 records/flush	11915697 B/op	   79196 allocs/op
+      27	 180566285 ns/op	      5000 records/flush	40870506 B/op	  400294 allocs/op
+      14	 226420821 ns/op	     10000 records/flush	91722689 B/op	  853349 allocs/op

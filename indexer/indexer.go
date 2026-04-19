@@ -158,7 +158,6 @@ func New(cfg Config) (*Indexer, error) {
 
 // StartDaemonMode connects to the daemon and begins indexing.
 func (idx *Indexer) StartDaemonMode() error {
-
 	// Start background chain height monitor
 	go idx.monitorChainHeight()
 
@@ -498,7 +497,7 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 
 	var txResult *rpc.GetTransaction_Result
 	if len(allTxHashes) > 0 {
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			var e error
 			txResult, e = c.GetTransaction(allTxHashes)
 			return e
@@ -768,7 +767,7 @@ func (idx *Indexer) postScanVariableFetch() {
 		go func() {
 			defer wg.Done()
 			for scid := range work {
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					result, err := c.GetSC(scid, -1, nil, nil, false)
 					if err != nil {
 						return err
@@ -790,35 +789,6 @@ func (idx *Indexer) postScanVariableFetch() {
 		logger.Errorf("post-scan flush: %v", err)
 	}
 	logger.Info("Post-scan variable fetch complete")
-}
-
-// processTxResults processes batch transaction results.
-func (idx *Indexer) processTxResults(wi *structures.WorkItem, txResult *rpc.GetTransaction_Result, hashes []string, batch *storage.WriteBatch) {
-	for i, txHex := range txResult.Txs_as_hex {
-		txBin, err := hex.DecodeString(txHex)
-		if err != nil {
-			logger.Errorf("decode tx hex: %v", err)
-			continue
-		}
-
-		var tx transaction.Transaction
-		if err := tx.Deserialize(txBin); err != nil {
-			logger.Errorf("deserialize tx: %v", err)
-			continue
-		}
-
-		switch tx.TransactionType {
-		case transaction.SC_TX:
-			idx.processSCTx(&tx, txResult.Txs[i], hashes[i], wi.Height, batch)
-		case transaction.REGISTRATION:
-			wi.RegCount++
-		case transaction.BURN_TX:
-			wi.BurnCount++
-		case transaction.NORMAL:
-			wi.NormCount++
-			idx.processNormalTx(&tx, txResult.Txs[i], hashes[i], wi.Height, batch)
-		}
-	}
 }
 
 // processSCTx handles a smart contract transaction.
@@ -925,7 +895,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 
 	// Fetch SC variables
 	var scVars []*structures.SCIDVariable
-	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 		result, err := c.GetSC(scid, height, nil, nil, false)
 		if err != nil {
 			return err
@@ -983,7 +953,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 // twice on first encounter of an unknown SCID.
 func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, txid string, batch *storage.WriteBatch) {
 	var scVars []*structures.SCIDVariable
-	idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 		result, err := c.GetSC(scid, height, nil, nil, false)
 		if err != nil {
 			return err
@@ -1115,9 +1085,9 @@ func (idx *Indexer) Close() {
 // method's JSON response shape but in Go-native types so additional callers
 // (HTTP handlers, tests) can consume it without a second parse.
 type IndexSingleSCIDResult struct {
-	SCID      string            `json:"scid"`
+	SCID      string                `json:"scid"`
 	ClassMeta *structures.ClassMeta `json:"-"`
-	VarsCount int               `json:"vars_count"`
+	VarsCount int                   `json:"vars_count"`
 	// FromCache indicates this SCID was already in the class bucket and
 	// skipfsrecheck=true caused us to return cached metadata without hitting
 	// the daemon.

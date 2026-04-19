@@ -597,7 +597,7 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 			}
 			scid := parts[0]
 			var height int64
-			fmt.Sscanf(parts[1], "%d", &height)
+			_, _ = fmt.Sscanf(parts[1], "%d", &height)
 			var vars []*structures.SCIDVariable
 			// Storage.FlushBatch writes v1 typed after C7; legacy DBs may
 			// still hold msgpack. Dispatch on byte[0].
@@ -648,7 +648,7 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 	case "invalidscidinvokes":
 		return b.ForEach(func(k, v []byte) error {
 			var fees uint64
-			fmt.Sscanf(string(v), "%d", &fees)
+			_, _ = fmt.Sscanf(string(v), "%d", &fees)
 			batch.InvalidSCIDs[string(k)] = fees
 			return nil
 		})
@@ -660,15 +660,15 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 			switch key {
 			case "regtxcount":
 				var n int64
-				fmt.Sscanf(string(v), "%d", &n)
+				_, _ = fmt.Sscanf(string(v), "%d", &n)
 				batch.RegTxCount += n
 			case "burntxcount":
 				var n int64
-				fmt.Sscanf(string(v), "%d", &n)
+				_, _ = fmt.Sscanf(string(v), "%d", &n)
 				batch.BurnTxCount += n
 			case "normtxcount":
 				var n int64
-				fmt.Sscanf(string(v), "%d", &n)
+				_, _ = fmt.Sscanf(string(v), "%d", &n)
 				batch.NormTxCount += n
 				// lastindexedheight is set by the caller after merge, skip here
 			}

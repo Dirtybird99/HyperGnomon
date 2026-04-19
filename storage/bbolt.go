@@ -8,9 +8,10 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/hypergnomon/hypergnomon/structures"
 	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/hypergnomon/hypergnomon/structures"
 )
 
 var logger = logrus.WithField("pkg", "storage")
@@ -28,11 +29,11 @@ var (
 	bucketInvalid = []byte("invalidscidinvokes")
 
 	// Route B (DESIGN.md §3) buckets.
-	bucketBlockHash   = []byte("blockhashes")    // BE8 height -> 64-hex block hash
-	bucketInstalls    = []byte("installs")       // "<BE8:h>|<scid>" -> InstallRecord msgpack
-	bucketClassIdx    = []byte("class_scid")     // scid -> ClassMeta msgpack (O(1) lookup)
-	bucketAddrSCIDs   = []byte("addr_scids")     // parent; per-addr sub-bucket created on demand
-	bucketTELAContent = []byte("tela_content")   // scid|path -> {body, mime, sha256}
+	bucketBlockHash   = []byte("blockhashes")  // BE8 height -> 64-hex block hash
+	bucketInstalls    = []byte("installs")     // "<BE8:h>|<scid>" -> InstallRecord msgpack
+	bucketClassIdx    = []byte("class_scid")   // scid -> ClassMeta msgpack (O(1) lookup)
+	bucketAddrSCIDs   = []byte("addr_scids")   // parent; per-addr sub-bucket created on demand
+	bucketTELAContent = []byte("tela_content") // scid|path -> {body, mime, sha256}
 )
 
 // Key layout helpers: keep binary big-endian so bbolt's byte-order cursor
@@ -140,7 +141,9 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 // EnableSync re-enables fsync after initial sync is complete (caught up to chain tip).
 func (s *BboltStore) EnableSync() {
 	s.DB.NoSync = false
-	s.DB.Sync()
+	if err := s.DB.Sync(); err != nil {
+		logger.Warnf("EnableSync: bbolt Sync returned: %v", err)
+	}
 	logger.Info("BoltDB sync enabled (caught up to chain tip)")
 }
 

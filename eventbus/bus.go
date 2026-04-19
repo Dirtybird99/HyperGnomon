@@ -208,7 +208,7 @@ func (b *Bus) Publish(e Event) {
 
 // Subscribe registers a new subscription. Returns the subscription id,
 // the receive channel, and a cancel func. The channel is closed when the
-// subscription is cancelled or the bus is closed.
+// subscription is canceled or the bus is closed.
 func (b *Bus) Subscribe(f Filter) (id string, events <-chan Event, cancel func()) {
 	n := b.seq.Add(1)
 	sub := &subscription{

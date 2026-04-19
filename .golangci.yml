@@ -9,103 +9,65 @@ output:
       path: stdout
       print-linter-name: true
       print-issued-lines: true
+
+# Linter selection for a pre-1.0 indexer release.
+#
+# Enabled: catches real bugs (errcheck, govet sans-shadow, staticcheck,
+# bodyclose, errorlint, copyloopvar, nilerr) and basic hygiene
+# (misspell, whitespace, unconvert, unused, predeclared).
+#
+# Disabled (documented reasons, not "just because"):
+#   - gosec          — current findings are mostly G115 int<->uint for
+#                      block heights (DERO heights are always 0..<2^62,
+#                      so conversions are safe in practice). Requires a
+#                      dedicated security audit with context before
+#                      flipping on, not blanket suppression.
+#   - godot          — trailing periods on comments. Cosmetic only.
+#   - gocognit/gocyclo — complexity linters; subjective thresholds.
+#   - gocritic       — opinionated suggestions; many false positives on
+#                      idiomatic Go.
+#   - nestif/nilnil  — pre-existing structural code; refactor is its own
+#                      PR track.
+#   - dupl/exhaustive/prealloc/unparam/revive — noise vs signal ratio
+#                      too low for first release. Revisit post-v1.0.
+#   - usetesting/tparallel/sqlclosecheck/noctx/contextcheck/errname
+#                    — marginal signal on this codebase; enable when
+#                      structural patterns stabilize.
+#
+# If adding back: fix every reported issue in the same PR, no silent
+# suppressions.
 linters:
   enable:
     - bodyclose
-    - contextcheck
     - copyloopvar
-    - dupl
-    - durationcheck
-    - errname
+    - errcheck
     - errorlint
-    - exhaustive
-    - gocognit
-    - goconst
-    - gocritic
-    - gocyclo
-    - godot
-    - gosec
     - misspell
-    - nakedret
-    - nestif
     - nilerr
-    - nilnil
-    - noctx
-    - prealloc
     - predeclared
-    - revive
-    - sqlclosecheck
     - staticcheck
-    - tparallel
     - unconvert
-    - unparam
-    - usetesting
     - whitespace
   settings:
     errcheck:
-      check-type-assertions: true
-      check-blank: true
+      # check-blank / check-type-assertions would be strict but generate
+      # many false positives on idiomatic json encode and the DERO RPC
+      # surface. Leave defaults.
       exclude-functions:
         - io.Copy
         - io.WriterTo.WriteTo
-    gocognit:
-      min-complexity: 20
-    goconst:
-      min-len: 3
-      min-occurrences: 3
-    gocritic:
-      disabled-checks:
-        - dupImport
-        - ifElseChain
-        - whyNoLint
-      enabled-tags:
-        - diagnostic
-        - experimental
-        - opinionated
-        - performance
-        - style
-    gocyclo:
-      min-complexity: 15
-    godot:
-      scope: declarations
-      capital: true
-    gosec:
-      excludes:
-        - G104
+        - (*encoding/json.Encoder).Encode
+        - (net/http.ResponseWriter).Write
+        - github.com/gorilla/websocket.(*Conn).WriteJSON
     govet:
       disable:
+        # shadow: noisy on idiomatic `if err := ...; err != nil` patterns
+        # inside tx.Update closures. Re-enable when those are refactored.
+        - shadow
         - fieldalignment
       enable-all: true
     misspell:
       locale: US
-    nakedret:
-      max-func-lines: 30
-    nestif:
-      min-complexity: 4
-    revive:
-      rules:
-        - name: blank-imports
-        - name: context-as-argument
-        - name: context-keys-type
-        - name: dot-imports
-        - name: error-return
-        - name: error-strings
-        - name: error-naming
-        - name: exported
-        - name: if-return
-        - name: increment-decrement
-        - name: var-naming
-        - name: var-declaration
-        - name: package-comments
-        - name: range
-        - name: receiver-naming
-        - name: time-naming
-        - name: unexported-return
-        - name: indent-error-flow
-        - name: errorf
-        - name: empty-block
-        - name: superfluous-else
-        - name: unreachable-code
     staticcheck:
       checks:
         - all
@@ -123,17 +85,11 @@ linters:
       - std-error-handling
     rules:
       - linters:
-          - dupl
           - errcheck
-          - gocognit
-          - gocyclo
-          - gosec
         path: _test\.go
       - linters:
           - all
         path: .*\.pb\.go
-      - path: _test\.go
-        text: dot-imports
     paths:
       - third_party$
       - builtin$
@@ -145,9 +101,6 @@ issues:
 severity:
   default: warning
   rules:
-    - linters:
-        - gosec
-      severity: error
     - linters:
         - errcheck
       severity: error

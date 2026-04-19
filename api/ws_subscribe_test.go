@@ -24,10 +24,15 @@ func dialTestWS(t *testing.T, ws *WSServer) (*websocket.Conn, func()) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(ws.ServeWS))
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
-	c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	c, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		srv.Close()
 		t.Fatalf("dial: %v", err)
+	}
+	// The Dial response body carries handshake details; bodyclose wants it
+	// explicitly closed even on WS upgrade.
+	if resp != nil {
+		_ = resp.Body.Close()
 	}
 	return c, func() {
 		c.Close()

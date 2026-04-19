@@ -13,12 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/hypergnomon/hypergnomon/api"
 	"github.com/hypergnomon/hypergnomon/eventbus"
 	"github.com/hypergnomon/hypergnomon/indexer"
 	hgrpc "github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/structures"
-	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -50,7 +51,9 @@ func main() {
 	if *pprofAddr != "" {
 		go func() {
 			structures.Logger.Infof("pprof listening on %s", *pprofAddr)
-			http.ListenAndServe(*pprofAddr, nil)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				structures.Logger.Errorf("pprof server exited: %v", err)
+			}
 		}()
 	}
 
@@ -200,14 +203,16 @@ func main() {
 		}
 		// Get chain height for segment sync range
 		var chainHeight int64
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		if err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			info, err := c.GetInfo()
 			if err != nil {
 				return err
 			}
 			chainHeight = info.TopoHeight
 			return nil
-		})
+		}); err != nil {
+			structures.Logger.Errorf("segment sync GetInfo: %v", err)
+		}
 		if chainHeight > 0 {
 			lastHeight, _ := idx.Store.GetLastIndexHeight()
 			if lastHeight < chainHeight {

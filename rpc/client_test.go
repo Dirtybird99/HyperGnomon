@@ -16,7 +16,6 @@ func TestResolveDialURL(t *testing.T) {
 		{"https://host:1/ws", "wss://host:1/ws"},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.in, func(t *testing.T) {
 			got := resolveDialURL(tc.in)
 			if got != tc.want {
