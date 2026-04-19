@@ -252,6 +252,15 @@ func (s *BboltStore) GetSCIDVariableDetailsAtHeight(scid string, height int64) (
 		if v == nil {
 			return nil
 		}
+		// Tag-byte dispatch: 0x02 is typed v1, 0x9X is legacy msgpack array.
+		if structures.IsSCIDVariablesTyped(v) {
+			parsed, err := structures.UnmarshalSCIDVariablesTyped(v)
+			if err != nil {
+				return err
+			}
+			vars = parsed
+			return nil
+		}
 		return msgpack.Unmarshal(v, &vars)
 	})
 	return vars, err
@@ -406,18 +415,21 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 
 		// Store variables.
 		// Same treatment: fmt.Sprintf("%s:%d", scid, height) → append + AppendInt.
+		// Value is now v1 typed (C7 optimization): 6→0 marshal allocs per snapshot.
+		// Reader (GetSCIDVariableDetailsAtHeight) dispatches on byte[0] so legacy
+		// msgpack-encoded values remain readable until overwritten.
 		varBucket := tx.Bucket(bucketScVars)
+		// Reusable value buffer across every Put — bbolt copies on Put.
+		varValBuf := make([]byte, 0, 256)
 		for scid, heightVars := range batch.Variables {
 			for height, vars := range heightVars {
 				keyBuf = keyBuf[:0]
 				keyBuf = append(keyBuf, scid...)
 				keyBuf = append(keyBuf, ':')
 				keyBuf = strconv.AppendInt(keyBuf, height, 10)
-				val, err := msgpack.Marshal(vars)
-				if err != nil {
-					return fmt.Errorf("batch vars marshal: %w", err)
-				}
-				if err := varBucket.Put(keyBuf, val); err != nil {
+				varValBuf = varValBuf[:0]
+				varValBuf = structures.MarshalSCIDVariablesTypedAppend(varValBuf, vars)
+				if err := varBucket.Put(keyBuf, varValBuf); err != nil {
 					return err
 				}
 			}

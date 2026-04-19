@@ -599,8 +599,16 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 			var height int64
 			fmt.Sscanf(parts[1], "%d", &height)
 			var vars []*structures.SCIDVariable
-			// Storage writes msgpack via storage.FlushBatch — decode with the same codec.
-			if err := msgpack.Unmarshal(v, &vars); err != nil {
+			// Storage.FlushBatch writes v1 typed after C7; legacy DBs may
+			// still hold msgpack. Dispatch on byte[0].
+			if structures.IsSCIDVariablesTyped(v) {
+				parsed, err := structures.UnmarshalSCIDVariablesTyped(v)
+				if err != nil {
+					segLog.Warnf("merge scvars typed: %s: %v", string(k), err)
+					return nil
+				}
+				vars = parsed
+			} else if err := msgpack.Unmarshal(v, &vars); err != nil {
 				segLog.Warnf("merge scvars: %s: %v", string(k), err)
 				return nil
 			}
