@@ -1,3 +1,13 @@
+# Existing
+hypergnomon
+hypergnomon.exe
+gnomondb/
+*.log
+*.prof
+
+# Bench artifacts
+bench_*/
+bench_*.log
 # Binaries
 hypergnomon
 hypergnomon.exe
@@ -32,3 +42,4 @@ vendor/
 
 # Segments temp (parallel sync)
 segments/
+bench-*.txt

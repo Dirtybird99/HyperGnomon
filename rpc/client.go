@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,38 @@ func NewClient(endpoint string) (*Client, error) {
 	return c, nil
 }
 
+// resolveDialURL normalizes a daemon endpoint into a WebSocket dial URL.
+// Accepted input forms:
+//   - bare "host:port"           -> "ws://host:port/ws"
+//   - "ws://host:port"           -> "ws://host:port/ws"
+//   - "wss://host:port"          -> "wss://host:port/ws"
+//   - "http://host:port"         -> "ws://host:port/ws"
+//   - "https://host:port"        -> "wss://host:port/ws"
+//
+// If the input already ends with "/ws", it is not appended twice.
+func resolveDialURL(endpoint string) string {
+	scheme := "ws://"
+	rest := endpoint
+	switch {
+	case strings.HasPrefix(endpoint, "wss://"):
+		scheme = "wss://"
+		rest = strings.TrimPrefix(endpoint, "wss://")
+	case strings.HasPrefix(endpoint, "ws://"):
+		scheme = "ws://"
+		rest = strings.TrimPrefix(endpoint, "ws://")
+	case strings.HasPrefix(endpoint, "https://"):
+		scheme = "wss://"
+		rest = strings.TrimPrefix(endpoint, "https://")
+	case strings.HasPrefix(endpoint, "http://"):
+		scheme = "ws://"
+		rest = strings.TrimPrefix(endpoint, "http://")
+	}
+	if strings.HasSuffix(rest, "/ws") {
+		return scheme + rest
+	}
+	return scheme + rest + "/ws"
+}
+
 // Connect establishes the WebSocket connection and JSON-RPC client.
 func (c *Client) Connect() error {
 	c.mu.Lock()
@@ -49,7 +82,7 @@ func (c *Client) Connect() error {
 		HandshakeTimeout:  3 * time.Second,
 		EnableCompression: true,
 	}
-	ws, _, err := dialer.Dial("ws://"+c.Endpoint+"/ws", nil)
+	ws, _, err := dialer.Dial(resolveDialURL(c.Endpoint), nil)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", c.Endpoint, err)
 	}
@@ -214,13 +247,21 @@ func (c *Client) BatchGetBlocks(heights []uint64) ([]*rpc.GetBlock_Result, error
 		return nil, fmt.Errorf("BatchGetBlocks(%d heights): %w", len(heights), err)
 	}
 
+	// Partial success: a single bad block in a batch of 50 should not poison
+	// the other 49. Callers already handle nil entries (fetcherLoop skips them).
 	results := make([]*rpc.GetBlock_Result, len(responses))
+	failures := 0
 	for i, resp := range responses {
 		var result rpc.GetBlock_Result
 		if err := resp.UnmarshalResult(&result); err != nil {
-			return nil, fmt.Errorf("BatchGetBlocks unmarshal %d: %w", heights[i], err)
+			logger.Warnf("BatchGetBlocks: skipping height %d: %v", heights[i], err)
+			failures++
+			continue
 		}
 		results[i] = &result
+	}
+	if failures == len(responses) {
+		return results, fmt.Errorf("BatchGetBlocks: all %d responses failed to unmarshal", len(responses))
 	}
 	return results, nil
 }

@@ -182,6 +182,14 @@ func (idx *Indexer) FastSync(testnet bool) error {
 			idx.ValidatedSCs.Store(scid, struct{}{})
 			batch.AddOwner(scid, entry.owner)
 			batch.AddInteractionHeight(scid, entry.height)
+			// Route B: install record + owner→scid edge.
+			// Class is filled in later by probeTELA's phase-1 code probe.
+			batch.AddInstall(scid, entry.height, &structures.InstallRecord{
+				Owner: entry.owner,
+			})
+			if entry.owner != "" {
+				batch.AddAddrSCID(entry.owner, scid, entry.height)
+			}
 		}
 
 		idx.LastIndexedHeight.Store(chainHeight)
@@ -360,7 +368,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() || probeComplete.Load() {
 					return
 				}
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					specs := make([]jrpc2.Spec, len(batch))
 					for i, scid := range batch {
 						specs[i] = jrpc2.Spec{
@@ -473,7 +481,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() {
 					return
 				}
-				idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 					specs := make([]jrpc2.Spec, len(batch))
 					for i, scid := range batch {
 						specs[i] = jrpc2.Spec{
@@ -498,6 +506,22 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 						if len(vars) > 0 {
 							varMu.Lock()
 							varBatch.AddVariables(batch[i], chainHeight, vars)
+							// Route B: populate class metadata. We already
+							// know the class is TELA-INDEX-1 — the SCID came
+							// from phase-1's code-probe match on `STORE("telaVersion"`.
+							// ClassifySC with empty code would return UNKNOWN
+							// (the code rule wouldn't fire) so we set the class
+							// directly and use ClassifySC only for header extraction.
+							sc := ClassifySC(batch[i], "", varsToMap(vars))
+							varBatch.AddClass(batch[i], &structures.ClassMeta{
+								Class:         "TELA-INDEX-1",
+								Tags:          []string{"all", "tela"},
+								Name:          sc.Name,
+								Desc:          sc.Desc,
+								IconURL:       sc.IconURL,
+								InstallHeight: chainHeight,
+								LastHeight:    chainHeight,
+							})
 							varMu.Unlock()
 						}
 					}
@@ -516,7 +540,20 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	close(varWork)
 	wg2.Wait()
 
-	// Flush TELA variables to DB
+	// DOCs don't get variable fetch but still classify (from the phase-1
+	// code probe we already know they contain STORE("docVersion")).
+	for _, docScid := range telaDocSCIDs {
+		varMu.Lock()
+		varBatch.AddClass(docScid, &structures.ClassMeta{
+			Class:         "TELA-DOC-1",
+			Tags:          []string{"all", "tela"},
+			InstallHeight: chainHeight,
+			LastHeight:    chainHeight,
+		})
+		varMu.Unlock()
+	}
+
+	// Flush TELA variables + class metadata to DB
 	if err := idx.Store.FlushBatch(varBatch); err != nil {
 		logger.Errorf("TELA variable flush: %v", err)
 	}
@@ -550,7 +587,15 @@ func telaCachePath(dbDir string) string {
 	return filepath.Join(dbDir, "tela_cache.bin")
 }
 
+// telaCacheMu serializes concurrent reads/writes of tela_cache.bin.
+// Writers: probeTELA (full refresh), monitorChainHeight (height bump),
+// fastsync-cache-hit (no-op). A plain sync.Mutex is enough — the file is tiny
+// and contention is low.
+var telaCacheMu sync.Mutex
+
 func loadTELACache(dbDir string) (*telaCache, error) {
+	telaCacheMu.Lock()
+	defer telaCacheMu.Unlock()
 	data, err := os.ReadFile(telaCachePath(dbDir))
 	if err != nil {
 		return nil, err
@@ -563,6 +608,8 @@ func loadTELACache(dbDir string) (*telaCache, error) {
 }
 
 func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) error {
+	telaCacheMu.Lock()
+	defer telaCacheMu.Unlock()
 	cache := telaCache{
 		IndexSCIDs: indexSCIDs,
 		DocSCIDs:   docSCIDs,
@@ -573,7 +620,9 @@ func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) er
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(telaCachePath(dbDir), data, 0644)
+	// 0600 matches BoltDB permissions — cache contains indexer-derived data only,
+	// but tighter is fine.
+	return os.WriteFile(telaCachePath(dbDir), data, 0600)
 }
 
 // hexTable is a lookup table for hex character validation.

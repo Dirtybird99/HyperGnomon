@@ -13,11 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/hypergnomon/hypergnomon/api"
+	"github.com/hypergnomon/hypergnomon/eventbus"
 	"github.com/hypergnomon/hypergnomon/indexer"
 	hgrpc "github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/structures"
-	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -49,7 +51,9 @@ func main() {
 	if *pprofAddr != "" {
 		go func() {
 			structures.Logger.Infof("pprof listening on %s", *pprofAddr)
-			http.ListenAndServe(*pprofAddr, nil)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				structures.Logger.Errorf("pprof server exited: %v", err)
+			}
 		}()
 	}
 
@@ -104,6 +108,12 @@ func main() {
 		}
 	}
 
+	// Event bus for subscription fan-out (DESIGN.md M1). One per process.
+	// Started before Indexer so New() can take it via Config.
+	bus := eventbus.New(1024)
+	go bus.Run()
+	defer bus.Close()
+
 	var idx *indexer.Indexer
 	var err error
 	var connectedEndpoint string
@@ -120,6 +130,7 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Bus:            bus,
 		})
 		if err == nil {
 			connectedEndpoint = node
@@ -158,6 +169,7 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Bus:            bus,
 		})
 		if err == nil {
 			connectedEndpoint = input
@@ -191,14 +203,16 @@ func main() {
 		}
 		// Get chain height for segment sync range
 		var chainHeight int64
-		idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		if err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			info, err := c.GetInfo()
 			if err != nil {
 				return err
 			}
 			chainHeight = info.TopoHeight
 			return nil
-		})
+		}); err != nil {
+			structures.Logger.Errorf("segment sync GetInfo: %v", err)
+		}
 		if chainHeight > 0 {
 			lastHeight, _ := idx.Store.GetLastIndexHeight()
 			if lastHeight < chainHeight {
@@ -218,15 +232,17 @@ func main() {
 		idx.Close()
 	}()
 
-	// Start API servers (deferred until after fastsync/segment-sync complete)
-	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress)
+	// Start API servers (deferred until after fastsync/segment-sync complete).
+	// &idx.SafeHeight gives the api package a live read of the finality-lag
+	// height without pulling in an indexer import.
+	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress, &idx.SafeHeight)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			structures.Logger.Errorf("HTTP API server error: %v", err)
 		}
 	}()
 
-	wsServer := api.NewWSServer(*wsAddress, idx.Store)
+	wsServer := api.NewWSServer(*wsAddress, idx.Store, &idx.SafeHeight, bus, idx)
 	go func() {
 		if err := wsServer.Start(); err != nil {
 			structures.Logger.Errorf("WebSocket server error: %v", err)
