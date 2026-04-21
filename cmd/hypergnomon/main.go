@@ -45,6 +45,8 @@ func main() {
 	adaptBatch := flag.Bool("adapt-batch", true, "Auto-tune batch size based on block density")
 	recentBlocks := flag.Int64("recent-blocks", 0, "Scan only last N blocks from chain tip (0 = scan all)")
 	telaOnly := flag.Bool("tela-only", false, "Only discover TELA apps, then exit (no chain scanning)")
+	timing := flag.Bool("timing", false, "Emit per-stage timing summaries (grouped fetcher/processor/flusher)")
+	timingEvery := flag.Int("timing-every", 10, "How many batches between timing summaries")
 	flag.Parse()
 
 	// Start pprof server if requested
@@ -130,6 +132,8 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Timing:         *timing,
+			TimingEvery:    *timingEvery,
 			Bus:            bus,
 		})
 		if err == nil {
@@ -169,6 +173,8 @@ func main() {
 			TurboMode:      *turboMode,
 			AdaptBatchSize: *adaptBatch,
 			RecentBlocks:   *recentBlocks,
+			Timing:         *timing,
+			TimingEvery:    *timingEvery,
 			Bus:            bus,
 		})
 		if err == nil {

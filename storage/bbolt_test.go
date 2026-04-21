@@ -445,6 +445,141 @@ func BenchmarkIndividualWrites(b *testing.B) {
 	b.ReportMetric(float64(n), "records/iter")
 }
 
+// TestFlushBatch_VariableLengthSnapshots pins down the bbolt-Put buffer-reuse
+// bug we hit in probeTELA: bolt stores the value slice header and copies at
+// commit time, so sharing a single backing array across multiple Puts
+// corrupts every write except the last. The earlier FlushBatch reused a
+// single varValBuf across all scvars Puts; when successive SCIDs had
+// variable-length snapshots (e.g., TELA INDEX with 24 vars vs TELA DOC with
+// 14 vars), the larger record ended up with later, shorter bytes in its
+// tail — the reader saw a valid tag + count but stale/truncated payload.
+//
+// Guard the fix by writing three distinct snapshots of clearly different
+// sizes in one batch and asserting every one round-trips verbatim.
+func TestFlushBatch_VariableLengthSnapshots(t *testing.T) {
+	store := openTestStore(t)
+
+	scids := []string{fakeSCID(), fakeSCID(), fakeSCID()}
+	heights := []int64{1001, 1002, 1003}
+
+	// Deliberately vary counts and string lengths so encoded sizes differ.
+	snapshots := [][]*structures.SCIDVariable{
+		// Tiny: 2 vars, short values
+		{
+			{Key: "a", Value: "x"},
+			{Key: "b", Value: uint64(1)},
+		},
+		// Medium: 8 vars, 64-byte string values
+		func() []*structures.SCIDVariable {
+			s := make([]*structures.SCIDVariable, 8)
+			for i := range s {
+				s[i] = &structures.SCIDVariable{
+					Key:   fmt.Sprintf("med_%d", i),
+					Value: randHex(32), // 64 hex chars
+				}
+			}
+			return s
+		}(),
+		// Large: 30 vars, 256-byte string values
+		func() []*structures.SCIDVariable {
+			s := make([]*structures.SCIDVariable, 30)
+			for i := range s {
+				s[i] = &structures.SCIDVariable{
+					Key:   fmt.Sprintf("large_%d_%s", i, randHex(4)),
+					Value: randHex(128),
+				}
+			}
+			return s
+		}(),
+	}
+
+	batch := NewWriteBatch()
+	for i, snap := range snapshots {
+		batch.AddVariables(scids[i], heights[i], snap)
+	}
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("FlushBatch: %v", err)
+	}
+
+	for i, want := range snapshots {
+		got, err := store.GetSCIDVariableDetailsAtHeight(scids[i], heights[i])
+		if err != nil {
+			t.Fatalf("snapshot %d read: %v", i, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("snapshot %d: count=%d, want %d", i, len(got), len(want))
+		}
+		// Order is iteration-dependent across runs, but we wrote unique
+		// keys per snapshot, so a map compare is sufficient.
+		wantMap := make(map[string]any, len(want))
+		for _, v := range want {
+			wantMap[fmt.Sprintf("%v", v.Key)] = v.Value
+		}
+		for _, v := range got {
+			k := fmt.Sprintf("%v", v.Key)
+			wv, ok := wantMap[k]
+			if !ok {
+				t.Errorf("snapshot %d: unexpected key %q", i, k)
+				continue
+			}
+			if fmt.Sprintf("%v", v.Value) != fmt.Sprintf("%v", wv) {
+				t.Errorf("snapshot %d key %q: got %v, want %v", i, k, v.Value, wv)
+			}
+		}
+	}
+}
+
+// TestFlushBatch_AddrSCIDs_MultiEntry covers the sibling bug on the
+// addr_scids bucket: the old FlushBatch reused a single 25-byte valBuf
+// across every Put, so after commit all entries shared the last-written
+// record. Three entries with distinct FirstHeight/LastHeight/Count make
+// any silent sharing visible.
+func TestFlushBatch_AddrSCIDs_MultiEntry(t *testing.T) {
+	store := openTestStore(t)
+	addr := fakeAddr()
+
+	type want struct {
+		scid               string
+		first, last, count int64
+	}
+	wants := []want{
+		{scid: fakeSCID(), first: 100, last: 100, count: 1},
+		{scid: fakeSCID(), first: 200, last: 250, count: 5},
+		{scid: fakeSCID(), first: 400, last: 999, count: 42},
+	}
+
+	batch := NewWriteBatch()
+	for _, w := range wants {
+		// AddAddrSCID's signature lets us supply only one (addr, scid,
+		// height); for count>1 we call it once per increment so FirstHeight
+		// / LastHeight get set correctly via the min/max merge.
+		batch.AddAddrSCID(addr, w.scid, w.first)
+		for h := w.first + 1; h <= w.last && h <= w.first+w.count-1; h++ {
+			batch.AddAddrSCID(addr, w.scid, h)
+		}
+		// Ensure LastHeight hits w.last even when count < (last-first+1).
+		batch.AddAddrSCID(addr, w.scid, w.last)
+	}
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("FlushBatch: %v", err)
+	}
+
+	for _, w := range wants {
+		got, err := store.GetAddressSCIDs(addr)
+		if err != nil {
+			t.Fatalf("GetAddressSCIDs: %v", err)
+		}
+		entry, ok := got[w.scid]
+		if !ok {
+			t.Fatalf("missing entry for scid %s", w.scid[:16])
+		}
+		if entry.FirstHeight != w.first || entry.LastHeight != w.last {
+			t.Errorf("scid %s heights: got first=%d last=%d, want first=%d last=%d",
+				w.scid[:16], entry.FirstHeight, entry.LastHeight, w.first, w.last)
+		}
+	}
+}
+
 // BenchmarkFlushBatch_Scaling runs all batch sizes as sub-benchmarks for
 // convenient comparison with `go test -bench=Scaling -benchmem`.
 func BenchmarkFlushBatch_Scaling(b *testing.B) {
