@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -421,18 +422,22 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Value is now v1 typed (C7 optimization): 6→0 marshal allocs per snapshot.
 		// Reader (GetSCIDVariableDetailsAtHeight) dispatches on byte[0] so legacy
 		// msgpack-encoded values remain readable until overwritten.
+		//
+		// CRITICAL: each Put needs its OWN value buffer. bbolt stores the
+		// slice header during Put and only copies bytes at commit time, so
+		// reusing a single backing array across Puts corrupts all but the
+		// last write (earlier nodes end up pointing at mutated bytes).
+		// Keys are safe to reuse because bolt's bucket.Put copies keys
+		// eagerly (node.put clones the key into its own arena).
 		varBucket := tx.Bucket(bucketScVars)
-		// Reusable value buffer across every Put — bbolt copies on Put.
-		varValBuf := make([]byte, 0, 256)
 		for scid, heightVars := range batch.Variables {
 			for height, vars := range heightVars {
 				keyBuf = keyBuf[:0]
 				keyBuf = append(keyBuf, scid...)
 				keyBuf = append(keyBuf, ':')
 				keyBuf = strconv.AppendInt(keyBuf, height, 10)
-				varValBuf = varValBuf[:0]
-				varValBuf = structures.MarshalSCIDVariablesTypedAppend(varValBuf, vars)
-				if err := varBucket.Put(keyBuf, varValBuf); err != nil {
+				val := structures.MarshalSCIDVariablesTypedAppend(nil, vars)
+				if err := varBucket.Put(keyBuf, val); err != nil {
 					return err
 				}
 			}
@@ -544,12 +549,28 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Class metadata: two writes per SCID.
 		//   1. classIdx:  scid -> ClassMeta  (O(1) lookup)
 		//   2. class:     <class>|<BE8 h>|<scid> -> ClassMeta  (prefix-scan by class)
+		//
+		// classPrefix is keyed by height, so re-probing the same SCID at a
+		// new chain height would leave a stale entry at the old height and
+		// make GetClassInstalls return that SCID twice. Before writing the
+		// new key, look up the current classIdx record for this SCID: if its
+		// old (class, installHeight) differs from the new one we're about to
+		// write, delete the stale classPrefix key so each SCID stays
+		// represented exactly once in the class bucket.
 		if len(batch.Classes) > 0 {
 			classIdx := tx.Bucket(bucketClassIdx)
 			classPrefix := tx.Bucket(bucketClass)
 			for scid, meta := range batch.Classes {
 				if meta == nil || meta.Class == "" {
 					continue
+				}
+				if prev := classIdx.Get([]byte(scid)); prev != nil {
+					var oldMeta structures.ClassMeta
+					if err := msgpack.Unmarshal(prev, &oldMeta); err == nil {
+						if oldMeta.Class != meta.Class || oldMeta.InstallHeight != meta.InstallHeight {
+							_ = classPrefix.Delete(classKey(oldMeta.Class, oldMeta.InstallHeight, scid))
+						}
+					}
 				}
 				val, err := msgpack.Marshal(meta)
 				if err != nil {
@@ -573,9 +594,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// always v1, so legacy blobs get upgraded on next touch.
 		if len(batch.AddrSCIDs) > 0 {
 			parent := tx.Bucket(bucketAddrSCIDs)
-			// Reusable encode buffer — bbolt.Put copies, so one slice serves
-			// every Put across the whole addr_scids block.
-			valBuf := make([]byte, 0, structures.EncodedAddrSCIDEntrySize)
+			// Each Put stores the slice header; bolt copies to the page only
+			// at commit. Using a single shared backing array across Puts
+			// would leave all earlier-Put'd slice headers pointing at the
+			// last iteration's bytes. Allocate one slice per Put.
 			for addr, scids := range batch.AddrSCIDs {
 				subBucket, err := parent.CreateBucketIfNotExists([]byte(addr))
 				if err != nil {
@@ -602,9 +624,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 							}
 						}
 					}
-					valBuf = valBuf[:0]
-					valBuf = merged.MarshalTypedAppend(valBuf)
-					if err := subBucket.Put([]byte(scid), valBuf); err != nil {
+					if err := subBucket.Put([]byte(scid), merged.MarshalTyped()); err != nil {
 						return err
 					}
 				}
@@ -686,14 +706,21 @@ func (s *BboltStore) GetBlockHash(height int64) (string, error) {
 	return hash, err
 }
 
-// GetClassInstalls returns classified SCIDs for a given class, ordered by
-// install height ascending. limit<=0 means unlimited.
+// GetClassInstalls returns classified SCIDs for a given class, one entry
+// per unique SCID (the highest-height entry wins). Ordered by install
+// height ascending. limit<=0 means unlimited.
+//
+// Dedup note: classPrefix is keyed by (class, height, scid), so a SCID
+// re-indexed at a later chain height used to leak two+ rows. FlushBatch
+// now deletes stale rows before writing new ones, but legacy DBs can
+// still contain duplicates — we collapse them here at read time so every
+// caller (GetTELAApps, GetMyDOCs, OmniSearch, …) sees a clean view.
 func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.ClassInstall, error) {
 	if class == "" {
 		return nil, nil
 	}
 	prefix := append([]byte(class), '|')
-	var out []structures.ClassInstall
+	latest := make(map[string]structures.ClassInstall)
 	err := s.DB.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketClass).Cursor()
 		for k, v := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, v = c.Next() {
@@ -709,17 +736,28 @@ func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.Cla
 				logger.Warnf("GetClassInstalls decode %s/%d/%s: %v", class, h, scid, err)
 				continue
 			}
-			out = append(out, structures.ClassInstall{
-				SCID:          scid,
-				InstallHeight: h,
-				Meta:          &meta,
-			})
-			if limit > 0 && len(out) >= limit {
-				return nil
+			if prev, seen := latest[scid]; !seen || h > prev.InstallHeight {
+				latest[scid] = structures.ClassInstall{
+					SCID:          scid,
+					InstallHeight: h,
+					Meta:          &meta,
+				}
 			}
 		}
 		return nil
 	})
+	// Emit in install-height-ascending order so callers can treat limit as
+	// "oldest N" just like before the dedup.
+	out := make([]structures.ClassInstall, 0, len(latest))
+	for _, inst := range latest {
+		out = append(out, inst)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].InstallHeight < out[j].InstallHeight
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	return out, err
 }
 

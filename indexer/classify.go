@@ -38,6 +38,25 @@ var rules = []classRule{
 	{pattern: "docVersion", class: "TELA-DOC-1", tag: "tela"},
 }
 
+// tagsForClass returns the ClassMeta.Tags slice for a given class name.
+// Mirrors the rules table so the fastsync probe can label SCIDs without
+// re-running the full pattern match when it already knows the class.
+// Always includes "all" as the first tag for the universal-filter convention.
+func tagsForClass(class string) []string {
+	for _, r := range rules {
+		if r.class == class {
+			return []string{"all", r.tag}
+		}
+	}
+	switch class {
+	case "NAMESERVICE":
+		return []string{"all", "nameservice"}
+	case "GNOMONSC":
+		return []string{"all", "gnomon"}
+	}
+	return []string{"all"}
+}
+
 // ClassifySC determines the class and tags of a smart contract based on its
 // SCID, code, and stored variables. Every returned SCClass includes the "all"
 // tag so callers can use it as a universal filter.
