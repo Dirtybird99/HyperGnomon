@@ -47,8 +47,14 @@ func (idx *Indexer) FastSync(testnet bool) error {
 	}
 
 	// JOFITO: Skip registry fetch if cache is fresh (within 1000 blocks)
+	// AND written by the current schema version AND the on-disk scvars
+	// bucket still yields non-empty variable reads for sampled TELA INDEX
+	// SCIDs. Strict version equality invalidates any cache older than
+	// telaCacheVersion — that forces a one-time full re-probe after an
+	// HG upgrade so schema changes (like the 60s refresher's fresh-rating
+	// contract) take effect without manual reindex.
 	var chainHeight int64
-	if cached, err := loadTELACache(idx.DBDir); err == nil && cached.Height > 0 {
+	if cached, err := loadTELACache(idx.DBDir); err == nil && cached.Height > 0 && cached.Version == telaCacheVersion {
 		if err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			info, err := c.GetInfo()
 			if err != nil {
@@ -59,14 +65,27 @@ func (idx *Indexer) FastSync(testnet bool) error {
 			return nil
 		}); err == nil {
 			if chainHeight-cached.Height < 1000 {
-				// Cache is fresh! Skip entire registry fetch.
-				idx.LastIndexedHeight.Store(chainHeight)
-				structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
-				elapsed := time.Since(start)
-				logger.Infof("FastSync: cache fresh (height %d, %d blocks behind) — %d INDEX + %d DOC loaded in %s",
-					cached.Height, chainHeight-cached.Height,
-					len(cached.IndexSCIDs), len(cached.DocSCIDs), elapsed.Round(time.Millisecond))
-				return nil
+				// Sanity-probe the scvars bucket. Sample up to 5 TELA INDEX
+				// SCIDs from the cached list; read their variables at the
+				// cache's height. If every sampled read comes back empty or
+				// error, the persistence layer is broken — invalidate the
+				// cache and fall through to a fresh probe. If at least one
+				// succeeds, honor the cache.
+				ok := cachedScvarsLookReadable(idx, cached)
+				if ok {
+					idx.LastIndexedHeight.Store(chainHeight)
+					otherCount := 0
+					for _, v := range cached.Classes {
+						otherCount += len(v)
+					}
+					structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
+					elapsed := time.Since(start)
+					logger.Infof("FastSync: cache fresh v%d (height %d, %d blocks behind) — %d INDEX + %d DOC + %d other classes loaded in %s",
+						cached.Version, cached.Height, chainHeight-cached.Height,
+						len(cached.IndexSCIDs), len(cached.DocSCIDs), otherCount, elapsed.Round(time.Millisecond))
+					return nil
+				}
+				logger.Warnf("FastSync: cache height-fresh but scvars reads failed — forcing re-probe to heal corrupted variable blobs (pre-fix HyperGnomon artifact)")
 			}
 		}
 	}
@@ -208,7 +227,13 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 		// JOFITO CACHE: Check if we have a cached TELA list from a previous run.
 		// If so, load it instantly and only probe NEW SCIDs (delta since cached height).
-		if cached, err := loadTELACache(idx.DBDir); err == nil && cached.Height > 0 {
+		// Apply the same gates the up-front cache-hit path uses — version match
+		// and a scvars sanity sample — so we don't trust a corrupt cache twice
+		// in the same FastSync call.
+		cached, cacheErr := loadTELACache(idx.DBDir)
+		cacheUsable := cacheErr == nil && cached != nil && cached.Height > 0 &&
+			cached.Version == telaCacheVersion && cachedScvarsLookReadable(idx, cached)
+		if cacheUsable {
 			// Cache hit! Load known TELA SCIDs instantly.
 			structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
 			logger.Infof("TELA cache hit: %d INDEX + %d DOC from height %d (instant load)",
@@ -229,8 +254,15 @@ func (idx *Indexer) FastSync(testnet bool) error {
 				logger.Info("TELA delta probe: no new SCIDs since last run")
 			}
 		} else {
-			// No cache -- full probe (first ever cold start)
-			logger.Info("TELA cache miss: running full probe")
+			// Cache missing, old-version, or corrupt — full probe. This is the
+			// self-heal path that overwrites historical malformed scvars blobs
+			// with cleanly-encoded bytes from the current marshaler.
+			if cacheErr != nil {
+				logger.Info("TELA cache miss: running full probe")
+			} else {
+				logger.Infof("TELA cache reject: v%d != v%d or scvars sanity failed — running full probe to heal",
+					cached.Version, telaCacheVersion)
+			}
 			go idx.probeTELA(candidates, chainHeight)
 		}
 
@@ -349,9 +381,13 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 		scids[i] = c.scid
 	}
 
-	// Phase 1: Batch code probe to find TELA SCIDs (split INDEX vs DOC)
+	// Phase 1: Batch code probe to find TELA SCIDs (split INDEX vs DOC) plus
+	// any other classes classify.go knows about (NFA, G45-*, T345). We reuse
+	// the same rules slice the scanner uses so classification stays
+	// consistent across the fastsync path and the live-scan path.
 	telaIndexSCIDs := make([]string, 0, 256)
 	telaDocSCIDs := make([]string, 0, 768)
+	otherClassSCIDs := make(map[string][]string)
 	var telaMu sync.Mutex
 	work := make(chan []string, 16)
 
@@ -392,24 +428,35 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 						if r.Code == "" {
 							continue
 						}
-						if strings.Contains(r.Code, `STORE("telaVersion"`) {
-							sinceLastFind.Store(0)
-							telaMu.Lock()
+						// Walk classify.go's rule list in order — first match wins.
+						// More specific patterns come first (G45-FAT before G45-C, etc.).
+						var matched string
+						for _, rule := range rules {
+							if strings.Contains(r.Code, rule.pattern) {
+								matched = rule.class
+								break
+							}
+						}
+						if matched == "" {
+							continue
+						}
+						sinceLastFind.Store(0)
+						telaMu.Lock()
+						switch matched {
+						case "TELA-INDEX-1":
 							telaIndexSCIDs = append(telaIndexSCIDs, batch[i])
-							found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-							telaMu.Unlock()
-							if found%200 == 0 {
-								logger.Infof("TELA milestone: %d TELA apps discovered so far", found)
-							}
-						} else if strings.Contains(r.Code, `STORE("docVersion"`) {
-							sinceLastFind.Store(0)
-							telaMu.Lock()
+						case "TELA-DOC-1":
 							telaDocSCIDs = append(telaDocSCIDs, batch[i])
-							found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-							telaMu.Unlock()
-							if found%200 == 0 {
-								logger.Infof("TELA milestone: %d TELA apps discovered so far", found)
-							}
+						default:
+							otherClassSCIDs[matched] = append(otherClassSCIDs[matched], batch[i])
+						}
+						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+						for _, v := range otherClassSCIDs {
+							found += len(v)
+						}
+						telaMu.Unlock()
+						if found%200 == 0 {
+							logger.Infof("Classify milestone: %d classified SCIDs discovered so far", found)
 						}
 					}
 
@@ -418,15 +465,21 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 					if count%5000 == 0 || count >= total {
 						telaMu.Lock()
 						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+						for _, v := range otherClassSCIDs {
+							found += len(v)
+						}
 						telaMu.Unlock()
-						logger.Infof("TELA probe: %d/%d checked, %d TELA found (%.0f%%)",
+						logger.Infof("Classify probe: %d/%d checked, %d classified (%.0f%%)",
 							count, total, found, float64(count)/float64(total)*100)
 					}
 
-					// Early exit: if we've checked 3k SCIDs since last TELA find, stop all workers
+					// Early exit: 3k since last find AND we've already classified something.
 					if sinceLastFind.Load() > 3000 {
 						telaMu.Lock()
 						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+						for _, v := range otherClassSCIDs {
+							found += len(v)
+						}
 						telaMu.Unlock()
 						if found > 0 {
 							probeComplete.Store(true)
@@ -449,41 +502,51 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	close(work)
 	wg.Wait()
 
+	// Roll up class counts for logging
+	totalClassified := len(telaIndexSCIDs) + len(telaDocSCIDs)
+	for _, v := range otherClassSCIDs {
+		totalClassified += len(v)
+	}
+
 	if probeComplete.Load() {
-		telaMu.Lock()
-		found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-		telaMu.Unlock()
 		checked := probed.Load()
-		logger.Infof("TELA probe: early exit at %d/%d SCIDs — found %d total", checked, total, found)
+		logger.Infof("Classify probe: early exit at %d/%d SCIDs — found %d total", checked, total, totalClassified)
 	}
 
 	phase1Time := time.Since(start)
-	telaCount := len(telaIndexSCIDs) + len(telaDocSCIDs)
-	logger.Infof("TELA probe phase 1: %d INDEX + %d DOC = %d total found in %s",
-		len(telaIndexSCIDs), len(telaDocSCIDs), telaCount, phase1Time.Round(time.Millisecond))
+	logger.Infof("Classify probe phase 1: %d INDEX + %d DOC + %d other classes = %d total in %s",
+		len(telaIndexSCIDs), len(telaDocSCIDs), totalClassified-len(telaIndexSCIDs)-len(telaDocSCIDs),
+		totalClassified, phase1Time.Round(time.Millisecond))
+	telaCount := len(telaIndexSCIDs) + len(telaDocSCIDs) // kept for cache compatibility
 
-	if telaCount == 0 {
+	if totalClassified == 0 {
 		return
 	}
 
-	// Phase 2: Batch fetch full variables for ONLY the INDEX SCIDs (DOCs don't need variable fetch)
+	// Phase 2: Batch fetch full variables for BOTH INDEX and DOC SCIDs.
+	// HOLOGRAM's GetMyDOCs / SearchByKey("docVersion") / GetAllDOCTypes / GetMyINDEXes
+	// all read scvars for TELA-DOC-1 SCIDs, so we must persist their variables here.
 	phase2Start := time.Now()
 	varBatch := storage.NewWriteBatch()
 	var varMu sync.Mutex
-	varWork := make(chan []string, 16)
+	type varBatchItem struct {
+		scids []string
+		class string
+	}
+	varWork := make(chan varBatchItem, 16)
 
 	var wg2 sync.WaitGroup
 	for i := 0; i < poolSize; i++ {
 		wg2.Add(1)
 		go func() {
 			defer wg2.Done()
-			for batch := range varWork {
+			for item := range varWork {
 				if idx.Closing.Load() {
 					return
 				}
 				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-					specs := make([]jrpc2.Spec, len(batch))
-					for i, scid := range batch {
+					specs := make([]jrpc2.Spec, len(item.scids))
+					for i, scid := range item.scids {
 						specs[i] = jrpc2.Spec{
 							Method: "DERO.GetSC",
 							Params: rpc.GetSC_Params{SCID: scid, Variables: true},
@@ -503,27 +566,25 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 							continue
 						}
 						vars := parseSCVariables(&r)
+						varMu.Lock()
 						if len(vars) > 0 {
-							varMu.Lock()
-							varBatch.AddVariables(batch[i], chainHeight, vars)
-							// Route B: populate class metadata. We already
-							// know the class is TELA-INDEX-1 — the SCID came
-							// from phase-1's code-probe match on `STORE("telaVersion"`.
-							// ClassifySC with empty code would return UNKNOWN
-							// (the code rule wouldn't fire) so we set the class
-							// directly and use ClassifySC only for header extraction.
-							sc := ClassifySC(batch[i], "", varsToMap(vars))
-							varBatch.AddClass(batch[i], &structures.ClassMeta{
-								Class:         "TELA-INDEX-1",
-								Tags:          []string{"all", "tela"},
-								Name:          sc.Name,
-								Desc:          sc.Desc,
-								IconURL:       sc.IconURL,
-								InstallHeight: chainHeight,
-								LastHeight:    chainHeight,
-							})
-							varMu.Unlock()
+							varBatch.AddVariables(item.scids[i], chainHeight, vars)
 						}
+						// Always write class meta — phase 1 already proved the
+						// SCID belongs to item.class via code probe. ClassifySC
+						// with empty code won't re-detect from code, so we set
+						// class directly and use it only for header extraction.
+						sc := ClassifySC(item.scids[i], "", varsToMap(vars))
+						varBatch.AddClass(item.scids[i], &structures.ClassMeta{
+							Class:         item.class,
+							Tags:          tagsForClass(item.class),
+							Name:          sc.Name,
+							Desc:          sc.Desc,
+							IconURL:       sc.IconURL,
+							InstallHeight: chainHeight,
+							LastHeight:    chainHeight,
+						})
+						varMu.Unlock()
 					}
 					return nil
 				})
@@ -535,53 +596,85 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	varBatchSize := 25
 	for i := 0; i < len(telaIndexSCIDs); i += varBatchSize {
 		end := min(i+varBatchSize, len(telaIndexSCIDs))
-		varWork <- telaIndexSCIDs[i:end]
+		varWork <- varBatchItem{scids: telaIndexSCIDs[i:end], class: "TELA-INDEX-1"}
+	}
+	for i := 0; i < len(telaDocSCIDs); i += varBatchSize {
+		end := min(i+varBatchSize, len(telaDocSCIDs))
+		varWork <- varBatchItem{scids: telaDocSCIDs[i:end], class: "TELA-DOC-1"}
+	}
+	// Non-TELA classes: skip the variable fetch. HOLOGRAM's Browser renders
+	// them from ClassMeta alone (class name + optional Name/Desc/Icon from
+	// later on-invoke ClassifySC calls). Writing class meta directly here
+	// keeps the class bucket populated without burning RPC on ~50k GetSC
+	// variables-true calls that nobody currently reads.
+	for class, scids := range otherClassSCIDs {
+		meta := &structures.ClassMeta{
+			Class:         class,
+			Tags:          tagsForClass(class),
+			InstallHeight: chainHeight,
+			LastHeight:    chainHeight,
+		}
+		for _, scid := range scids {
+			varMu.Lock()
+			varBatch.AddClass(scid, meta)
+			varMu.Unlock()
+		}
 	}
 	close(varWork)
 	wg2.Wait()
 
-	// DOCs don't get variable fetch but still classify (from the phase-1
-	// code probe we already know they contain STORE("docVersion")).
-	for _, docScid := range telaDocSCIDs {
-		varMu.Lock()
-		varBatch.AddClass(docScid, &structures.ClassMeta{
-			Class:         "TELA-DOC-1",
-			Tags:          []string{"all", "tela"},
-			InstallHeight: chainHeight,
-			LastHeight:    chainHeight,
-		})
-		varMu.Unlock()
-	}
-
-	// Flush TELA variables + class metadata to DB
+	// Flush classified variables + class metadata to DB
 	if err := idx.Store.FlushBatch(varBatch); err != nil {
-		logger.Errorf("TELA variable flush: %v", err)
+		logger.Errorf("Classify flush: %v", err)
 	}
 
 	phase2Time := time.Since(phase2Start)
 	totalTime := time.Since(start)
-	logger.Infof("TELA probe complete: %d INDEX + %d DOC apps | Phase1: %s Phase2: %s Total: %s",
-		len(telaIndexSCIDs), len(telaDocSCIDs), phase1Time.Round(time.Millisecond),
+	otherCount := 0
+	for _, v := range otherClassSCIDs {
+		otherCount += len(v)
+	}
+	logger.Infof("Classify probe complete: %d INDEX + %d DOC + %d other | Phase1: %s Phase2: %s Total: %s",
+		len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, phase1Time.Round(time.Millisecond),
 		phase2Time.Round(time.Millisecond), totalTime.Round(time.Millisecond))
 
 	structures.TELACount.Store(int64(telaCount))
 
-	// Save TELA cache for instant subsequent startups (Jofito: never repeat work)
-	if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, chainHeight); err != nil {
-		logger.Errorf("TELA cache save: %v", err)
+	// Save cache for instant subsequent startups (Jofito: never repeat work)
+	if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, otherClassSCIDs, chainHeight); err != nil {
+		logger.Errorf("Classify cache save: %v", err)
 	} else {
-		logger.Infof("TELA cache saved: %d INDEX + %d DOC at height %d", len(telaIndexSCIDs), len(telaDocSCIDs), chainHeight)
+		logger.Infof("Classify cache v%d saved: %d INDEX + %d DOC + %d other classes at height %d",
+			telaCacheVersion, len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, chainHeight)
 	}
 }
 
-// telaCache stores discovered TELA SCIDs for instant subsequent startups.
+// telaCache stores discovered SCIDs for instant subsequent startups.
 // The Jofito endgame: never probe what you already know.
+//
+// v1 shape had only IndexSCIDs/DocSCIDs. v2 adds Classes for the
+// extended classify probe (NFA, G45-*). When loadTELACache decodes a v1
+// file, Classes comes back nil — callers treat nil as "no cache" so a
+// one-shot re-probe picks up the new classes and the on-disk cache
+// upgrades itself naturally.
 type telaCache struct {
-	IndexSCIDs []string `msgpack:"index"`
-	DocSCIDs   []string `msgpack:"doc"`
-	Height     int64    `msgpack:"height"`
-	Timestamp  int64    `msgpack:"ts"`
+	Version    int                 `msgpack:"v,omitempty"`
+	IndexSCIDs []string            `msgpack:"index"`
+	DocSCIDs   []string            `msgpack:"doc"`
+	Classes    map[string][]string `msgpack:"classes,omitempty"`
+	Height     int64               `msgpack:"height"`
+	Timestamp  int64               `msgpack:"ts"`
 }
+
+// telaCacheVersion is the current on-disk cache version. Bump when the
+// scvars/classify pipeline changes in a way that older snapshots can't
+// serve — a mismatch forces a one-time full re-probe on next launch,
+// which self-heals any stale or corrupted state from prior builds.
+//
+// v3 (2026-04-20): paired with the 60s TELA refresher — old v2 caches
+// were written before the refresher existed, so their rating data is
+// frozen at probe time. Strict equality (not >=) invalidates them.
+const telaCacheVersion = 3
 
 func telaCachePath(dbDir string) string {
 	return filepath.Join(dbDir, "tela_cache.bin")
@@ -607,12 +700,14 @@ func loadTELACache(dbDir string) (*telaCache, error) {
 	return &cache, nil
 }
 
-func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) error {
+func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, otherClasses map[string][]string, height int64) error {
 	telaCacheMu.Lock()
 	defer telaCacheMu.Unlock()
 	cache := telaCache{
+		Version:    telaCacheVersion,
 		IndexSCIDs: indexSCIDs,
 		DocSCIDs:   docSCIDs,
+		Classes:    otherClasses,
 		Height:     height,
 		Timestamp:  time.Now().Unix(),
 	}
@@ -623,6 +718,66 @@ func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, height int64) er
 	// 0600 matches BoltDB permissions — cache contains indexer-derived data only,
 	// but tighter is fine.
 	return os.WriteFile(telaCachePath(dbDir), data, 0600)
+}
+
+// cachedScvarsLookReadable samples cached TELA INDEX SCIDs and checks
+// whether their variable snapshots decode AND contain the shape we
+// expect for a TELA INDEX (at least one "dero1q…" rating-address key).
+// Returns true only if the majority of the sample looks healthy.
+//
+// A TELA INDEX always initializes with STORE("likes",0)+STORE("dislikes",0)
+// plus STORE(addr, ...) entries as users rate — so a healthy scvars for
+// this SCID must contain `likes`/`dislikes` plus typically one or more
+// rating-address keys. Pre-fix HyperGnomon wrote garbage payload bytes
+// that decode as "valid" structurally but lose address keys; this check
+// catches that drift in a bounded O(5) probe.
+func cachedScvarsLookReadable(idx *Indexer, cached *telaCache) bool {
+	if idx == nil || cached == nil {
+		return false
+	}
+	sample := cached.IndexSCIDs
+	if len(sample) == 0 {
+		// No TELA INDEXes cached at all — nothing to validate; trust cache.
+		return true
+	}
+	if len(sample) > 5 {
+		sample = sample[:5]
+	}
+	healthy := 0
+	for _, scid := range sample {
+		vars, err := idx.Store.GetSCIDVariableDetailsAtHeight(scid, cached.Height)
+		if err != nil {
+			logger.Debugf("cache sanity: scid %s decode err: %v", scid[:16], err)
+			continue
+		}
+		if len(vars) == 0 {
+			continue
+		}
+		// A healthy TELA INDEX snapshot always carries the likes/dislikes
+		// counter keys — their presence means the blob decoded into the
+		// real variable set, not a truncated/scrambled payload.
+		seenLikes := false
+		seenDislikes := false
+		for _, v := range vars {
+			switch k := v.Key.(type) {
+			case string:
+				if k == "likes" {
+					seenLikes = true
+				}
+				if k == "dislikes" {
+					seenDislikes = true
+				}
+			}
+			if seenLikes && seenDislikes {
+				break
+			}
+		}
+		if seenLikes && seenDislikes {
+			healthy++
+		}
+	}
+	// ≥ 60% of the sample must look healthy to trust the cache.
+	return healthy*10 >= len(sample)*6
 }
 
 // hexTable is a lookup table for hex character validation.

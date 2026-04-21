@@ -66,6 +66,10 @@ type Indexer struct {
 	// after the initial fastsync catch-up, even if the caught-up condition
 	// is detected multiple times.
 	syncedOnce atomic.Bool
+
+	// timer, when enabled, accumulates per-stage nanoseconds and emits a
+	// grouped summary every TimingEvery batches. Nil-safe via enabled flag.
+	timer *stageTimer
 }
 
 // Config holds indexer configuration.
@@ -81,6 +85,11 @@ type Config struct {
 	AdaptBatchSize bool
 	RecentBlocks   int64 // scan only the last N blocks from chain tip (0 = scan all)
 	FinalityDepth  int64 // blocks behind tip considered safe (0 = default 10)
+
+	// Timing, when true, turns on per-stage timers. TimingEvery controls how
+	// many processed batches pass between log lines (0 = default 10).
+	Timing      bool
+	TimingEvery int
 
 	// Bus is the optional event bus for subscription fan-out.
 	// If nil, indexing still works; just no push notifications.
@@ -135,6 +144,7 @@ func New(cfg Config) (*Indexer, error) {
 		Store:          store,
 		RPCPool:        pool,
 		Bus:            cfg.Bus,
+		timer:          newStageTimer(cfg.Timing, cfg.TimingEvery),
 	}
 	if idx.FinalityDepth <= 0 {
 		idx.FinalityDepth = structures.DefaultFinalityDepth
@@ -216,7 +226,7 @@ func (idx *Indexer) monitorChainHeight() {
 				newHeight-lastCacheHeight >= telaCacheHeightThrottle {
 				if cached, err := loadTELACache(idx.DBDir); err == nil {
 					cached.Height = newHeight
-					if err := saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, newHeight); err == nil {
+					if err := saveTELACache(idx.DBDir, cached.IndexSCIDs, cached.DocSCIDs, cached.Classes, newHeight); err == nil {
 						lastCacheHeight = newHeight
 					}
 				}
@@ -368,11 +378,13 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		}
 
 		var blockResults []*rpc.GetBlock_Result
+		tBlocks := time.Now()
 		err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 			var e error
 			blockResults, e = c.BatchGetBlocks(heights)
 			return e
 		})
+		idx.timer.record(stageFetchBlocksRPC, time.Since(tBlocks))
 		if err != nil {
 			logger.Errorf("BatchGetBlocks at %d: %v", lastHeight+1, err)
 			time.Sleep(1 * time.Second)
@@ -385,6 +397,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		var regCount int64
 		firstBlockChecked := false
 
+		tDecode := time.Now()
 		for i, result := range blockResults {
 			if result == nil {
 				continue
@@ -435,20 +448,24 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			}
 			blocks = append(blocks, bi)
 		}
+		idx.timer.record(stageFetchBlockDecode, time.Since(tDecode))
 
 		// === ROUND TRIP 2: Mega-batch fetch ALL transactions ===
 		var txResult *rpc.GetTransaction_Result
 		if len(allTxHashes) > 0 {
+			tTxs := time.Now()
 			err = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 				var e error
 				txResult, e = c.GetTransaction(allTxHashes)
 				return e
 			})
+			idx.timer.record(stageFetchTxsRPC, time.Since(tTxs))
 			if err != nil {
 				logger.Errorf("BatchGetTransaction (%d hashes): %v", len(allTxHashes), err)
 			}
 		}
 
+		tSend := time.Now()
 		out <- &fetchedBatch{
 			blockResults: blockResults,
 			heights:      heights,
@@ -458,6 +475,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			blocks:       blocks,
 			regCount:     regCount,
 		}
+		idx.timer.record(stageFetchSendWait, time.Since(tSend))
 		nextHeight += int64(fetchCount)
 	}
 }
@@ -531,7 +549,13 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 	syncSignaled := false
 	runningHeight := idx.LastIndexedHeight.Load()
 
-	for fb := range in {
+	for {
+		tRecv := time.Now()
+		fb, ok := <-in
+		idx.timer.record(stageProcRecvWait, time.Since(tRecv))
+		if !ok {
+			break
+		}
 		if idx.Closing.Load() {
 			break
 		}
@@ -585,27 +609,35 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 						continue
 					}
 
+					tDec := time.Now()
 					txHex := fb.txResult.Txs_as_hex[txIdx]
 					txBin, err := hex.DecodeString(txHex)
 					if err != nil {
+						idx.timer.record(stageProcTxDecode, time.Since(tDec))
 						continue
 					}
 
 					var tx transaction.Transaction
 					if err := tx.Deserialize(txBin); err != nil {
+						idx.timer.record(stageProcTxDecode, time.Since(tDec))
 						continue
 					}
+					idx.timer.record(stageProcTxDecode, time.Since(tDec))
 
 					switch tx.TransactionType {
 					case transaction.SC_TX:
+						tSC := time.Now()
 						idx.processSCTx(&tx, fb.txResult.Txs[txIdx], hashStr, bi.height, batch)
+						idx.timer.record(stageProcSCTx, time.Since(tSC))
 					case transaction.REGISTRATION:
 						fb.regCount++
 					case transaction.BURN_TX:
 						burnCount++
 					case transaction.NORMAL:
 						normCount++
+						tN := time.Now()
 						idx.processNormalTx(&tx, fb.txResult.Txs[txIdx], hashStr, bi.height, batch)
+						idx.timer.record(stageProcNormal, time.Since(tN))
 					}
 				}
 			}
@@ -622,12 +654,15 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 
 		// Flush when threshold reached
 		if blocksInBatch >= batchSize {
+			tSend := time.Now()
 			out <- &processedBatch{
 				batch:      batch,
 				newHeight:  newHeight,
 				blockCount: blocksInBatch,
 				batchStart: batchStart,
 			}
+			idx.timer.record(stageProcSendWait, time.Since(tSend))
+			idx.timer.onBatch()
 			batch = storage.NewWriteBatch()
 			blocksInBatch = 0
 		}
@@ -652,7 +687,13 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 	batchSize := idx.BatchSize
 	syncEnabled := false
 
-	for pb := range in {
+	for {
+		tRecv := time.Now()
+		pb, ok := <-in
+		idx.timer.record(stageFlushRecvWait, time.Since(tRecv))
+		if !ok {
+			break
+		}
 		if idx.Closing.Load() {
 			// Drain: still flush remaining batches for data integrity
 			if pb.batch != nil && pb.batch.LastHeight > 0 {
@@ -679,14 +720,21 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 							logger.Info("Post-scan variable fetch skipped (TELA cache exists)")
 						}
 					}
+					// Kick off the 60s TELA variable refresher so rating
+					// updates/state changes from post-sync invokes land in
+					// scvars without waiting for the next fastsync cycle.
+					idx.startTELARefresher()
 				}
 			}
 			continue
 		}
 		syncEnabled = false
 
-		if err := idx.Store.FlushBatch(pb.batch); err != nil {
-			logger.Errorf("FlushBatch: %v", err)
+		tFlush := time.Now()
+		flushErr := idx.Store.FlushBatch(pb.batch)
+		idx.timer.record(stageFlushBBolt, time.Since(tFlush))
+		if flushErr != nil {
+			logger.Errorf("FlushBatch: %v", flushErr)
 		} else {
 			// Only advance the durable progress atomic after the DB commit succeeds.
 			// If the process dies between here and the next flush, restart resumes
@@ -895,6 +943,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 
 	// Fetch SC variables
 	var scVars []*structures.SCIDVariable
+	tGetSC := time.Now()
 	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 		result, err := c.GetSC(scid, height, nil, nil, false)
 		if err != nil {
@@ -903,6 +952,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 		scVars = parseSCVariables(result)
 		return nil
 	})
+	idx.timer.record(stageProcSCTxGetSC, time.Since(tGetSC))
 
 	if len(scVars) == 0 {
 		batch.InvalidSCIDs[scid] = fees
@@ -953,6 +1003,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 // twice on first encounter of an unknown SCID.
 func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, txid string, batch *storage.WriteBatch) {
 	var scVars []*structures.SCIDVariable
+	tGetSC := time.Now()
 	_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 		result, err := c.GetSC(scid, height, nil, nil, false)
 		if err != nil {
@@ -961,6 +1012,7 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 		scVars = parseSCVariables(result)
 		return nil
 	})
+	idx.timer.record(stageProcSCTxGetSC, time.Since(tGetSC))
 
 	if _, known := idx.ValidatedSCs.Load(scid); !known {
 		if len(scVars) == 0 {
