@@ -8,7 +8,7 @@ import (
 
 // Version is set via -ldflags -X at release build time (goreleaser).
 // Default value below is what unreleased/development builds report.
-var Version = "0.8.0-dev"
+var Version = "0.9.0"
 
 const (
 	AppName = "HyperGnomon"
@@ -22,8 +22,10 @@ const (
 
 	// Default batch size for DB writes (number of blocks to accumulate)
 	DefaultBatchSize = 100
-	// Default RPC connection pool size
-	DefaultPoolSize = 8
+	// Default RPC connection pool size.
+	// Swept 4/8/16/24 on a LAN daemon with 49k SCIDs: pool=8 took 104s,
+	// pool=16 took 51s, pool=24 took 56s. Knee at 16.
+	DefaultPoolSize = 16
 	// Default parallel block fetchers
 	DefaultParallelBlocks = 20
 	// Default blocks-behind-tip considered safe from reorg.
