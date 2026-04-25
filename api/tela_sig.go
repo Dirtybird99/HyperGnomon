@@ -30,11 +30,11 @@ import (
 //   failed             — (v1.1+) cryptographic verification failed
 
 const (
-	telaVerifyDisabled        = "disabled"
-	telaVerifyUnsigned        = "unsigned"
+	telaVerifyDisabled         = "disabled"
+	telaVerifyUnsigned         = "unsigned"
 	telaVerifySignedUnverified = "signed-unverified"
-	telaVerifyPassed          = "passed"
-	telaVerifyFailed          = "failed"
+	telaVerifyPassed           = "passed"
+	telaVerifyFailed           = "failed"
 )
 
 // telaSigFields carries the three STORE values that make a TELA signature:
@@ -42,10 +42,10 @@ const (
 // signed. All three are post-hex-decode (DVM STORE strings come back
 // hex-encoded from derod's RPC layer).
 type telaSigFields struct {
-	CHex     string
-	SHex     string
-	Owner    string
-	Present  bool // at least CHex and SHex are non-empty
+	CHex    string
+	SHex    string
+	Owner   string
+	Present bool // at least CHex and SHex are non-empty
 }
 
 // readTELASigFields extracts the three signature fields from a DOC's
@@ -77,7 +77,7 @@ func readTELASigFields(vars []*structures.SCIDVariable) telaSigFields {
 
 // decodeHexIfPrintableASCII is the api-package copy of the indexer's
 // hex-decode heuristic. Kept here to avoid a cross-package dependency
-// solely for tela signatures. Behavioural contract: if s is valid hex
+// solely for tela signatures. Behavioral contract: if s is valid hex
 // that decodes to printable ASCII, return decoded; else return s
 // unchanged. DERO addresses + signature hex values survive either branch.
 func decodeHexIfPrintableASCII(s string) string {
@@ -86,7 +86,7 @@ func decodeHexIfPrintableASCII(s string) string {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return s
 		}
 	}

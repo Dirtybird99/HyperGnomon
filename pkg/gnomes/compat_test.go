@@ -10,6 +10,7 @@
 package gnomes_test
 
 import (
+	"errors"
 	"testing"
 
 	compatindexer "github.com/hypergnomon/hypergnomon/pkg/gnomes/indexer"
@@ -39,7 +40,7 @@ func TestCompatSurface_CompilesLikeCivilware(t *testing.T) {
 	// Civilware consumers build these at runtime from parsed RPC
 	// responses; HOLOGRAM treats it as a plain struct with Key/Value.
 	v := &compatstructures.SCIDVariable{Key: "hello", Value: "world"}
-	if v.Key != "hello" {
+	if v.Key != "hello" || v.Value != "world" {
 		t.Fatalf("SCIDVariable field access broken")
 	}
 
@@ -47,7 +48,7 @@ func TestCompatSurface_CompilesLikeCivilware(t *testing.T) {
 	// (civilware-shape has no error return, so we signal via DBType=="").
 	dead := compatindexer.NewIndexer(
 		nil, nil,
-		"gravdb",              // civilware gravdb path — unsupported
+		"gravdb", // civilware gravdb path — unsupported
 		"telaVersion;;;docVersion",
 		0,
 		"http://127.0.0.1:10102",
@@ -90,7 +91,7 @@ func TestCompatSurface_CompilesLikeCivilware(t *testing.T) {
 // gravdb first then bbolt — must not panic.
 func TestGravDBErrors(t *testing.T) {
 	g, err := compatstorage.NewGravDB("/tmp/nonexistent", "25ms")
-	if err != compatstorage.ErrGravDBNotSupported {
+	if !errors.Is(err, compatstorage.ErrGravDBNotSupported) {
 		t.Fatalf("NewGravDB err = %v, want ErrGravDBNotSupported", err)
 	}
 	if g != nil {

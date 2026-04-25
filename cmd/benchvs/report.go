@@ -38,7 +38,7 @@ func writeReport(path string, r Result) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		newFile = true
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) // #nosec G304 -- report path is operator-selected output.
 	if err != nil {
 		return err
 	}

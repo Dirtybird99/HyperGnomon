@@ -46,12 +46,12 @@ func (g *GravitonStore) GetAllSCIDVariableDetails(scid string) []interface{} {
 }
 
 // GetSCIDValuesByKey returns empty slices.
-func (g *GravitonStore) GetSCIDValuesByKey(scid, key string, height int64, any bool) ([]string, []int64) {
+func (g *GravitonStore) GetSCIDValuesByKey(scid, key string, height int64, matchAny bool) ([]string, []int64) {
 	return nil, nil
 }
 
 // GetSCIDKeysByValue returns empty slices.
-func (g *GravitonStore) GetSCIDKeysByValue(scid, value string, height int64, any bool) ([]string, []int64) {
+func (g *GravitonStore) GetSCIDKeysByValue(scid, value string, height int64, matchAny bool) ([]string, []int64) {
 	return nil, nil
 }
 

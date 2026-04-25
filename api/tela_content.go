@@ -686,10 +686,11 @@ func writeTELAEntry(w http.ResponseWriter, entry *structures.TELAContentEntry, r
 // need to re-run the signature lookup.
 //
 // Header values:
-//   disabled           — operator didn't enable verification
-//   unsigned           — DOC has no fileCheckC/S on-chain
-//   signed-unverified  — DOC is signed, our v1.0 stub verifier didn't run
-//   passed / failed    — (v1.1+) real cryptographic verification outcome
+//
+//	disabled           — operator didn't enable verification
+//	unsigned           — DOC has no fileCheckC/S on-chain
+//	signed-unverified  — DOC is signed, our v1.0 stub verifier didn't run
+//	passed / failed    — (v1.1+) real cryptographic verification outcome
 //
 // v1.0 never emits passed/failed because verifyTELASignature is a stub.
 // The stub returns (false, nil) which we map to signed-unverified, not

@@ -417,18 +417,6 @@ func (s *BboltStore) StoreTxCounts(reg, burn, norm int64) error {
 	})
 }
 
-func addIntStat(b *bolt.Bucket, key string, delta int64) error {
-	if delta == 0 {
-		return nil
-	}
-	existing := b.Get([]byte(key))
-	var current int64
-	if existing != nil {
-		current, _ = strconv.ParseInt(string(existing), 10, 64)
-	}
-	return b.Put([]byte(key), []byte(strconv.FormatInt(current+delta, 10)))
-}
-
 func addSCIDCountStat(tx *bolt.Tx, delta int64) error {
 	if delta == 0 {
 		return nil
@@ -1236,7 +1224,7 @@ func hexDecodeIfHex(s string) string {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return s
 		}
 	}

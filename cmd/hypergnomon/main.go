@@ -61,10 +61,10 @@ func main() {
 	// TELA-INDEX-1 / TELA-DOC-1 / TELA-MOD-1 — the classes whose content
 	// server + GetInitialSCIDCode consumers actually read. "none" disables
 	// forward-populate entirely (lazy-fill on each read). "all" matches
-	// the pre-class-aware behaviour (grows mainnet DB by ~134 MB).
+	// the pre-class-aware behavior (grows mainnet DB by ~134 MB).
 	//
 	// Legacy --skip-tela-doc-code still accepted and forces policy "none"
-	// for TELA-DOC-1 — equivalent behaviour is now "none" applied broadly.
+	// for TELA-DOC-1 — equivalent behavior is now "none" applied broadly.
 	codePolicy := flag.String("persist-install-code", "tela", "sccode persistence: none|tela|all (default tela — only TELA-{INDEX,DOC,MOD}-1 codes persisted)")
 	fastsync := flag.Bool("fastsync", false, "Enable fastsync from GnomonSC")
 	testnet := flag.Bool("testnet", false, "Use testnet GnomonSC SCID")

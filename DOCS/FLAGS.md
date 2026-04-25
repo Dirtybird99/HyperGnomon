@@ -77,7 +77,7 @@ Policy for the `sccode` bucket (install-time SC code persistence):
 
 - `none` — disables forward-populate entirely. Code is lazy-filled on each `GetInitialSCIDCode` read via a single-flight backfill.
 - `tela` (**default**) — persists only `TELA-INDEX-1`, `TELA-DOC-1`, `TELA-MOD-1`. These are the classes whose content server + `GetInitialSCIDCode` consumers actually read. Adds ~15 MB to mainnet DB.
-- `all` — persists every SC's install code. Matches the pre-class-aware behaviour; adds ~134 MB to mainnet DB.
+- `all` — persists every SC's install code. Matches the pre-class-aware behavior; adds ~134 MB to mainnet DB.
 
 Legacy `--skip-tela-doc-code` is still accepted and coerces the policy toward `none` for `TELA-DOC-1`.
 

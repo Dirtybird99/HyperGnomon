@@ -87,7 +87,7 @@ func runProbes(baseURL string, paths []string, workers int, duration time.Durati
 						failed = true
 					}
 					_, _ = io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 				samples <- sample{pathIdx: idx, dur: lat, err: failed}
 			}
