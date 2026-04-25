@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creachadair/jrpc2"
@@ -114,6 +115,8 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 	batch := storage.NewWriteBatch()
 	var batchMu sync.Mutex
 	persisted := 0
+	var rpcErrors atomic.Int64
+	var decodeErrors atomic.Int64
 
 	workChan := make(chan []string, 8)
 	var wg sync.WaitGroup
@@ -142,53 +145,69 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 				if idx.Closing.Load() {
 					return
 				}
-				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-					specs := make([]jrpc2.Spec, len(chunk))
-					for i, scid := range chunk {
-						specs[i] = jrpc2.Spec{
-							Method: "DERO.GetSC",
-							Params: buildGetSCParams(scid, fastKeys),
+				var lastErr error
+				for attempt := 1; attempt <= 2; attempt++ {
+					lastErr = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+						specs := make([]jrpc2.Spec, len(chunk))
+						for i, scid := range chunk {
+							specs[i] = jrpc2.Spec{
+								Method: "DERO.GetSC",
+								Params: buildGetSCParams(scid, fastKeys),
+							}
 						}
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					defer cancel()
+						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
 
-					results, err := c.RPC.Batch(ctx, specs)
-					if err != nil {
-						return err
-					}
+						results, err := c.RPC.Batch(ctx, specs)
+						if err != nil {
+							return err
+						}
 
-					for i, resp := range results {
-						var r rpc.GetSC_Result
-						if err := resp.UnmarshalResult(&r); err != nil {
-							continue
+						for i, resp := range results {
+							var r rpc.GetSC_Result
+							if err := resp.UnmarshalResult(&r); err != nil {
+								decodeErrors.Add(1)
+								continue
+							}
+							var vars []*structures.SCIDVariable
+							if fastKeys != nil {
+								vars = scVarsFromKeyValues(fastKeys, r.ValuesString)
+							} else {
+								vars = parseSCVariables(&r)
+							}
+							if len(vars) == 0 {
+								continue
+							}
+							varMap := varsToMap(vars)
+							sc := ClassifySC(chunk[i], "", varMap)
+							durl, version := telaFieldsForClass(class, varMap)
+							meta := &structures.ClassMeta{
+								Class:         class,
+								Tags:          classTags,
+								Name:          sc.Name,
+								Desc:          sc.Desc,
+								IconURL:       sc.IconURL,
+								DURL:          durl,
+								Version:       version,
+								InstallHeight: chainHeight,
+								LastHeight:    chainHeight,
+							}
+							batchMu.Lock()
+							batch.AddVariables(chunk[i], chainHeight, vars)
+							batch.AddClass(chunk[i], meta)
+							persisted++
+							batchMu.Unlock()
 						}
-						var vars []*structures.SCIDVariable
-						if fastKeys != nil {
-							vars = scVarsFromKeyValues(fastKeys, r.ValuesString)
-						} else {
-							vars = parseSCVariables(&r)
-						}
-						if len(vars) == 0 {
-							continue
-						}
-						sc := ClassifySC(chunk[i], "", varsToMap(vars))
-						batchMu.Lock()
-						batch.AddVariables(chunk[i], chainHeight, vars)
-						batch.AddClass(chunk[i], &structures.ClassMeta{
-							Class:         class,
-							Tags:          classTags,
-							Name:          sc.Name,
-							Desc:          sc.Desc,
-							IconURL:       sc.IconURL,
-							InstallHeight: chainHeight,
-							LastHeight:    chainHeight,
-						})
-						persisted++
-						batchMu.Unlock()
+						return nil
+					})
+					if lastErr == nil || idx.Closing.Load() {
+						break
 					}
-					return nil
-				})
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				}
+				if lastErr != nil {
+					rpcErrors.Add(1)
+				}
 			}
 		}()
 	}
@@ -217,5 +236,8 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 	}
 	logger.Infof("Class refresh %s (%s): %d apps persisted at height %d in %s",
 		class, mode, persisted, chainHeight, time.Since(start).Round(time.Millisecond))
+	if rpcErrors.Load() > 0 || decodeErrors.Load() > 0 {
+		logger.Warnf("Class refresh %s (%s): rpc_errors=%d decode_errors=%d", class, mode, rpcErrors.Load(), decodeErrors.Load())
+	}
 	return persisted, nil
 }

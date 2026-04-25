@@ -194,8 +194,8 @@ func (idx *Indexer) FastSync(testnet bool) error {
 	batch := storage.NewWriteBatch()
 
 	if idx.TurboMode {
-		// TURBO FASTSYNC: Skip ALL GetSC calls. Just store SCID + owner + height
-		// from the registry. DB flush + TELA probe run in background.
+		// TURBO FASTSYNC: Skip ALL GetSC calls. Store SCID + owner + height
+		// from the registry, then claim progress only after the DB commit.
 		for _, entry := range candidates {
 			scid := hgpool.InternSCID(entry.scid)
 			idx.ValidatedSCs.Store(scid, struct{}{})
@@ -211,19 +211,18 @@ func (idx *Indexer) FastSync(testnet bool) error {
 			}
 		}
 
+		batch.LastHeight = chainHeight
+		flushStart := time.Now()
+		if err := idx.Store.FlushBatch(batch); err != nil {
+			storage.PutWriteBatch(batch)
+			return fmt.Errorf("fastsync: turbo flush batch: %w", err)
+		}
+		persisted := len(batch.Owners)
+		storage.PutWriteBatch(batch)
 		idx.LastIndexedHeight.Store(chainHeight)
 		elapsed := time.Since(start)
-		logger.Infof("FastSync complete: %d SCIDs ready in %s", len(candidates), elapsed.Round(time.Millisecond))
-
-		// Background: flush to disk (non-blocking)
-		batch.LastHeight = chainHeight
-		go func() {
-			if err := idx.Store.FlushBatch(batch); err != nil {
-				logger.Errorf("FastSync background flush: %v", err)
-			} else {
-				logger.Infof("FastSync DB flush complete (%d SCIDs persisted)", len(batch.Owners))
-			}
-		}()
+		logger.Infof("FastSync complete: %d SCIDs persisted to height %d in %s (flush=%s)",
+			persisted, chainHeight, elapsed.Round(time.Millisecond), time.Since(flushStart).Round(time.Millisecond))
 
 		// JOFITO CACHE: Check if we have a cached TELA list from a previous run.
 		// If so, load it instantly and only probe NEW SCIDs (delta since cached height).
@@ -249,7 +248,7 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 			if len(deltaCandidates) > 0 {
 				logger.Infof("TELA delta probe: %d new SCIDs since height %d", len(deltaCandidates), cached.Height)
-				go idx.probeTELA(deltaCandidates, chainHeight)
+				go idx.probeTELA(deltaCandidates, chainHeight, true)
 			} else {
 				logger.Info("TELA delta probe: no new SCIDs since last run")
 			}
@@ -263,7 +262,7 @@ func (idx *Indexer) FastSync(testnet bool) error {
 				logger.Infof("TELA cache reject: v%d != v%d or scvars sanity failed — running full probe to heal",
 					cached.Version, telaCacheVersion)
 			}
-			go idx.probeTELA(candidates, chainHeight)
+			go idx.probeTELA(candidates, chainHeight, false)
 		}
 
 		return nil
@@ -350,25 +349,55 @@ func (idx *Indexer) FastSync(testnet bool) error {
 	// Step 5: Flush batch and set last indexed height to current chain height
 	batch.LastHeight = chainHeight
 	if err := idx.Store.FlushBatch(batch); err != nil {
+		storage.PutWriteBatch(batch)
 		return fmt.Errorf("fastsync: flush batch: %w", err)
 	}
 
 	idx.LastIndexedHeight.Store(chainHeight)
 
 	scidCount := len(batch.Owners)
+	storage.PutWriteBatch(batch)
 	elapsed := time.Since(start)
 	logger.Infof("FastSync complete: %d SCIDs indexed to height %d in %s", scidCount, chainHeight, elapsed.Round(time.Millisecond))
+
+	// Non-turbo FastSync used to skip probeTELA entirely, leaving TELACount
+	// at 0 and --tela-only hanging forever. Run the probe here so every
+	// FastSync path populates the TELA bucket regardless of scan strategy.
+	// The turbo branch above has its own cache-aware probe launch; this
+	// only fires on the non-turbo codepath.
+	go idx.probeTELA(candidates, chainHeight, false)
+
 	return nil
 }
 
 // probeTELA discovers TELA apps using batch code probing, then fetches their variables.
 // Phase 1: Batch GetSC(code=true) across 8 connections to find SCIDs with telaVersion/docVersion
 // Phase 2: Batch GetSC(variables=true) for only the matched TELA SCIDs to get metadata
-func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
+func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, allowEarlyExit bool) {
 	start := time.Now()
-	probeBatchSize := 100
+	probeBatchSize := normalizeClassifyProbeBatchSize(idx.ClassifyProbeBatchSize)
 	var probed atomic.Int64
 	total := int64(len(candidates))
+	var phase1SpecNanos atomic.Int64
+	var phase1RPCNanos atomic.Int64
+	var phase1DecodeNanos atomic.Int64
+	var phase1ScanNanos atomic.Int64
+	var phase1Batches atomic.Int64
+	var phase1RPCErrors atomic.Int64
+	var phase1DecodeErrors atomic.Int64
+	var phase1CodeBytes atomic.Int64
+	var phase2SpecNanos atomic.Int64
+	var phase2RPCNanos atomic.Int64
+	var phase2DecodeNanos atomic.Int64
+	var phase2ParseNanos atomic.Int64
+	var phase2ClassifyNanos atomic.Int64
+	var phase2Batches atomic.Int64
+	var phase2RPCErrors atomic.Int64
+	var phase2DecodeErrors atomic.Int64
+	var phase2Vars atomic.Int64
+	var codeFlushTime time.Duration
+	var varFlushTime time.Duration
+	var cacheSaveTime time.Duration
 
 	// Sort candidates by height descending -- newer SCIDs first
 	// TELA apps are more likely among recent deployments
@@ -377,9 +406,17 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	})
 
 	scids := make([]string, len(candidates))
+	heightByScid := make(map[string]int64, len(candidates))
 	for i, c := range candidates {
 		scids[i] = c.scid
+		heightByScid[c.scid] = c.height
 	}
+
+	// codeBatch accumulates install-time code for every SCID whose phase-1
+	// probe matched a known class. Flushed between phase 1 and phase 2 so
+	// phase-2's varBatch stays focused on variables + class metadata.
+	codeBatch := storage.NewWriteBatch()
+	var codeMu sync.Mutex
 
 	// Phase 1: Batch code probe to find TELA SCIDs (split INDEX vs DOC) plus
 	// any other classes classify.go knows about (NFA, G45-*, T345). We reuse
@@ -404,90 +441,124 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() || probeComplete.Load() {
 					return
 				}
-				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-					specs := make([]jrpc2.Spec, len(batch))
-					for i, scid := range batch {
-						specs[i] = jrpc2.Spec{
-							Method: "DERO.GetSC",
-							Params: rpc.GetSC_Params{SCID: scid, Code: true},
-						}
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					defer cancel()
-
-					results, err := c.RPC.Batch(ctx, specs)
-					if err != nil {
-						return err
-					}
-
-					for i, resp := range results {
-						var r rpc.GetSC_Result
-						if err := resp.UnmarshalResult(&r); err != nil {
-							continue
-						}
-						if r.Code == "" {
-							continue
-						}
-						// Walk classify.go's rule list in order — first match wins.
-						// More specific patterns come first (G45-FAT before G45-C, etc.).
-						var matched string
-						for _, rule := range rules {
-							if strings.Contains(r.Code, rule.pattern) {
-								matched = rule.class
-								break
+				var lastErr error
+				for attempt := 1; attempt <= 2; attempt++ {
+					lastErr = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+						tSpec := time.Now()
+						specs := make([]jrpc2.Spec, len(batch))
+						for i, scid := range batch {
+							specs[i] = jrpc2.Spec{
+								Method: "DERO.GetSC",
+								Params: rpc.GetSC_Params{SCID: scid, Code: true},
 							}
 						}
-						if matched == "" {
-							continue
-						}
-						sinceLastFind.Store(0)
-						telaMu.Lock()
-						switch matched {
-						case "TELA-INDEX-1":
-							telaIndexSCIDs = append(telaIndexSCIDs, batch[i])
-						case "TELA-DOC-1":
-							telaDocSCIDs = append(telaDocSCIDs, batch[i])
-						default:
-							otherClassSCIDs[matched] = append(otherClassSCIDs[matched], batch[i])
-						}
-						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-						for _, v := range otherClassSCIDs {
-							found += len(v)
-						}
-						telaMu.Unlock()
-						if found%200 == 0 {
-							logger.Infof("Classify milestone: %d classified SCIDs discovered so far", found)
-						}
-					}
+						phase1SpecNanos.Add(time.Since(tSpec).Nanoseconds())
+						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
 
-					count := probed.Add(int64(len(batch)))
-					sinceLastFind.Add(int64(len(batch)))
-					if count%5000 == 0 || count >= total {
-						telaMu.Lock()
-						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-						for _, v := range otherClassSCIDs {
-							found += len(v)
+						tRPC := time.Now()
+						results, err := c.RPC.Batch(ctx, specs)
+						phase1RPCNanos.Add(time.Since(tRPC).Nanoseconds())
+						phase1Batches.Add(1)
+						if err != nil {
+							return err
 						}
-						telaMu.Unlock()
-						logger.Infof("Classify probe: %d/%d checked, %d classified (%.0f%%)",
-							count, total, found, float64(count)/float64(total)*100)
-					}
 
-					// Early exit: 3k since last find AND we've already classified something.
-					if sinceLastFind.Load() > 3000 {
-						telaMu.Lock()
-						found := len(telaIndexSCIDs) + len(telaDocSCIDs)
-						for _, v := range otherClassSCIDs {
-							found += len(v)
+						for i, resp := range results {
+							var r rpc.GetSC_Result
+							tDecode := time.Now()
+							if err := resp.UnmarshalResult(&r); err != nil {
+								phase1DecodeNanos.Add(time.Since(tDecode).Nanoseconds())
+								phase1DecodeErrors.Add(1)
+								continue
+							}
+							phase1DecodeNanos.Add(time.Since(tDecode).Nanoseconds())
+							if r.Code == "" {
+								continue
+							}
+							phase1CodeBytes.Add(int64(len(r.Code)))
+							// Walk classify.go's rule list in order — first match wins.
+							// More specific patterns come first (G45-FAT before G45-C, etc.).
+							tScan := time.Now()
+							var matched string
+							for _, rule := range rules {
+								if strings.Contains(r.Code, rule.pattern) {
+									matched = rule.class
+									break
+								}
+							}
+							phase1ScanNanos.Add(time.Since(tScan).Nanoseconds())
+							if matched == "" {
+								continue
+							}
+							sinceLastFind.Store(0)
+							scidStr := batch[i]
+							telaMu.Lock()
+							switch matched {
+							case "TELA-INDEX-1":
+								telaIndexSCIDs = append(telaIndexSCIDs, scidStr)
+							case "TELA-DOC-1":
+								telaDocSCIDs = append(telaDocSCIDs, scidStr)
+							default:
+								otherClassSCIDs[matched] = append(otherClassSCIDs[matched], scidStr)
+							}
+							// Persist the install-time code. Skip TELA-DOC-1 when
+							// the operator opted out (flag --skip-tela-doc-code).
+							persistCode := idx.shouldPersistCode(matched)
+							telaMu.Unlock()
+							if persistCode {
+								codeMu.Lock()
+								codeBatch.AddSCCode(scidStr, heightByScid[scidStr], r.Code)
+								codeMu.Unlock()
+							}
+							telaMu.Lock()
+							found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+							for _, v := range otherClassSCIDs {
+								found += len(v)
+							}
+							telaMu.Unlock()
+							if found%200 == 0 {
+								logger.Infof("Classify milestone: %d classified SCIDs discovered so far", found)
+							}
 						}
-						telaMu.Unlock()
-						if found > 0 {
-							probeComplete.Store(true)
-							return nil
+
+						count := probed.Add(int64(len(batch)))
+						sinceLastFind.Add(int64(len(batch)))
+						if count%5000 == 0 || count >= total {
+							telaMu.Lock()
+							found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+							for _, v := range otherClassSCIDs {
+								found += len(v)
+							}
+							telaMu.Unlock()
+							logger.Infof("Classify probe: %d/%d checked, %d classified (%.0f%%)",
+								count, total, found, float64(count)/float64(total)*100)
 						}
+
+						// Early exit is only safe for cache-backed delta probes.
+						if allowEarlyExit && sinceLastFind.Load() > 3000 {
+							telaMu.Lock()
+							found := len(telaIndexSCIDs) + len(telaDocSCIDs)
+							for _, v := range otherClassSCIDs {
+								found += len(v)
+							}
+							telaMu.Unlock()
+							if found > 0 {
+								probeComplete.Store(true)
+								return nil
+							}
+						}
+						return nil
+					})
+					if lastErr == nil || idx.Closing.Load() || probeComplete.Load() {
+						break
 					}
-					return nil
-				})
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				}
+				if lastErr != nil {
+					phase1RPCErrors.Add(1)
+					logger.Warnf("Classify phase 1 batch failed after retry (%d SCIDs): %v", len(batch), lastErr)
+				}
 			}
 		}()
 	}
@@ -520,8 +591,28 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	telaCount := len(telaIndexSCIDs) + len(telaDocSCIDs) // kept for cache compatibility
 
 	if totalClassified == 0 {
+		logger.Infof("Classify probe timings: phase1_spec=%s phase1_rpc=%s phase1_decode=%s phase1_scan=%s phase1_batches=%d phase1_batch_size=%d phase1_rpc_errors=%d phase1_decode_errors=%d code_bytes=%d early_exit_allowed=%v",
+			time.Duration(phase1SpecNanos.Load()).Round(time.Millisecond),
+			time.Duration(phase1RPCNanos.Load()).Round(time.Millisecond),
+			time.Duration(phase1DecodeNanos.Load()).Round(time.Millisecond),
+			time.Duration(phase1ScanNanos.Load()).Round(time.Millisecond),
+			phase1Batches.Load(), probeBatchSize, phase1RPCErrors.Load(), phase1DecodeErrors.Load(),
+			phase1CodeBytes.Load(), allowEarlyExit)
+		storage.PutWriteBatch(codeBatch)
 		return
 	}
+
+	// Flush phase-1 code snapshots before phase-2 starts so a crash between
+	// phases still leaves the DB with authoritative install code for any
+	// SCID we successfully classified.
+	if len(codeBatch.SCCodes) > 0 {
+		codeFlushStart := time.Now()
+		if err := idx.Store.FlushBatch(codeBatch); err != nil {
+			logger.Errorf("FastSync phase-1 code flush: %v", err)
+		}
+		codeFlushTime = time.Since(codeFlushStart)
+	}
+	storage.PutWriteBatch(codeBatch)
 
 	// Phase 2: Batch fetch full variables for BOTH INDEX and DOC SCIDs.
 	// HOLOGRAM's GetMyDOCs / SearchByKey("docVersion") / GetAllDOCTypes / GetMyINDEXes
@@ -544,50 +635,77 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 				if idx.Closing.Load() {
 					return
 				}
-				_ = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
-					specs := make([]jrpc2.Spec, len(item.scids))
-					for i, scid := range item.scids {
-						specs[i] = jrpc2.Spec{
-							Method: "DERO.GetSC",
-							Params: rpc.GetSC_Params{SCID: scid, Variables: true},
+				var lastErr error
+				for attempt := 1; attempt <= 2; attempt++ {
+					lastErr = idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+						tSpec := time.Now()
+						specs := make([]jrpc2.Spec, len(item.scids))
+						for i, scid := range item.scids {
+							specs[i] = jrpc2.Spec{
+								Method: "DERO.GetSC",
+								Params: rpc.GetSC_Params{SCID: scid, Variables: true},
+							}
 						}
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					defer cancel()
+						phase2SpecNanos.Add(time.Since(tSpec).Nanoseconds())
+						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
 
-					results, err := c.RPC.Batch(ctx, specs)
-					if err != nil {
-						return err
-					}
+						tRPC := time.Now()
+						results, err := c.RPC.Batch(ctx, specs)
+						phase2RPCNanos.Add(time.Since(tRPC).Nanoseconds())
+						phase2Batches.Add(1)
+						if err != nil {
+							return err
+						}
 
-					for i, resp := range results {
-						var r rpc.GetSC_Result
-						if err := resp.UnmarshalResult(&r); err != nil {
-							continue
+						for i, resp := range results {
+							var r rpc.GetSC_Result
+							tDecode := time.Now()
+							if err := resp.UnmarshalResult(&r); err != nil {
+								phase2DecodeNanos.Add(time.Since(tDecode).Nanoseconds())
+								phase2DecodeErrors.Add(1)
+								continue
+							}
+							phase2DecodeNanos.Add(time.Since(tDecode).Nanoseconds())
+							tParse := time.Now()
+							vars := parseSCVariables(&r)
+							phase2ParseNanos.Add(time.Since(tParse).Nanoseconds())
+							phase2Vars.Add(int64(len(vars)))
+							tClassify := time.Now()
+							varMap := varsToMap(vars)
+							sc := ClassifySC(item.scids[i], "", varMap)
+							durl, version := telaFieldsForClass(item.class, varMap)
+							meta := &structures.ClassMeta{
+								Class:         item.class,
+								Tags:          tagsForClass(item.class),
+								Name:          sc.Name,
+								Desc:          sc.Desc,
+								IconURL:       sc.IconURL,
+								DURL:          durl,
+								Version:       version,
+								InstallHeight: chainHeight,
+								LastHeight:    chainHeight,
+							}
+							phase2ClassifyNanos.Add(time.Since(tClassify).Nanoseconds())
+
+							varMu.Lock()
+							if len(vars) > 0 {
+								varBatch.AddVariables(item.scids[i], chainHeight, vars)
+							}
+							varBatch.AddClass(item.scids[i], meta)
+							varMu.Unlock()
 						}
-						vars := parseSCVariables(&r)
-						varMu.Lock()
-						if len(vars) > 0 {
-							varBatch.AddVariables(item.scids[i], chainHeight, vars)
-						}
-						// Always write class meta — phase 1 already proved the
-						// SCID belongs to item.class via code probe. ClassifySC
-						// with empty code won't re-detect from code, so we set
-						// class directly and use it only for header extraction.
-						sc := ClassifySC(item.scids[i], "", varsToMap(vars))
-						varBatch.AddClass(item.scids[i], &structures.ClassMeta{
-							Class:         item.class,
-							Tags:          tagsForClass(item.class),
-							Name:          sc.Name,
-							Desc:          sc.Desc,
-							IconURL:       sc.IconURL,
-							InstallHeight: chainHeight,
-							LastHeight:    chainHeight,
-						})
-						varMu.Unlock()
+						return nil
+					})
+					if lastErr == nil || idx.Closing.Load() {
+						break
 					}
-					return nil
-				})
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				}
+				if lastErr != nil {
+					phase2RPCErrors.Add(1)
+					logger.Warnf("Classify phase 2 batch failed after retry (%s, %d SCIDs): %v", item.class, len(item.scids), lastErr)
+				}
 			}
 		}()
 	}
@@ -624,9 +742,12 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	wg2.Wait()
 
 	// Flush classified variables + class metadata to DB
+	varFlushStart := time.Now()
 	if err := idx.Store.FlushBatch(varBatch); err != nil {
 		logger.Errorf("Classify flush: %v", err)
 	}
+	varFlushTime = time.Since(varFlushStart)
+	storage.PutWriteBatch(varBatch)
 
 	phase2Time := time.Since(phase2Start)
 	totalTime := time.Since(start)
@@ -637,15 +758,36 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64) {
 	logger.Infof("Classify probe complete: %d INDEX + %d DOC + %d other | Phase1: %s Phase2: %s Total: %s",
 		len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, phase1Time.Round(time.Millisecond),
 		phase2Time.Round(time.Millisecond), totalTime.Round(time.Millisecond))
+	logger.Infof("Classify probe timings: phase1_spec=%s phase1_rpc=%s phase1_decode=%s phase1_scan=%s code_flush=%s phase2_spec=%s phase2_rpc=%s phase2_decode=%s phase2_parse=%s phase2_classify=%s var_flush=%s phase1_batches=%d phase1_batch_size=%d phase2_batches=%d rpc_errors=%d/%d decode_errors=%d/%d code_bytes=%d vars=%d early_exit_allowed=%v",
+		time.Duration(phase1SpecNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase1RPCNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase1DecodeNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase1ScanNanos.Load()).Round(time.Millisecond),
+		codeFlushTime.Round(time.Millisecond),
+		time.Duration(phase2SpecNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase2RPCNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase2DecodeNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase2ParseNanos.Load()).Round(time.Millisecond),
+		time.Duration(phase2ClassifyNanos.Load()).Round(time.Millisecond),
+		varFlushTime.Round(time.Millisecond),
+		phase1Batches.Load(), probeBatchSize, phase2Batches.Load(),
+		phase1RPCErrors.Load(), phase2RPCErrors.Load(),
+		phase1DecodeErrors.Load(), phase2DecodeErrors.Load(),
+		phase1CodeBytes.Load(), phase2Vars.Load(), allowEarlyExit)
 
 	structures.TELACount.Store(int64(telaCount))
 
 	// Save cache for instant subsequent startups (Jofito: never repeat work)
+	cacheSaveStart := time.Now()
 	if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, otherClassSCIDs, chainHeight); err != nil {
 		logger.Errorf("Classify cache save: %v", err)
 	} else {
+		cacheSaveTime = time.Since(cacheSaveStart)
 		logger.Infof("Classify cache v%d saved: %d INDEX + %d DOC + %d other classes at height %d",
 			telaCacheVersion, len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, chainHeight)
+	}
+	if cacheSaveTime > 0 {
+		logger.Infof("Classify cache save timing: cache_save=%s", cacheSaveTime.Round(time.Millisecond))
 	}
 }
 
@@ -715,9 +857,24 @@ func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, otherClasses map
 	if err != nil {
 		return err
 	}
+	path := telaCachePath(dbDir)
+	tmp := path + ".tmp"
 	// 0600 matches BoltDB permissions — cache contains indexer-derived data only,
-	// but tighter is fine.
-	return os.WriteFile(telaCachePath(dbDir), data, 0600)
+	// but tighter is fine. Write a temp file first so a crash does not leave
+	// a truncated cache at the canonical path.
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		// Windows does not replace existing files with Rename. Remove+rename is
+		// not fully atomic, but still avoids serving partially-written bytes.
+		_ = os.Remove(path)
+		if err2 := os.Rename(tmp, path); err2 != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	return nil
 }
 
 // cachedScvarsLookReadable samples cached TELA INDEX SCIDs and checks

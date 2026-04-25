@@ -47,11 +47,31 @@ builds:
       - -s -w
     mod_timestamp: "{{ .CommitTimestamp }}"
 
+  # benchvs is the single-target head-to-head bench harness
+  # (see cmd/benchvs/README.md). Bundled so operators can run
+  # the comparison against their own daemon without a `go build`.
+  - id: benchvs
+    main: ./cmd/benchvs
+    binary: benchvs
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
 archives:
   - id: default
     ids:
       - hypergnomon
       - wstest
+      - benchvs
     formats: ["tar.gz"]
     name_template: >-
       {{ .ProjectName }}_
@@ -68,7 +88,10 @@ archives:
       - README*
       - SECURITY*
       - DESIGN*
-      - CLAUDE*
+      - CHANGELOG*
+      - DOCS/MIGRATION_FROM_GNOMON.md
+      - DOCS/FLAGS.md
+      - DOCS/BENCHMARKS.md
 
 checksum:
   name_template: "checksums.txt"
@@ -117,18 +140,24 @@ release:
   header: |
     ## HyperGnomon {{ .Tag }}
 
-    Arena-accelerated DERO blockchain indexer. Finds all TELA apps on the
-    entire chain in under 5s (cold), 14ms (cached).
+    Arena-accelerated DERO blockchain indexer. Byte-correct TELA
+    content server, WebSocket push API, civilware/Gnomon-shape Go
+    library for embedding. See README.md §4 for the comparison table
+    and DOCS/BENCHMARKS.md for methodology behind every number.
 
-    ### Install (pre-built)
-    Grab the archive for your OS below, extract, and run:
+    ### Install (pre-built archive)
     ```
-    ./hypergnomon --daemon-rpc-address=127.0.0.1:10102 --fastsync --turbo
+    tar -xzf hypergnomon_{{ trimprefix .Tag "v" }}_<os>_<arch>.tar.gz
+    ./hypergnomon --daemon-rpc-address=127.0.0.1:10102 --fastsync
     ```
 
-    ### Install (from source)
+    ### Install (go install)
     ```
     go install github.com/hypergnomon/hypergnomon/cmd/hypergnomon@{{ .Tag }}
     ```
+
+    ### Migrate from civilware/Gnomon (Go library embedders)
+    Three sed commands + one constructor swap —
+    see `DOCS/MIGRATION_FROM_GNOMON.md`.
   footer: |
     **Full Changelog**: {{ .GitURL }}/compare/{{ .PreviousTag }}...{{ .Tag }}

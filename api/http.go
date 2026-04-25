@@ -5,12 +5,15 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
 
+	"github.com/hypergnomon/hypergnomon/eventbus"
+	"github.com/hypergnomon/hypergnomon/indexer"
 	"github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/storage"
 	"github.com/hypergnomon/hypergnomon/structures"
@@ -23,29 +26,52 @@ type Server struct {
 	listenAddr string
 
 	// safeHeight is a pointer to the indexer's atomic.Int64 tracking
-	// max(LastIndexedHeight - FinalityDepth, 0). A pointer keeps the api
-	// package free of an indexer import while still giving clients a live
-	// read. nil is tolerated (returns 0) so callers that don't care can
-	// skip wiring it up.
+	// max(LastIndexedHeight - FinalityDepth, 0). nil is tolerated (returns 0).
 	safeHeight *atomic.Int64
+
+	// TELA content server wiring. All three are optional: if bus is nil the
+	// cache invalidator is a no-op; if tela is nil /tela/... returns 503
+	// on cache misses (but served reads from the durable bucket still work).
+	bus       *eventbus.Bus
+	tela      *indexer.Indexer
+	telaCache *telaContentCache
+
+	// telaVerifySigs enables the X-TELA-Verify response header on /tela/…
+	// responses. v1.0 surfaces signature presence without running the
+	// bn256 Schnorr verification (that lands in v1.1). Default false so
+	// existing deployments don't see unexpected header changes.
+	telaVerifySigs bool
 
 	mu         sync.RWMutex
 	cachedInfo *structures.GetInfoResult
+
+	assetCatalogMu       sync.RWMutex
+	assetCatalogs        map[string]assetCatalogCacheEntry
+	assetCatalogTTL      time.Duration
+	assetCatalogEmptyTTL time.Duration
 }
 
 // NewServer creates a new API server.
 //
-// safeHeight may be nil; handlers treat nil as zero. Passing a pointer to
-// indexer.Indexer.SafeHeight lets the API expose live safe-height reads
-// without the api package importing indexer.
-func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string, safeHeight *atomic.Int64) *Server {
+// safeHeight may be nil; handlers treat nil as zero. bus/idx may be nil to
+// disable the /tela/... content server's on-demand refresh + invalidation.
+func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string, safeHeight *atomic.Int64, bus *eventbus.Bus, idx *indexer.Indexer, telaCacheBytes int64) *Server {
 	return &Server{
 		store:      store,
 		pool:       pool,
 		listenAddr: listenAddr,
 		safeHeight: safeHeight,
+		bus:        bus,
+		tela:       idx,
+		telaCache:  newTELAContentCache(telaCacheBytes),
 	}
 }
+
+// SetTELAVerifySigs toggles the X-TELA-Verify header on served /tela/…
+// responses. Call before Start; flipping at runtime is safe but only
+// affects subsequent requests. v1.0 limitation: the header reports
+// signature presence, not cryptographic verification.
+func (s *Server) SetTELAVerifySigs(on bool) { s.telaVerifySigs = on }
 
 // loadSafeHeight returns the current safe height, or 0 if not wired.
 func (s *Server) loadSafeHeight() int64 {
@@ -70,10 +96,21 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/scidprivtx", s.handleSCIDPrivTx).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela", s.handleGetTELA).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela/count", s.handleGetTELACount).Methods(http.MethodGet)
+	r.HandleFunc("/api/tela/{scid}/ratings", s.handleGetTELARatings).Methods(http.MethodGet)
+	r.HandleFunc("/api/assets", s.handleGetAssets).Methods(http.MethodGet)
+	r.HandleFunc("/api/assets/{scid}", s.handleGetAsset).Methods(http.MethodGet)
+	r.HandleFunc("/api/initialscidcode", s.handleGetInitialSCIDCode).Methods(http.MethodGet)
+	r.HandleFunc("/api/address/{address}/created-assets", s.handleGetAddressCreatedAssets).Methods(http.MethodGet)
+	r.HandleFunc("/api/address/{address}/touched-assets", s.handleGetAddressTouchedAssets).Methods(http.MethodGet)
 	r.HandleFunc("/api/address/{address}/scs", s.handleGetAddress).Methods(http.MethodGet)
 
-	// Start background info caching
+	// TELA content server (DESIGN.md §10). {path:.*} lets the router
+	// forward multi-segment paths like "app/js/main.js" intact.
+	r.HandleFunc("/tela/{scid}/{path:.*}", s.handleGetTELAContent).Methods(http.MethodGet, http.MethodHead)
+
+	// Start background info caching + TELA cache invalidator
 	go s.refreshInfoLoop()
+	go s.runTELAInvalidator()
 
 	logger.Infof("HTTP API listening on %s", s.listenAddr)
 	srv := &http.Server{
@@ -151,9 +188,9 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scids, err := s.store.GetAllSCIDs()
+	scCount, err := s.store.GetSCIDCount()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to get SCIDs: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to get SCID count: "+err.Error())
 		return
 	}
 
@@ -168,7 +205,7 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		"version":        structures.Version,
 		"index_height":   indexHeight,
 		"safe_height":    s.loadSafeHeight(),
-		"sc_count":       len(scids),
+		"sc_count":       scCount,
 		"reg_tx_count":   reg,
 		"burn_tx_count":  burn,
 		"norm_tx_count":  norm,
@@ -326,24 +363,439 @@ func (s *Server) handleGetTELA(w http.ResponseWriter, r *http.Request) {
 		Owner       string `json:"owner,omitempty"`
 	}
 
+	scids := make([]string, 0, len(installs))
+	for _, inst := range installs {
+		scids = append(scids, inst.SCID)
+	}
+	owners, err := s.store.GetOwnersForSCIDs(scids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get owners: "+err.Error())
+		return
+	}
+
 	apps := make([]telaApp, 0, len(installs))
 	for _, inst := range installs {
-		owner, _ := s.store.GetOwner(inst.SCID)
 		app := telaApp{
 			SCID:  inst.SCID,
-			Owner: owner,
+			Owner: owners[inst.SCID],
 		}
 		if inst.Meta != nil {
 			app.Name = inst.Meta.Name
 			app.Description = inst.Meta.Desc
+			app.DURL = inst.Meta.DURL
+			app.Version = inst.Meta.Version
 		}
-		// DURL and Version are not yet captured on ClassMeta (M0); leave blank.
 		apps = append(apps, app)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"tela_apps": apps,
 		"count":     len(apps),
+	})
+}
+
+var assetCatalogClasses = []string{
+	"NFA",
+	"G45-NFT",
+	"G45-FAT",
+	"G45-AT",
+	"DERO-ASSET",
+}
+
+const (
+	assetCatalogCacheKeyAll = "all"
+	defaultAssetCatalogTTL  = 5 * time.Second
+	defaultEmptyAssetTTL    = 1 * time.Second
+)
+
+type assetCatalogCacheEntry struct {
+	entries []assetEntry
+	expires time.Time
+}
+
+type assetEntry struct {
+	SCID             string   `json:"scid"`
+	Class            string   `json:"class"`
+	Tags             []string `json:"tags"`
+	Name             string   `json:"name"`
+	Description      string   `json:"description"`
+	IconURL          string   `json:"icon_url"`
+	Owner            string   `json:"owner"`
+	InstallHeight    int64    `json:"install_height"`
+	LastHeight       int64    `json:"last_height"`
+	FirstTouchHeight int64    `json:"first_touch_height,omitempty"`
+	LastTouchHeight  int64    `json:"last_touch_height,omitempty"`
+	TouchCount       int64    `json:"touch_count,omitempty"`
+}
+
+func assetClassesForParam(class string) ([]string, bool) {
+	class = strings.TrimSpace(class)
+	if class == "" || strings.EqualFold(class, "asset") || strings.EqualFold(class, "assets") {
+		return assetCatalogClasses, true
+	}
+	class = strings.ToUpper(class)
+	if isAssetClass(class) {
+		return []string{class}, true
+	}
+	return nil, false
+}
+
+func assetCatalogCacheKey(class string) string {
+	class = strings.TrimSpace(class)
+	if class == "" || strings.EqualFold(class, "asset") || strings.EqualFold(class, "assets") {
+		return assetCatalogCacheKeyAll
+	}
+	return strings.ToUpper(class)
+}
+
+func isAssetClass(class string) bool {
+	switch class {
+	case "NFA", "G45-NFT", "G45-FAT", "G45-AT", "DERO-ASSET":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAssetMeta(meta *structures.ClassMeta) bool {
+	if meta == nil {
+		return false
+	}
+	if isAssetClass(strings.ToUpper(meta.Class)) {
+		return true
+	}
+	for _, tag := range meta.Tags {
+		if strings.EqualFold(tag, "asset") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseHTTPPageParams(r *http.Request) (int, int, string) {
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			return 0, 0, "offset must be >= 0"
+		}
+		offset = parsed
+	}
+
+	limit := listSCDefaultLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, 0, "limit must be an integer"
+		}
+		limit = parsed
+	}
+	return offset, clampListLimit(limit, listSCDefaultLimit), ""
+}
+
+func assetEntryFromMeta(scid, owner string, meta *structures.ClassMeta) assetEntry {
+	tags := []string{}
+	if meta != nil && len(meta.Tags) > 0 {
+		tags = append(tags, meta.Tags...)
+	}
+	entry := assetEntry{
+		SCID:  scid,
+		Owner: owner,
+		Tags:  tags,
+	}
+	if meta != nil {
+		entry.Class = meta.Class
+		entry.Name = meta.Name
+		entry.Description = meta.Desc
+		entry.IconURL = meta.IconURL
+		entry.InstallHeight = meta.InstallHeight
+		entry.LastHeight = meta.LastHeight
+	}
+	return entry
+}
+
+func (s *Server) assetCatalogDurations() (time.Duration, time.Duration) {
+	ttl := s.assetCatalogTTL
+	if ttl <= 0 {
+		ttl = defaultAssetCatalogTTL
+	}
+	emptyTTL := s.assetCatalogEmptyTTL
+	if emptyTTL <= 0 {
+		emptyTTL = defaultEmptyAssetTTL
+	}
+	return ttl, emptyTTL
+}
+
+func (s *Server) getCachedAssetCatalog(cacheKey string) ([]assetEntry, bool) {
+	now := time.Now()
+	s.assetCatalogMu.RLock()
+	entry, ok := s.assetCatalogs[cacheKey]
+	if ok && now.Before(entry.expires) {
+		entries := entry.entries
+		s.assetCatalogMu.RUnlock()
+		return entries, true
+	}
+	s.assetCatalogMu.RUnlock()
+	return nil, false
+}
+
+func (s *Server) storeCachedAssetCatalog(cacheKey string, entries []assetEntry) {
+	ttl, emptyTTL := s.assetCatalogDurations()
+	expires := time.Now().Add(ttl)
+	if len(entries) == 0 {
+		expires = time.Now().Add(emptyTTL)
+	}
+	s.assetCatalogMu.Lock()
+	if s.assetCatalogs == nil {
+		s.assetCatalogs = make(map[string]assetCatalogCacheEntry, len(assetCatalogClasses)+1)
+	}
+	s.assetCatalogs[cacheKey] = assetCatalogCacheEntry{
+		entries: entries,
+		expires: expires,
+	}
+	s.assetCatalogMu.Unlock()
+}
+
+func (s *Server) getAssetCatalog(cacheKey string, classes []string) ([]assetEntry, error) {
+	if entries, ok := s.getCachedAssetCatalog(cacheKey); ok {
+		return entries, nil
+	}
+	entries, err := s.buildAssetCatalog(classes)
+	if err != nil {
+		return nil, err
+	}
+	s.storeCachedAssetCatalog(cacheKey, entries)
+	return entries, nil
+}
+
+func (s *Server) buildAssetCatalog(classes []string) ([]assetEntry, error) {
+	seen := make(map[string]structures.ClassInstall)
+	for _, class := range classes {
+		installs, err := s.store.GetClassInstalls(class, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, inst := range installs {
+			if !isAssetMeta(inst.Meta) {
+				continue
+			}
+			if prev, ok := seen[inst.SCID]; !ok || inst.InstallHeight > prev.InstallHeight {
+				seen[inst.SCID] = inst
+			}
+		}
+	}
+
+	out := make([]structures.ClassInstall, 0, len(seen))
+	for _, inst := range seen {
+		out = append(out, inst)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].InstallHeight == out[j].InstallHeight {
+			return out[i].SCID < out[j].SCID
+		}
+		return out[i].InstallHeight < out[j].InstallHeight
+	})
+
+	scids := make([]string, 0, len(out))
+	for _, inst := range out {
+		scids = append(scids, inst.SCID)
+	}
+	owners, err := s.store.GetOwnersForSCIDs(scids)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]assetEntry, 0, len(out))
+	for _, inst := range out {
+		entries = append(entries, assetEntryFromMeta(inst.SCID, owners[inst.SCID], inst.Meta))
+	}
+	return entries, nil
+}
+
+func (s *Server) assetEntriesForWindow(installs []structures.ClassInstall, owners map[string]string) []assetEntry {
+	out := make([]assetEntry, 0, len(installs))
+	for _, inst := range installs {
+		out = append(out, assetEntryFromMeta(inst.SCID, owners[inst.SCID], inst.Meta))
+	}
+	return out
+}
+
+// handleGetAssets returns recognized asset/NFT contracts from the class index.
+// It is an asset catalog, not a private wallet-balance view.
+func (s *Server) handleGetAssets(w http.ResponseWriter, r *http.Request) {
+	offset, limit, msg := parseHTTPPageParams(r)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	classes, ok := assetClassesForParam(r.URL.Query().Get("class"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "class is not an asset class")
+		return
+	}
+	cacheKey := assetCatalogCacheKey(r.URL.Query().Get("class"))
+
+	assets, err := s.getAssetCatalog(cacheKey, classes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get asset catalog: "+err.Error())
+		return
+	}
+	total := len(assets)
+	win := sliceWindow(total, offset, limit)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"assets": assets[win.start:win.end],
+		"count":  total,
+		"offset": offset,
+		"limit":  limit,
+	})
+}
+
+// handleGetAsset returns one recognized asset/NFT contract by SCID.
+func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
+	scid := mux.Vars(r)["scid"]
+	if scid == "" {
+		writeError(w, http.StatusBadRequest, "missing scid")
+		return
+	}
+	if !isValidSCID(scid) {
+		writeError(w, http.StatusBadRequest, "invalid scid")
+		return
+	}
+
+	meta, err := s.store.GetSCIDClass(scid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
+		return
+	}
+	if !isAssetMeta(meta) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	owner, err := s.store.GetOwner(scid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get owner: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, assetEntryFromMeta(scid, owner, meta))
+}
+
+// handleGetAddressCreatedAssets returns asset contracts deployed by address.
+// This is deployer/registry ownership, not proof of current wallet balance.
+func (s *Server) handleGetAddressCreatedAssets(w http.ResponseWriter, r *http.Request) {
+	addr := mux.Vars(r)["address"]
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing required path parameter: address")
+		return
+	}
+	offset, limit, msg := parseHTTPPageParams(r)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	scids, err := s.store.GetSCIDsByOwner(addr)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get owner SCIDs: "+err.Error())
+		return
+	}
+	installs := make([]structures.ClassInstall, 0, len(scids))
+	for _, scid := range scids {
+		meta, err := s.store.GetSCIDClass(scid)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
+			return
+		}
+		if !isAssetMeta(meta) {
+			continue
+		}
+		installs = append(installs, structures.ClassInstall{
+			SCID:          scid,
+			InstallHeight: meta.InstallHeight,
+			Meta:          meta,
+		})
+	}
+	sort.Slice(installs, func(i, j int) bool {
+		if installs[i].InstallHeight == installs[j].InstallHeight {
+			return installs[i].SCID < installs[j].SCID
+		}
+		return installs[i].InstallHeight < installs[j].InstallHeight
+	})
+
+	total := len(installs)
+	win := sliceWindow(total, offset, limit)
+	owners := make(map[string]string, win.end-win.start)
+	for i := win.start; i < win.end; i++ {
+		owners[installs[i].SCID] = addr
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"address": addr,
+		"assets":  s.assetEntriesForWindow(installs[win.start:win.end], owners),
+		"count":   total,
+		"offset":  offset,
+		"limit":   limit,
+	})
+}
+
+// handleGetAddressTouchedAssets returns asset contracts an address has
+// interacted with. This is activity history, not proof of current balance.
+func (s *Server) handleGetAddressTouchedAssets(w http.ResponseWriter, r *http.Request) {
+	addr := mux.Vars(r)["address"]
+	if addr == "" {
+		writeError(w, http.StatusBadRequest, "missing required path parameter: address")
+		return
+	}
+	offset, limit, msg := parseHTTPPageParams(r)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	touched, err := s.store.GetAddressSCIDs(addr)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get address SCIDs: "+err.Error())
+		return
+	}
+
+	entries := make([]assetEntry, 0, len(touched))
+	for scid, touch := range touched {
+		if touch == nil {
+			continue
+		}
+		meta, err := s.store.GetSCIDClass(scid)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
+			return
+		}
+		if !isAssetMeta(meta) {
+			continue
+		}
+		owner, err := s.store.GetOwner(scid)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to get owner: "+err.Error())
+			return
+		}
+		entry := assetEntryFromMeta(scid, owner, meta)
+		entry.FirstTouchHeight = touch.FirstHeight
+		entry.LastTouchHeight = touch.LastHeight
+		entry.TouchCount = touch.Count
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].LastTouchHeight == entries[j].LastTouchHeight {
+			return entries[i].SCID < entries[j].SCID
+		}
+		return entries[i].LastTouchHeight > entries[j].LastTouchHeight
+	})
+
+	total := len(entries)
+	win := sliceWindow(total, offset, limit)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"address": addr,
+		"assets":  entries[win.start:win.end],
+		"count":   total,
+		"offset":  offset,
+		"limit":   limit,
 	})
 }
 
@@ -398,6 +850,90 @@ func (s *Server) handleGetAddress(w http.ResponseWriter, r *http.Request) {
 		"address": addr,
 		"scids":   out,
 		"count":   len(out),
+	})
+}
+
+// handleGetTELARatings returns the ratings stored on the given SCID.
+//
+// Canonical TELA format (github.com/civilware/tela): per-rater STORE keys
+// that equal the rater's wallet address, hex-encoded `"<score>_<height>"`
+// values. No comment field. The response also includes the aggregate
+// `likes` / `dislikes` counters from the TELA Rate() entrypoint plus a
+// computed mean across per-rater scores.
+func (s *Server) handleGetTELARatings(w http.ResponseWriter, r *http.Request) {
+	scid := mux.Vars(r)["scid"]
+	if scid == "" {
+		writeError(w, http.StatusBadRequest, "missing scid")
+		return
+	}
+	var height int64
+	if h := r.URL.Query().Get("height"); h != "" {
+		parsed, err := strconv.ParseInt(h, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid height: "+err.Error())
+			return
+		}
+		height = parsed
+	}
+	ratings, summary, err := s.store.GetRatingsAndSummaryForSCID(scid, height)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read ratings: "+err.Error())
+		return
+	}
+	if ratings == nil {
+		ratings = []structures.Rating{}
+	}
+	var sum float64
+	for _, r := range ratings {
+		sum += r.Score
+	}
+	var avg float64
+	if len(ratings) > 0 {
+		avg = sum / float64(len(ratings))
+	}
+	resp := map[string]interface{}{
+		"scid":    scid,
+		"ratings": ratings,
+		"count":   len(ratings),
+		"avg":     avg,
+	}
+	if summary != nil {
+		resp["summary"] = summary
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGetInitialSCIDCode returns the install-time DVM code for scid.
+// Drop-in compat with simple-gnomon's WS method of the same name. Reads
+// from the sccode bucket; on miss, lazily backfills via idx.GetSCCode
+// (one daemon round-trip per SCID per process lifetime).
+func (s *Server) handleGetInitialSCIDCode(w http.ResponseWriter, r *http.Request) {
+	if s.tela == nil {
+		writeError(w, http.StatusServiceUnavailable, "indexer not configured")
+		return
+	}
+	scid := r.URL.Query().Get("scid")
+	if scid == "" {
+		writeError(w, http.StatusBadRequest, "missing scid")
+		return
+	}
+	if len(scid) != 64 {
+		writeError(w, http.StatusBadRequest, "invalid scid")
+		return
+	}
+	entry, err := s.tela.GetSCCode(scid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get sc code: "+err.Error())
+		return
+	}
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "scid not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"scid":           scid,
+		"code":           entry.Code,
+		"install_height": entry.InstallHeight,
 	})
 }
 

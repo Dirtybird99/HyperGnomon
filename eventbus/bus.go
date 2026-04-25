@@ -94,17 +94,24 @@ type Event struct {
 // Filter narrows which events a subscriber receives. All non-zero fields
 // must match (AND). Events is a set of EventType; empty set = all types.
 // CodeContains is held for M2+ (needs code cache); currently ignored.
+// IncludeSpeculative opts the subscriber into mempool-derived events
+// (Event.Speculative=true). Default false → speculative events are dropped
+// so existing subscribers can't be surprised by unconfirmed data.
 type Filter struct {
-	Events       map[EventType]struct{}
-	SCID         string
-	Owner        string
-	Sender       string
-	Class        string
-	CodeContains string
+	Events             map[EventType]struct{}
+	SCID               string
+	Owner              string
+	Sender             string
+	Class              string
+	CodeContains       string
+	IncludeSpeculative bool
 }
 
 // Match reports whether the given event passes this filter.
 func (f Filter) Match(e Event) bool {
+	if e.Speculative && !f.IncludeSpeculative {
+		return false
+	}
 	if len(f.Events) > 0 {
 		if _, ok := f.Events[e.Type]; !ok {
 			return false

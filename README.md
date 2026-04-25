@@ -1,214 +1,253 @@
 # HyperGnomon
 
-Arena-accelerated DERO blockchain indexer. Finds all TELA apps on the entire blockchain in under 5 seconds.
+Arena-accelerated DERO blockchain indexer. Byte-correct TELA content server, WebSocket push API, civilware/Gnomon-shape Go library for embedding.
 
-Built from scratch in Go 1.26, inspired by [Jody Bruchon's Jofito](https://codeberg.org/jbruchon/jofito) arena-based memory philosophy: **the fastest code is code that doesn't run.**
+Built for **TELA dApp operators**, **HOLOGRAM** backend, and the **dReams / Engram / TELA-CLI** Go-library embedders who import `civilware/Gnomon` today. Drop-in source compatibility via `pkg/gnomes` — migration is a three-sed search-and-replace plus one constructor swap.
 
-## Performance
+Status: v1.0.0. All numeric claims below are reproducible — see [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md) for methodology, hardware, and dates.
 
-| Scenario | HyperGnomon | Engram | PureWolf |
-|---|---|---|---|
-| **TELA discovery (cached)** | **14ms** | ~25s | ~120s |
-| **TELA discovery (cold)** | **~5s** | ~60-91s | ~120s |
-| **Full chain scan** | 143 blk/s | ~20-30 blk/s | ~20-30 blk/s |
-| **Speedup** | — | **1,786x cached** | **8,571x cached** |
+## Table of contents
 
-### TELA Discovery Breakdown
+1. [Who it's for](#1-who-its-for)
+2. [Install](#2-install)
+3. [Quickstart](#3-quickstart)
+4. [Comparison — HyperGnomon vs civilware/Gnomon vs simple-gnomon](#4-comparison)
+5. [Flags](#5-flags)
+6. [HTTP API](#6-http-api)
+7. [WebSocket API](#7-websocket-api)
+8. [Library mode (`pkg/gnomes`)](#8-library-mode)
+9. [Benchmarks](#9-benchmarks)
+10. [Known limitations](#10-known-limitations)
 
-```
-0.0s  Binary starts
-0.01s 8 parallel RPC connections established
-0.05s TELA cache loaded (14ms path) — OR —
-2.5s  GnomonSC registry fetched (49,924 SCIDs)
-3.5s  Batch code probe finds 645 TELA apps (92 INDEX + 553 DOC)
-4.5s  Variable fetch for 92 INDEX apps
-5.0s  TELA apps ready via REST + WebSocket API
-```
+## 1. Who it's for
 
-## Quick Start
+- **TELA dApp operators** serving `.html` / `.js` / `.css` / `.gz` / DocShard assets from on-chain SC code. HyperGnomon's content server is canonical-spec compliant (base64→gunzip for `.gz`, DocShard strict parsing, optional `fileCheckC/S` signature reporting).
+- **HOLOGRAM** and other Go-library embedders (dReams, dPrediction, Duels, Dero-Baccarat, Engram, TELA-CLI) who import `github.com/civilware/Gnomon` today and want a drop-in replacement. See §8.
+- **Operators** who want a typed WebSocket push API, byte-identical TELA serving against mainnet contracts, and honest benchmarks.
+
+Non-goals: not a chain node, not a SQL engine, not a long-term code archive.
+
+## 2. Install
 
 ```bash
-# Build
+# go install (recommended for Go users)
+go install github.com/hypergnomon/hypergnomon/cmd/hypergnomon@latest
+
+# Build from source
+git clone https://github.com/hypergnomon/hypergnomon && cd hypergnomon
 go build -o hypergnomon ./cmd/hypergnomon/
 
-# Discover TELA apps (fastest mode)
-./hypergnomon --fastsync --turbo --tela-only
+# Docker
+docker build -t hypergnomon:local .
+docker run --rm -p 8082:8082 -p 9190:9190 -v hg-data:/data \
+    hypergnomon:local \
+    --daemon-rpc-address=host.docker.internal:10102 \
+    --api-address=0.0.0.0:8082 --ws-address=0.0.0.0:9190 \
+    --db-dir=/data/gnomondb --fastsync
 
-# Full indexer with TELA discovery
-./hypergnomon --fastsync --turbo
-
-# Custom daemon
-./hypergnomon --daemon-rpc-address=node.derofoundation.org:11012 --fastsync --turbo --tela-only
+# Pre-built binaries (Linux/macOS/Windows, amd64/arm64)
+# GoReleaser produces archives on every tag push.
+# Grab one from https://github.com/hypergnomon/hypergnomon/releases
+# and extract:
+#   tar -xzf hypergnomon_<ver>_<os>_<arch>.tar.gz
+#   ./hypergnomon --help
 ```
 
-Double-click the binary — it auto-connects to local daemon, LAN nodes, or public nodes with interactive fallback.
-
-## Flags
-
-```
---daemon-rpc-address    Daemon RPC address (default: auto-detect with fallback)
---fastsync              Bootstrap from GnomonSC registry (skip historical scan)
---turbo                 Skip SC variable fetching during scan (fetch post-scan)
---tela-only             Discover TELA apps then exit (no chain scanning)
---num-parallel-blocks   Parallel block fetchers (default: 20)
---batch-size            Blocks per DB flush (default: 100, adaptive up to 2000)
---rpc-pool-size         WebSocket connection pool (default: 8)
---recent-blocks         Scan only last N blocks from tip (0 = scan all)
---search-filter         SC code filter, ;;; separated
---fastsync              Bootstrap from on-chain GnomonSC registry
---testnet               Use testnet GnomonSC SCID
---segment-sync          MapReduce parallel initial sync
---adapt-batch           Auto-tune batch size (default: true)
---mem-limit             GOMEMLIMIT in bytes (0 = auto)
---pprof-address         pprof endpoint (e.g. 127.0.0.1:6060)
---api-address           REST API listen address (default: 127.0.0.1:8082)
---ws-address            WebSocket server address (default: 127.0.0.1:9190)
---db-dir                Database directory (default: gnomondb)
---debug                 Enable debug logging
-```
-
-## API
-
-### REST (default :8082)
-
-```
-GET /api/getinfo         Daemon info (cached)
-GET /api/getstats        SC count, TX counts, TELA count, index height
-GET /api/getscids        All indexed SCIDs
-GET /api/indexedscs      All SCIDs with owners
-GET /api/indexbyscid     Invocation details (?scid=X)
-GET /api/scvarsbyheight  SC variables (?scid=X&height=N)
-GET /api/tela            All TELA apps with metadata
-GET /api/tela/count      TELA app count (lightweight polling)
-GET /api/invalidscids    Failed SC deploys
-```
-
-### WebSocket JSON-RPC (default :9190/ws)
-
-```
-GetAllOwnersAndSCIDs                    → map[scid]owner
-GetAllSCIDs                             → []scid
-GetSCIDVariableDetailsAtTopoheight      → variables at height
-GetSCIDInteractionHeight                → interaction heights
-GetAllSCIDInvokeDetails                 → invocation details
-```
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                    HyperGnomon                        │
-├──────────┬──────────┬───────────┬────────────────────┤
-│ FastSync │ TELA     │ 3-Stage   │ REST + WebSocket   │
-│ GnomonSC │ Probe    │ Pipeline  │ API                │
-│ Registry │ (batch)  │ fetch→    │                    │
-│          │          │ process→  │ /api/tela          │
-│          │          │ flush     │ /api/getstats      │
-├──────────┴──────────┴───────────┴────────────────────┤
-│              Arena-Inspired Memory Layer              │
-│  sync.Pool │ Pre-alloc │ unique.Make │ Batch Flush   │
-├──────────────────────────────────────────────────────┤
-│  RPC Pool (8 parallel WS) │ BoltDB (msgpack, NoSync) │
-└──────────────────────────────────────────────────────┘
-```
-
-### Key Optimizations
-
-**Jofito Arena Patterns (memory)**
-- `sync.Pool` for all hot-path structs — 96x faster than `new`
-- Pre-allocated slices with `[:0]` reset per cycle
-- `unique.Make` string interning for SCIDs and addresses
-- Batch `WriteBatch` flush — 228x faster than individual writes
-
-**Nuclear RPC (network)**
-- `BatchGetBlocks` — 50 blocks per JSON-RPC batch call
-- Mega-batch `GetTransaction` — all TXs from all blocks in 1 call
-- 8 parallel WebSocket connections with 64KB buffers
-- 2 round trips per 50 blocks instead of 150
-
-**TELA Discovery (intelligence)**
-- GnomonSC registry bootstrap — skip 6.8M block scan
-- Batch code probe — 100 `GetSC(code=true)` per batch call
-- Height-descending sort — find TELA apps in first 10% of SCIDs
-- Early-exit — stop probing after 3000 dry SCIDs
-- INDEX/DOC split — only fetch variables for ~92 INDEX apps, not all 645
-- Jofito cache — save TELA list to disk, instant load on subsequent starts
-- Cache height tracking — updates every block, always fresh
-
-**Pipeline (throughput)**
-- 3-stage prefetch pipeline: fetcher → processor → flusher
-- Adaptive batch sizing: 100→2000 based on flush latency
-- Turbo mode: skip GetSC during scan, defer to post-scan
-- BoltDB NoSync + NoGrowSync during initial sync
-- msgpack encoding (2-3x faster than JSON)
-
-## Benchmarks
+## 3. Quickstart
 
 ```bash
-# Storage: batch vs individual writes
-go test ./storage/ -bench=. -benchmem
-# FlushBatch_100:  5.2ms    (1 transaction)
-# Individual_100:  1,188ms  (400 transactions) → 228x faster
+# TELA-only: discover all TELA apps on mainnet, exit when ready
+./hypergnomon --fastsync --tela-only
 
-# Pool: arena reuse vs fresh allocation
-go test ./pool/ -bench=. -benchmem
-# WorkItem_Pool:   9.2ns  0 allocs
-# WorkItem_New:    887ns  2 allocs → 96x faster
-# Buffer256K_Pool: 8.4ns  0 B
-# Buffer256K_New:  27µs   262KB → 3,240x faster
+# Full indexer + API servers
+./hypergnomon --fastsync --daemon-rpc-address=127.0.0.1:10102
+
+# Remote daemon
+./hypergnomon --fastsync --daemon-rpc-address=node.derofoundation.org:11012
 ```
 
-## How It Works
+Once running, REST API listens on `127.0.0.1:8082` and WebSocket on `127.0.0.1:9190/ws`.
 
-### TELA Discovery (--fastsync --turbo --tela-only)
+Double-clicking the binary auto-detects local / LAN / public daemons with interactive fallback.
 
-1. **Check cache** — if `tela_cache.bin` exists and is <1000 blocks old, load it (14ms)
-2. **Fetch GnomonSC registry** — 1 RPC call returns 49,924 SCIDs with owners + heights (2.5s)
-3. **Sort by height descending** — newest SCIDs first (TELA apps cluster in recent deployments)
-4. **Batch code probe** — JSON-RPC batch of 100 `GetSC(code=true)` per call across 8 connections
-5. **Check for `STORE("telaVersion"` / `STORE("docVersion"`** in SC code
-6. **Early exit** — stop after 3000 consecutive non-TELA SCIDs
-7. **Fetch variables** — batch `GetSC(variables=true)` for only the ~92 INDEX apps
-8. **Save cache** — write TELA SCID list to `tela_cache.bin` for instant next startup
+## 4. Comparison
 
-### Full Chain Scan (--turbo)
+| | **HyperGnomon** | civilware/Gnomon | simple-gnomon |
+|---|---|---|---|
+| Backends | bbolt | bbolt, graviton | bbolt, sqlite |
+| TELA content server | yes, canonical-spec | no | no |
+| TELA `.gz` (base64+gunzip) | yes | n/a | n/a |
+| TELA DocShard `.shard`/`.shards` | yes | n/a | n/a |
+| `fileCheckC/S` header reporting | yes (v1.0) | no | no |
+| Cryptographic signature verification | v1.1 (stub in v1.0) | no | no |
+| Typed binary encoding hot-path | yes | msgpack everywhere | msgpack |
+| WebSocket push (subscribe/event) | yes | partial | no |
+| Reorg detection (STABLE_LIMIT=8 DAG) | yes, `SafeHeight` exposed | no | no |
+| Reorg truncate-replay | v1.x (deferred — see §10) | no (manual `pop`) | no |
+| Go-library drop-in (`pkg/gnomes`) | yes, three-sed migration | n/a (is the original) | partial |
+| Unit + integration tests | yes | partial | partial |
+| Published benchmark methodology | yes ([DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md)) | no | no |
+| Live-daemon head-to-head harness | `cmd/benchvs` (v1.0) | no | no |
 
-1. **3-stage pipeline**: fetcher → processor → flusher (all concurrent)
-2. **Fetcher**: `BatchGetBlocks(50 heights)` → 1 JSON-RPC batch per 50 blocks
-3. **Processor**: decode TXs, classify SC installs/invokes, accumulate to WriteBatch
-4. **Flusher**: atomic BoltDB commit every N blocks, adaptive batch sizing
-5. **Turbo mode**: skip GetSC during scan, fetch variables in post-scan pass
+The comparison is scoped to indexer concerns. civilware/Gnomon remains the canonical reference for the DERO indexer surface — HyperGnomon's goal is not to replace it but to be the best fit for consumers who need a byte-correct TELA content layer, a typed push API, and an embeddable Go library with the same import shape.
 
-## Project Structure
+## 5. Flags
+
+The flags below are the ones worth knowing. For the full list with rationale for each default, see [DOCS/FLAGS.md](DOCS/FLAGS.md).
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--daemon-rpc-address` | `127.0.0.1:10102` | DERO daemon RPC endpoint |
+| `--fastsync` | `false` | Bootstrap from GnomonSC on-chain registry instead of full scan |
+| `--turbo` | `true` | Skip per-SC variable fetch during scan |
+| `--postscan-vars` | `lazy` | Turbo follow-up variable policy: `lazy` skips all-SCID sweep, `all` keeps it |
+| `--tela-only` | `false` | Discover TELA apps, print, and exit |
+| `--num-parallel-blocks` | `8` | Parallel block fetchers. Higher risks daemon rate-limit (tested ceiling per TELA-CLI guide: ~16) |
+| `--rpc-pool-size` | `8` | WebSocket connection pool size |
+| `--batch-size` | `100` | Blocks per atomic bbolt flush. Adaptive up to 2000 when `--adapt-batch` is on |
+| `--persist-install-code` | `tela` | sccode bucket policy: `none`, `tela` (TELA-INDEX/DOC/MOD only), or `all` |
+| `--tela-verify-sigs` | `false` | Report `X-TELA-Verify` header on `/tela/…` responses (v1.0: presence only, v1.1: cryptographic check) |
+| `--search-filter` | `""` | Semicolon-separated substring filter on SC code |
+| `--recent-blocks` | `0` | Scan only last N blocks from tip (0 = all) |
+| `--segment-sync` | `false` | MapReduce parallel initial sync |
+| `--adapt-batch` | `true` | Auto-tune batch size based on flush latency |
+| `--mem-limit` | `0` | `GOMEMLIMIT` in bytes (0 = auto) |
+| `--api-address` | `127.0.0.1:8082` | REST API listen address |
+| `--ws-address` | `127.0.0.1:9190` | WebSocket listen address |
+
+## 6. HTTP API
+
+Default listen address: `127.0.0.1:8082`.
 
 ```
-cmd/hypergnomon/main.go    CLI, flags, interactive fallback, GOMEMLIMIT
-indexer/indexer.go          3-stage pipeline, batch RPC, turbo mode
-indexer/fastsync.go         GnomonSC bootstrap, TELA probe, Jofito cache
-indexer/classify.go         G45/NFA/TELA/NAMESERVICE classification
-indexer/segment.go          MapReduce parallel initial sync
-rpc/client.go               WS JSON-RPC, BatchGetBlocks, GetBlockByHeight
-rpc/pool.go                 Parallel connection pool
-rpc/rwc/rwc.go              WebSocket ReadWriteCloser adapter
-storage/storage.go          Storage interface, WriteBatch (arena pattern)
-storage/bbolt.go            BoltDB backend, msgpack, FlushBatch
-pool/pools.go               sync.Pool for hot-path structs
-pool/intern.go              unique.Make string interning
-structures/types.go         Core types with Reset() for recycling
-structures/globals.go       Constants, version, TELACount
-api/http.go                 REST API (9 endpoints)
-api/ws.go                   WebSocket JSON-RPC server
+GET /api/getinfo                  Daemon info (cached)
+GET /api/getstats                 SC count, TX counts, TELA count, index height
+GET /api/getscids                 All indexed SCIDs
+GET /api/indexedscs               All SCIDs with owners
+GET /api/indexbyscid?scid=X       Invocation details for one SCID
+GET /api/scvarsbyheight?scid=X&height=N   SC variables snapshot
+GET /api/initialscidcode?scid=X   Install-time SC code
+GET /api/tela                     All TELA apps with metadata
+GET /api/tela/count               TELA app count (lightweight polling)
+GET /api/assets                   Asset/NFT catalog (NFA, G45, legacy DERO assets)
+GET /api/assets/{scid}            Asset/NFT metadata for one SCID
+GET /api/address/{addr}/created-assets  Asset contracts deployed by address
+GET /api/address/{addr}/touched-assets  Asset contracts the address interacted with
+GET /api/address/{addr}/scs       All SCIDs the address interacted with
+GET /api/invalidscids             Failed SC deploys
+
+GET /tela/{scid}/{path…}          TELA content server (INDEX routing, DOC body, .gz, DocShard)
 ```
+
+The `/tela/{scid}/…` endpoint is the content server. It resolves TELA-INDEX routes, fetches referenced TELA-DOC source, strips the `/* … */` body, decompresses `.gz` assets (base64→gunzip), and dispatches DocShard strict parsing when the dURL suffix is `.shard`/`.shards`. With `--tela-verify-sigs`, every response carries `X-TELA-Verify: disabled|unsigned|signed-unverified|passed|failed`.
+
+Asset endpoints are catalog and activity views. True "my held assets" should be wallet-assisted: fetch candidate asset SCIDs from `/api/assets`, then have the wallet check decrypted balances for each SCID at the latest topoheight. `/created-assets` means deployer/registry ownership; `/touched-assets` means interaction history. Neither endpoint claims current wallet balance.
+
+## 7. WebSocket API
+
+Default listen address: `127.0.0.1:9190/ws`. JSON-RPC 2.0.
+
+Core methods (civilware-shape):
+
+```
+GetAllOwnersAndSCIDs                      → map[scid]owner
+GetAllSCIDs                               → []scid
+GetSCIDVariableDetailsAtTopoheight        → variables at height
+GetSCIDInteractionHeight                  → []height
+GetAllSCIDInvokeDetails                   → invocation detail list
+GetSCIDValuesByKey / GetSCIDKeysByValue   → variable lookups
+```
+
+HyperGnomon-native methods:
+
+```
+subscribe {events, filters}     → typed push: install, invoke, var_change, reorg, safe, class_match
+unsubscribe {id}
+```
+
+See [DESIGN.md §4](DESIGN.md) for the subscription protocol.
+
+## 8. Library mode
+
+Go consumers who import `github.com/civilware/Gnomon/{indexer,storage,structures}` today can migrate with three sed commands and one constructor swap. Full walkthrough in [DOCS/MIGRATION_FROM_GNOMON.md](DOCS/MIGRATION_FROM_GNOMON.md).
+
+```go
+import (
+    compatindexer    "github.com/hypergnomon/hypergnomon/pkg/gnomes/indexer"
+    compatstructures "github.com/hypergnomon/hypergnomon/pkg/gnomes/structures"
+)
+
+cfg := &compatstructures.FastSyncConfig{
+    Enabled: true, SkipFSRecheck: true, ForceFastSyncDiff: 100,
+}
+idx, err := compatindexer.NewIndexerWithDBDir(
+    "./gnomondb", "telaVersion;;;docVersion", "127.0.0.1:10102", "daemon",
+    cfg, nil,
+)
+if err != nil { return err }
+defer idx.Close()
+idx.StartDaemonMode(8)
+```
+
+See [`pkg/gnomes/example/main.go`](pkg/gnomes/example/main.go) for a complete 30-line program.
+
+Compat scope: bbolt backend, `daemon` runmode, civilware-shape `Indexer` fields (`LastIndexedHeight`, `ChainHeight`, `DBType`, `GravDBBackend`, `BBSBackend`) and store methods (`GetLastIndexHeight`, `GetAllOwnersAndSCIDs`, `GetAllSCIDVariableDetails`, `GetSCIDValuesByKey`, `GetSCIDKeysByValue`, `GetSCIDInteractionHeight`). Graviton and non-daemon runmodes return a dead indexer — see §10.
+
+## 9. Benchmarks
+
+Every number below has a reproducible harness. Hardware, date, daemon endpoint, and command in [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
+
+**Live-daemon wall-clock** (mainnet 192.168.2.251:10102, April 2026):
+
+| Stage | Baseline | v0.9 | Δ |
+|---|---|---|---|
+| FastSync main | 5.2 s | 2.9 s | −44% |
+| Phase-1 classify probe | 24.9 s | 11.6 s | −53% |
+| Phase-2 variable write | 10.7 s | 4.4 s | −59% |
+
+**Microbenchmarks** (medians from `go test ./... -bench=. -benchmem -benchtime=500ms -count=3`):
+
+| Bench | Msgpack / baseline | Typed / optimized | Factor |
+|---|---|---|---|
+| `ClassMeta_Marshal` | 1,480 ns / 11 allocs | 239 ns / 2 allocs | **6.2×** |
+| `ClassMeta_MarshalTypedAppend` | 1,480 ns / 11 allocs | 53 ns / 0 allocs | **28×** |
+| `SCIDVariables_Marshal` | 1,360 ns / 6 allocs | 85 ns / 0 allocs | **16×** |
+| `AddrSCIDEntry_MarshalTypedAppend` | 364 ns / 2 allocs | 1.4 ns / 0 allocs | **255×** |
+| `TELAContentCache_InvalidatePrefix` (fill=8192) | O(fill) quadratic | 1.1 µs, flat across fills | O(k) |
+| `WorkItem_Pool` vs `New` | 2,300 ns / 5.7 KB | 18 ns / 0 B | **127×** |
+| `FlushBatch_100` vs individual writes | 264 µs/record | 39 µs/record | **6.8×** |
+
+Full table with reproduction command, hardware, and methodology: [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
+
+**TELA correctness**: content server output is byte-identical (SHA256) to civilware/tela `parseDocCode` for `.html`, `.js`, `.css`, `.gz`, and DocShard paths. Live-fixture test: `api/tela_content_test.go`.
+
+Head-to-head harness vs civilware/Gnomon@dev is planned for v1.0:
+
+```bash
+go run ./cmd/benchvs --daemon=192.168.2.251:10102 --duration=5m --civilware-branch=dev
+# Output: bench_vs_civilware.md — wall-clock, DB size, RSS, p50/p95/p99 API latency.
+```
+
+Numbers reported as "228×", "96×", "3,240×", "1,786×", "8,571×" in earlier README revisions were inherited without reproducible methodology and have been retired. If you have a repro case we should own, file an issue.
+
+## 10. Known limitations
+
+- **Graviton backend**: not supported. `storage.NewGravDB` returns `ErrGravDBNotSupported`. Rationale: civilware/Gnomon issue #24 (graviton bloat) has been open 2+ years; both simple-gnomon forks dropped it; bbolt with our batch-flush pattern outperforms graviton in our measurements.
+- **Runmodes**: only `daemon` is implemented. `wallet` and `asset` return a dead indexer. No consumer has needed them yet.
+- **External-store injection** in the civilware-shape `NewIndexer(gravDB, boltDB, …)`: caller-pre-opened stores are not wired end-to-end. Use `NewIndexerWithDBDir(path, …)` for v1.0; full injection lands in v1.1.
+- **Reorg truncate-replay (M2)**: detection is implemented (`SafeHeight` atomic, `CheckReorgAt` stub); automatic rewind is not. Rationale: DERO's `STABLE_LIMIT=8` consensus bound plus DAG side-block absorption means real reorgs are rare and shallow. civilware/Gnomon has no reorg handling at all; operators recover via `pop <N>` CLI. Our `resync` subcommand serves the same operator path. Full truncate-replay is tracked for v1.x.
+- **Signature verification** (`fileCheckC/S` Schnorr on bn256): v1.0 reports presence only via `X-TELA-Verify`. Cryptographic verification ships in v1.1; the header surface is stable.
+- **Mempool speculative path (M6)**: designed, not yet implemented.
 
 ## References
 
-- [Jofito](https://codeberg.org/jbruchon/jofito) — Jody Bruchon's arena-based file tool
-- [jdupes](https://codeberg.org/jbruchon/jdupes) — 32x speedup via arena allocation
-- [civilware/Gnomon](https://github.com/civilware/Gnomon) — Original DERO indexer
-- [simple-gnomon](https://github.com/secretnamebasis/simple-gnomon) — Simplified indexer
-- [Kelvin](https://arxiv.org/abs/2504.06151) — Zero-copy data pipelines
-- [Xor Filters](https://arxiv.org/abs/1912.08258) — Faster than Bloom filters
-- [simdjson](https://arxiv.org/abs/1902.08318) — Gigabytes of JSON per second
+- [civilware/Gnomon](https://github.com/civilware/Gnomon) — canonical DERO indexer; HyperGnomon's `pkg/gnomes` is a drop-in compat layer for its public surface
+- [DHEBP/HOLOGRAM](https://github.com/DHEBP/HOLOGRAM) — reference embedded-indexer consumer
+- [civilware/tela](https://github.com/civilware/tela) — canonical TELA spec; HyperGnomon's content server is verified byte-identical against it
+- [DESIGN.md](DESIGN.md) — subscription protocol, data model, milestones
+- [DOCS/MIGRATION_FROM_GNOMON.md](DOCS/MIGRATION_FROM_GNOMON.md) — migration guide for civilware consumers
+- [DOCS/FLAGS.md](DOCS/FLAGS.md) — full flag reference with default rationale
+- [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md) — methodology, hardware, dates
 
 ## License
 

@@ -155,6 +155,43 @@ func TestBboltStore_BasicOps(t *testing.T) {
 	}
 }
 
+func TestBboltStore_SCIDCountAndBulkOwners(t *testing.T) {
+	store := openTestStore(t)
+	scidA := fakeSCID()
+	scidB := fakeSCID()
+	ownerA := fakeAddr()
+	ownerB := fakeAddr()
+
+	if err := store.StoreOwner(scidA, ownerA); err != nil {
+		t.Fatalf("StoreOwner A: %v", err)
+	}
+	batch := NewWriteBatch()
+	batch.AddOwner(scidB, ownerB)
+	batch.LastHeight = 10
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("FlushBatch: %v", err)
+	}
+	PutWriteBatch(batch)
+
+	count, err := store.GetSCIDCount()
+	if err != nil {
+		t.Fatalf("GetSCIDCount: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("GetSCIDCount = %d, want 2", count)
+	}
+	owners, err := store.GetOwnersForSCIDs([]string{scidA, scidB, fakeSCID()})
+	if err != nil {
+		t.Fatalf("GetOwnersForSCIDs: %v", err)
+	}
+	if owners[scidA] != ownerA || owners[scidB] != ownerB {
+		t.Fatalf("owners = %+v, want %s/%s", owners, ownerA, ownerB)
+	}
+	if len(owners) != 2 {
+		t.Fatalf("owners len = %d, want 2", len(owners))
+	}
+}
+
 func TestBboltStore_FlushBatch(t *testing.T) {
 	store := openTestStore(t)
 
@@ -384,6 +421,60 @@ func benchmarkFlushBatch(b *testing.B, n int) {
 func BenchmarkFlushBatch_100(b *testing.B)   { benchmarkFlushBatch(b, 100) }
 func BenchmarkFlushBatch_1000(b *testing.B)  { benchmarkFlushBatch(b, 1000) }
 func BenchmarkFlushBatch_10000(b *testing.B) { benchmarkFlushBatch(b, 10000) }
+
+func BenchmarkGetSCIDCount(b *testing.B) {
+	store := openTestStore(b)
+	batch := NewWriteBatch()
+	for i := 0; i < 10000; i++ {
+		batch.AddOwner(fakeSCID(), fakeAddr())
+	}
+	batch.LastHeight = 1
+	if err := store.FlushBatch(batch); err != nil {
+		b.Fatalf("FlushBatch: %v", err)
+	}
+	PutWriteBatch(batch)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := store.GetSCIDCount()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n != 10000 {
+			b.Fatalf("count = %d, want 10000", n)
+		}
+	}
+}
+
+func BenchmarkGetOwnersForSCIDs(b *testing.B) {
+	store := openTestStore(b)
+	batch := NewWriteBatch()
+	scids := make([]string, 0, 10000)
+	for i := 0; i < 10000; i++ {
+		scid := fakeSCID()
+		scids = append(scids, scid)
+		batch.AddOwner(scid, fakeAddr())
+	}
+	batch.LastHeight = 1
+	if err := store.FlushBatch(batch); err != nil {
+		b.Fatalf("FlushBatch: %v", err)
+	}
+	PutWriteBatch(batch)
+	window := scids[:100]
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		owners, err := store.GetOwnersForSCIDs(window)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(owners) != len(window) {
+			b.Fatalf("owners = %d, want %d", len(owners), len(window))
+		}
+	}
+}
 
 // BenchmarkIndividualWrites does the same work as BenchmarkFlushBatch but uses
 // per-record StoreOwner + StoreInvokeDetails + StoreSCIDVariableDetails calls.

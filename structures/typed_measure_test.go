@@ -72,6 +72,41 @@ func BenchmarkClassMeta_Unmarshal_Msgpack(b *testing.B) {
 	}
 }
 
+// BenchmarkClassMeta_Marshal_Typed is the production path after the typed
+// v1 switch. Head-to-head comparison against the msgpack baseline above.
+// Target: strictly fewer ns/op and fewer allocs.
+func BenchmarkClassMeta_Marshal_Typed(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		_ = benchClass.MarshalTyped()
+	}
+}
+
+func BenchmarkClassMeta_Unmarshal_Typed(b *testing.B) {
+	blob := benchClass.MarshalTyped()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		var r ClassMeta
+		if err := r.UnmarshalTyped(blob); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkClassMeta_MarshalTypedAppend — hot-path variant that reuses
+// caller-owned scratch. Expected to be roughly marshal-cost minus the
+// slice-header allocation in MarshalTyped. Shows the appendable API's
+// value for batched contexts that can pool a backing array.
+func BenchmarkClassMeta_MarshalTypedAppend(b *testing.B) {
+	// Big enough that no iteration re-grows the underlying array.
+	buf := make([]byte, 0, 512)
+	b.ReportAllocs()
+	for range b.N {
+		_ = benchClass.MarshalTypedAppend(buf[:0])
+	}
+}
+
 // C8 pre-measurement: what's the msgpack cost on a realistic SCTXParse?
 // Two variants: turbo (ScArgs+Payloads nil — typical hot path) and
 // non-turbo (args populated). Turbo is what most of the indexer writes.

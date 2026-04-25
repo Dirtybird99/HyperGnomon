@@ -7,8 +7,8 @@ import (
 )
 
 // Version is set via -ldflags -X at release build time (goreleaser).
-// Default value below is what unreleased/development builds report.
-var Version = "0.9.0"
+// Default value below is what source builds report without release ldflags.
+var Version = "1.0.0"
 
 const (
 	AppName = "HyperGnomon"
@@ -22,12 +22,32 @@ const (
 
 	// Default batch size for DB writes (number of blocks to accumulate)
 	DefaultBatchSize = 100
+	// DefaultClassifyProbeBatchSize is the number of SCIDs packed into each
+	// phase-1 GetSC(code=true) JSON-RPC batch during fastsync classification.
+	// LAN benchmarking showed 400 keeps startup close to the 1000-SCID ceiling
+	// without making each response frame as large.
+	DefaultClassifyProbeBatchSize = 400
+	// DefaultPostScanVarsMode controls turbo-mode behavior after the indexer
+	// catches up. "lazy" skips the old all-SCID variable sweep; richer
+	// metadata is filled by targeted probes/refresher paths.
+	DefaultPostScanVarsMode = "lazy"
 	// Default RPC connection pool size.
-	// Swept 4/8/16/24 on a LAN daemon with 49k SCIDs: pool=8 took 104s,
-	// pool=16 took 51s, pool=24 took 56s. Knee at 16.
-	DefaultPoolSize = 16
-	// Default parallel block fetchers
-	DefaultParallelBlocks = 20
+	//
+	// Previous: 16. LAN-measured knee was 16 (pool=8 took 104s vs 51s at 16)
+	// — but derod's default rate limit is 10 rps with 2× burst, so pool=16
+	// trips remote daemons. The TELA-CLI guide warns that >5 parallel on a
+	// remote node "triggers timeouts/rate-limits." 8 keeps headroom under
+	// that ceiling while preserving most of the LAN throughput win.
+	// Operators with their own LAN daemon can still override to 16 via
+	// --rpc-pool-size.
+	DefaultPoolSize = 8
+	// Default parallel block fetchers.
+	//
+	// Same rate-limit consideration applies: 20 concurrent block fetches
+	// × up to a few batched RPC calls each = burst spikes well past the
+	// 10 rps ceiling. 8 mirrors the pool default so an operator running
+	// against a public node doesn't get throttled by default.
+	DefaultParallelBlocks = 8
 	// Default blocks-behind-tip considered safe from reorg.
 	// DERO stabilizes in ~8 blocks; 10 is a pragmatic safety margin.
 	// Exposed as SafeHeight in API responses.

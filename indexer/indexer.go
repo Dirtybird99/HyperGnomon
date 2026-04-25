@@ -31,17 +31,21 @@ type Indexer struct {
 	ChainHeight       atomic.Int64
 
 	// Configuration
-	SearchFilter   []string
-	SCIDExclusions map[string]struct{} // O(1) lookup, not linear scan
-	ValidatedSCs   sync.Map            // concurrent map[string]struct{}
-	Endpoint       string
-	DBDir          string
-	ParallelBlocks int
-	BatchSize      int   // blocks per DB flush
-	TurboMode      bool  // skip GetSC during scan, fetch variables post-scan
-	AdaptBatchSize bool  // dynamically adjust batch size based on flush latency
-	RecentBlocks   int64 // scan only last N blocks (0 = all)
-	FinalityDepth  int64 // blocks behind tip considered "safe" (default 10)
+	SearchFilter           []string
+	SCIDExclusions         map[string]struct{} // O(1) lookup, not linear scan
+	ValidatedSCs           sync.Map            // concurrent map[string]struct{}
+	Endpoint               string
+	DBDir                  string
+	ParallelBlocks         int
+	BatchSize              int    // blocks per DB flush
+	ClassifyProbeBatchSize int    // SCIDs per phase-1 classify GetSC batch
+	TurboMode              bool   // skip GetSC during scan, fetch variables post-scan
+	PostScanVarsMode       string // "lazy" skips all-SCID post-scan vars, "all" keeps the full sweep
+	AdaptBatchSize         bool   // dynamically adjust batch size based on flush latency
+	RecentBlocks           int64  // scan only last N blocks (0 = all)
+	FinalityDepth          int64  // blocks behind tip considered "safe" (default 10)
+	CodePolicy             string // sccode persistence policy: "none" | "tela" | "all"
+	adaptiveBatchSize      atomic.Int64
 
 	// Backends
 	RPCPool *hgrpc.Pool
@@ -62,9 +66,9 @@ type Indexer struct {
 	// (library embeddings that don't need realtime push can pass nil).
 	Bus *eventbus.Bus
 
-	// syncedOnce ensures EnableSync + postScanVariableFetch run exactly once
-	// after the initial fastsync catch-up, even if the caught-up condition
-	// is detected multiple times.
+	// syncedOnce ensures EnableSync + optional post-scan variable work run
+	// exactly once after initial catch-up, even if the caught-up condition is
+	// detected multiple times.
 	syncedOnce atomic.Bool
 
 	// timer, when enabled, accumulates per-stage nanoseconds and emits a
@@ -74,17 +78,19 @@ type Indexer struct {
 
 // Config holds indexer configuration.
 type Config struct {
-	Endpoint       string
-	DBDir          string
-	SearchFilter   []string
-	SCIDExclusions []string
-	ParallelBlocks int
-	BatchSize      int
-	PoolSize       int
-	TurboMode      bool
-	AdaptBatchSize bool
-	RecentBlocks   int64 // scan only the last N blocks from chain tip (0 = scan all)
-	FinalityDepth  int64 // blocks behind tip considered safe (0 = default 10)
+	Endpoint               string
+	DBDir                  string
+	SearchFilter           []string
+	SCIDExclusions         []string
+	ParallelBlocks         int
+	BatchSize              int
+	ClassifyProbeBatchSize int
+	PoolSize               int
+	TurboMode              bool
+	PostScanVarsMode       string // "lazy" (default) or "all"
+	AdaptBatchSize         bool
+	RecentBlocks           int64 // scan only the last N blocks from chain tip (0 = scan all)
+	FinalityDepth          int64 // blocks behind tip considered safe (0 = default 10)
 
 	// Timing, when true, turns on per-stage timers. TimingEvery controls how
 	// many processed batches pass between log lines (0 = default 10).
@@ -94,6 +100,20 @@ type Config struct {
 	// Bus is the optional event bus for subscription fan-out.
 	// If nil, indexing still works; just no push notifications.
 	Bus *eventbus.Bus
+
+	// CodePolicy selects which SC classes get their install-time code
+	// persisted to the sccode bucket. One of:
+	//
+	//   "none" — never persist; /api/initialscidcode lazy-fills per call.
+	//   "tela" — only TELA-{INDEX,DOC,MOD}-1 classes. Default; matches
+	//            the real use case (TELA content server needs DOC source
+	//            to parse the /* ... */ body block).
+	//   "all"  — persist every classified SCID's code. Previous behaviour.
+	//            Grows the DB ~134 MB on mainnet; use only if an operator
+	//            actually serves GetInitialSCIDCode for arbitrary SCIDs.
+	//
+	// Empty-string defaults to "tela" inside Indexer.
+	CodePolicy string
 }
 
 // New creates a new Indexer with the given configuration.
@@ -104,6 +124,8 @@ func New(cfg Config) (*Indexer, error) {
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = structures.DefaultBatchSize
 	}
+	cfg.ClassifyProbeBatchSize = normalizeClassifyProbeBatchSize(cfg.ClassifyProbeBatchSize)
+	cfg.PostScanVarsMode = normalizePostScanVarsMode(cfg.PostScanVarsMode)
 	if cfg.PoolSize <= 0 {
 		cfg.PoolSize = structures.DefaultPoolSize
 	}
@@ -131,21 +153,25 @@ func New(cfg Config) (*Indexer, error) {
 	}
 
 	idx := &Indexer{
-		SearchFilter:   cfg.SearchFilter,
-		SCIDExclusions: exclusions,
-		Endpoint:       cfg.Endpoint,
-		DBDir:          cfg.DBDir,
-		ParallelBlocks: cfg.ParallelBlocks,
-		BatchSize:      cfg.BatchSize,
-		TurboMode:      cfg.TurboMode,
-		AdaptBatchSize: cfg.AdaptBatchSize,
-		RecentBlocks:   cfg.RecentBlocks,
-		FinalityDepth:  cfg.FinalityDepth,
-		Store:          store,
-		RPCPool:        pool,
-		Bus:            cfg.Bus,
-		timer:          newStageTimer(cfg.Timing, cfg.TimingEvery),
+		SearchFilter:           cfg.SearchFilter,
+		SCIDExclusions:         exclusions,
+		Endpoint:               cfg.Endpoint,
+		DBDir:                  cfg.DBDir,
+		ParallelBlocks:         cfg.ParallelBlocks,
+		BatchSize:              cfg.BatchSize,
+		ClassifyProbeBatchSize: cfg.ClassifyProbeBatchSize,
+		TurboMode:              cfg.TurboMode,
+		PostScanVarsMode:       cfg.PostScanVarsMode,
+		AdaptBatchSize:         cfg.AdaptBatchSize,
+		RecentBlocks:           cfg.RecentBlocks,
+		FinalityDepth:          cfg.FinalityDepth,
+		CodePolicy:             normalizeCodePolicy(cfg.CodePolicy),
+		Store:                  store,
+		RPCPool:                pool,
+		Bus:                    cfg.Bus,
+		timer:                  newStageTimer(cfg.Timing, cfg.TimingEvery),
 	}
+	idx.adaptiveBatchSize.Store(int64(idx.BatchSize))
 	if idx.FinalityDepth <= 0 {
 		idx.FinalityDepth = structures.DefaultFinalityDepth
 	}
@@ -191,7 +217,7 @@ func (idx *Indexer) StartDaemonMode() error {
 	logger.Infof("Connected to %s | Chain height: %d | Last indexed: %d",
 		idx.Endpoint, idx.ChainHeight.Load(), idx.LastIndexedHeight.Load())
 	if idx.TurboMode {
-		logger.Info("Turbo mode enabled: skipping GetSC during scan, variables fetched post-scan")
+		logger.Infof("Turbo mode enabled: skipping GetSC during scan, post-scan vars=%s", idx.PostScanVarsMode)
 	}
 	if idx.AdaptBatchSize {
 		logger.Info("Adaptive batch sizing enabled")
@@ -318,6 +344,24 @@ func (idx *Indexer) scanLoop() {
 	}()
 
 	wg.Wait()
+}
+
+func (idx *Indexer) currentBatchSize() int {
+	if !idx.AdaptBatchSize {
+		return idx.BatchSize
+	}
+	n := idx.adaptiveBatchSize.Load()
+	if n <= 0 {
+		return idx.BatchSize
+	}
+	return int(n)
+}
+
+func (idx *Indexer) setCurrentBatchSize(n int) {
+	if n < 1 {
+		n = 1
+	}
+	idx.adaptiveBatchSize.Store(int64(n))
 }
 
 // fetcherLoop continuously fetches blocks and transactions, sending
@@ -543,7 +587,6 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 // after FlushBatch commits. This prevents the indexer from skipping blocks on
 // restart after a mid-flight flush error.
 func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processedBatch) {
-	batchSize := idx.BatchSize
 	batch := storage.NewWriteBatch()
 	blocksInBatch := 0
 	syncSignaled := false
@@ -653,6 +696,7 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 		blocksInBatch += fb.fetchCount
 
 		// Flush when threshold reached
+		batchSize := idx.currentBatchSize()
 		if blocksInBatch >= batchSize {
 			tSend := time.Now()
 			out <- &processedBatch{
@@ -684,7 +728,6 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 	startTime := time.Now()
 	scanStartHeight := idx.LastIndexedHeight.Load()
-	batchSize := idx.BatchSize
 	syncEnabled := false
 
 	for {
@@ -712,12 +755,11 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 				if idx.syncedOnce.CompareAndSwap(false, true) {
 					idx.Store.EnableSync()
 					if idx.TurboMode {
-						// Skip post-scan variable fetch if TELA cache already has the data
-						if _, err := loadTELACache(idx.DBDir); err != nil {
-							// No cache — need to fetch variables
+						switch idx.PostScanVarsMode {
+						case PostScanVarsAll:
 							idx.postScanVariableFetch()
-						} else {
-							logger.Info("Post-scan variable fetch skipped (TELA cache exists)")
+						default:
+							logger.Info("Post-scan variable fetch skipped (--postscan-vars=lazy)")
 						}
 					}
 					// Kick off the 60s TELA variable refresher so rating
@@ -764,6 +806,7 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 			if bps > 0 && pb.newHeight < chainHeight {
 				eta = time.Duration(float64(chainHeight-pb.newHeight)/bps) * time.Second
 			}
+			batchSize := idx.currentBatchSize()
 			logger.Infof("Height: %d/%d | %.1f blk/s | ETA: %v | Batch: %d",
 				pb.newHeight, chainHeight, bps, eta.Round(time.Second), batchSize)
 		}
@@ -774,10 +817,11 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 		// Adaptive batch sizing
 		if idx.AdaptBatchSize {
 			batchElapsed := time.Since(pb.batchStart)
+			batchSize := idx.currentBatchSize()
 			if batchElapsed < 1*time.Second && batchSize < 2000 {
-				batchSize = min(batchSize*2, 2000)
+				idx.setCurrentBatchSize(min(batchSize*2, 2000))
 			} else if batchElapsed > 5*time.Second && batchSize > 10 {
-				batchSize = max(batchSize/2, 10)
+				idx.setCurrentBatchSize(max(batchSize/2, 10))
 			}
 		}
 	}
@@ -836,6 +880,7 @@ func (idx *Indexer) postScanVariableFetch() {
 	if err := idx.Store.FlushBatch(batch); err != nil {
 		logger.Errorf("post-scan flush: %v", err)
 	}
+	storage.PutWriteBatch(batch)
 	logger.Info("Post-scan variable fetch complete")
 }
 
@@ -894,8 +939,12 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 			sc := ClassifySC(scid, code, nil)
 			batch.AddClass(scid, &structures.ClassMeta{
 				Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+				DURL: sc.DURL, Version: sc.Version,
 				InstallHeight: height, LastHeight: height,
 			})
+			if idx.shouldPersistCode(sc.Class) {
+				batch.AddSCCode(scid, height, code)
+			}
 			batch.AddAddrSCID(sender, scid, height)
 		} else {
 			idx.handleInstallSC(scid, sender, entrypoint, height, scArgs, scFees, tx, batch)
@@ -990,9 +1039,85 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 	sc := ClassifySC(scid, code, varsToMap(scVars))
 	batch.AddClass(scid, &structures.ClassMeta{
 		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+		DURL: sc.DURL, Version: sc.Version,
 		InstallHeight: height, LastHeight: height,
 	})
+	if idx.shouldPersistCode(sc.Class) {
+		batch.AddSCCode(scid, height, code)
+	}
 	batch.AddAddrSCID(sender, scid, height)
+}
+
+// shouldPersistCode routes through CodePolicy. "none" skips all; "tela"
+// only persists the TELA family (INDEX/DOC/MOD -1); "all" persists every
+// classified SCID. Default "tela" matches the TELA content server's
+// requirement (body lives in the DOC source) without bloating the DB
+// with 48 k copies of largely-duplicated G45 NFT template code.
+func (idx *Indexer) shouldPersistCode(class string) bool {
+	if idx == nil {
+		return false
+	}
+	switch idx.CodePolicy {
+	case "all":
+		return true
+	case "none":
+		return false
+	case "tela", "":
+		return isTELAClass(class)
+	}
+	return isTELAClass(class) // unknown policy falls back to safe default
+}
+
+// isTELAClass reports whether class is in the TELA family. Used by the
+// code-persistence policy and (elsewhere) by downstream consumers that
+// want to filter TELA-only content.
+func isTELAClass(class string) bool {
+	switch class {
+	case "TELA-INDEX-1", "TELA-DOC-1", "TELA-MOD-1":
+		return true
+	}
+	return false
+}
+
+// normalizeCodePolicy maps an empty string (config default) to "tela" and
+// validates known values. Unknown strings pass through so the test in
+// shouldPersistCode can still reason about them.
+func normalizeCodePolicy(p string) string {
+	switch p {
+	case "", "tela":
+		return "tela"
+	case "none", "all":
+		return p
+	}
+	return "tela"
+}
+
+const maxClassifyProbeBatchSize = 1000
+
+func normalizeClassifyProbeBatchSize(n int) int {
+	if n <= 0 {
+		return structures.DefaultClassifyProbeBatchSize
+	}
+	if n > maxClassifyProbeBatchSize {
+		return maxClassifyProbeBatchSize
+	}
+	return n
+}
+
+const (
+	PostScanVarsLazy = "lazy"
+	PostScanVarsAll  = "all"
+)
+
+func normalizePostScanVarsMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", PostScanVarsLazy:
+		return PostScanVarsLazy
+	case PostScanVarsAll:
+		return PostScanVarsAll
+	default:
+		return structures.DefaultPostScanVarsMode
+	}
 }
 
 // handleInvokeSC processes an SC invocation.
@@ -1055,6 +1180,7 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 		}
 		batch.AddClass(scid, &structures.ClassMeta{
 			Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+			DURL: sc.DURL, Version: sc.Version,
 			InstallHeight: installH, LastHeight: height,
 		})
 	}
@@ -1241,6 +1367,8 @@ func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (
 		Name:          sc.Name,
 		Desc:          sc.Desc,
 		IconURL:       sc.IconURL,
+		DURL:          sc.DURL,
+		Version:       sc.Version,
 		InstallHeight: installH,
 		LastHeight:    height,
 	}
@@ -1262,6 +1390,9 @@ func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (
 		Fees:       0,
 	})
 	batch.AddClass(scid, meta)
+	if code != "" && idx.shouldPersistCode(sc.Class) {
+		batch.AddSCCode(scid, installH, code)
+	}
 	if owner != "" {
 		batch.AddAddrSCID(owner, scid, height)
 	}

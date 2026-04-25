@@ -1,0 +1,54 @@
+# Docker build context trimmed to just what's needed to compile.
+# Keeps builds fast and keeps local operator state (databases, logs,
+# bench artifacts) out of the resulting image.
+
+# Build artifacts — the Dockerfile's builder stage produces its own.
+hypergnomon
+hypergnomon.exe
+wstest
+wstest.exe
+example
+example.exe
+/benchvs
+/benchvs.exe
+
+# Operator state.
+gnomondb/
+*.db
+*.log
+
+# Bench / measurement output that accumulated during this release cycle.
+bench_*/
+bench_*.log
+c2_measure.log
+ct_curr.log
+ct_orig.log
+fc*.log
+ff_*.log
+fs_*.log
+pop_*.log
+pool*.log
+api_*.log
+heap.log
+refresh.log
+bench_vs_civilware.md
+
+# Node / editor / VCS cruft.
+.git/
+.github/
+.vscode/
+.idea/
+**/.DS_Store
+
+# Docs that don't belong in the runtime image. Keep the README only
+# to give `docker inspect` something meaningful; LICENSE is COPY-ed
+# in by the release pipeline via GoReleaser archives, not here.
+CHANGELOG.md
+DOCS/
+SECURITY.md
+DESIGN.md
+CLAUDE.md
+
+# Local experiments not tracked elsewhere.
+start.bat
+Taskfile.yml
