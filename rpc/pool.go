@@ -53,11 +53,20 @@ func NewPool(endpoint string, size int) (*Pool, error) {
 
 // Get retrieves a connection from the pool. Blocks if all connections are in use.
 func (p *Pool) Get() *Client {
-	return <-p.conns
+	c, ok := <-p.conns
+	if !ok {
+		return nil
+	}
+	return c
 }
 
 // Put returns a connection to the pool.
 func (p *Pool) Put(c *Client) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.closed.Load() {
 		c.Close()
 		return
@@ -67,9 +76,11 @@ func (p *Pool) Put(c *Client) {
 
 // Close shuts down all connections in the pool.
 func (p *Pool) Close() {
-	p.closed.Store(true)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed.Swap(true) {
+		return
+	}
 
 	close(p.conns)
 	for c := range p.conns {
@@ -85,7 +96,10 @@ func (p *Pool) Size() int {
 // GetWithTimeout retrieves a connection with a timeout. Returns nil if timeout expires.
 func (p *Pool) GetWithTimeout(d time.Duration) *Client {
 	select {
-	case c := <-p.conns:
+	case c, ok := <-p.conns:
+		if !ok {
+			return nil
+		}
 		return c
 	case <-time.After(d):
 		return nil
@@ -95,6 +109,9 @@ func (p *Pool) GetWithTimeout(d time.Duration) *Client {
 // WithConn executes a function with a pooled connection, automatically returning it.
 func (p *Pool) WithConn(fn func(*Client) error) error {
 	c := p.Get()
+	if c == nil {
+		return fmt.Errorf("pool closed")
+	}
 	defer p.Put(c)
 	return fn(c)
 }

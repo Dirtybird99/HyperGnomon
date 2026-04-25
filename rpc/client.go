@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creachadair/jrpc2"
@@ -17,6 +18,23 @@ import (
 )
 
 var logger = logrus.WithField("pkg", "rpc")
+
+var websocketCompression atomic.Bool
+
+func init() {
+	websocketCompression.Store(true)
+}
+
+// SetWebSocketCompression controls permessage-deflate on new daemon RPC
+// connections. Existing pooled connections are unchanged. Default is true to
+// preserve the historical behavior; benchmarks can disable it for LAN daemons.
+func SetWebSocketCompression(enabled bool) {
+	websocketCompression.Store(enabled)
+}
+
+func WebSocketCompressionEnabled() bool {
+	return websocketCompression.Load()
+}
 
 // Client wraps a WebSocket connection with JSON-RPC capabilities.
 type Client struct {
@@ -80,7 +98,7 @@ func (c *Client) Connect() error {
 		ReadBufferSize:    65536, // 64KB (up from 4KB default)
 		WriteBufferSize:   65536,
 		HandshakeTimeout:  3 * time.Second,
-		EnableCompression: true,
+		EnableCompression: WebSocketCompressionEnabled(),
 	}
 	ws, _, err := dialer.Dial(resolveDialURL(c.Endpoint), nil)
 	if err != nil {

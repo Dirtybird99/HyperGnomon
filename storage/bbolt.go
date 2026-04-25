@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/vmihailenco/msgpack/v5"
 
@@ -22,19 +23,24 @@ var (
 	bucketStats   = []byte("stats")
 	bucketOwners  = []byte("owners")
 	bucketHeaders = []byte("headers")
-	bucketClass   = []byte("class") // Route B: "<class>|<BE8:h>|<scid>" -> ClassMeta msgpack
+	bucketClass   = []byte("class") // Route B: "<class>|<BE8:h>|<scid>" -> ClassMeta (typed v1 tag 0x04; legacy msgpack fixmap reads via decodeClassMeta)
 	bucketTags    = []byte("tags")  // reserved; populated when tag indexes ship
 	bucketHeight  = []byte("height")
 	bucketScVars  = []byte("scvars")
-	bucketNormTx  = []byte("normaltxwithscid")
-	bucketInvalid = []byte("invalidscidinvokes")
+	// bucketScVarsLatest stores scid -> BE8 latest snapshot height. It avoids
+	// prefix-scanning every scvars snapshot for latest-rating reads.
+	bucketScVarsLatest = []byte("scvars_latest")
+	bucketNormTx       = []byte("normaltxwithscid")
+	bucketInvalid      = []byte("invalidscidinvokes")
 
 	// Route B (DESIGN.md §3) buckets.
 	bucketBlockHash   = []byte("blockhashes")  // BE8 height -> 64-hex block hash
 	bucketInstalls    = []byte("installs")     // "<BE8:h>|<scid>" -> InstallRecord msgpack
-	bucketClassIdx    = []byte("class_scid")   // scid -> ClassMeta msgpack (O(1) lookup)
+	bucketClassIdx    = []byte("class_scid")   // scid -> ClassMeta (typed v1 tag 0x04; legacy msgpack reads via decodeClassMeta; O(1) lookup)
 	bucketAddrSCIDs   = []byte("addr_scids")   // parent; per-addr sub-bucket created on demand
 	bucketTELAContent = []byte("tela_content") // scid|path -> {body, mime, sha256}
+	bucketSCCode      = []byte("sccode")       // scid -> SCCodeEntry (install-time DVM code)
+	bucketOwnerSCIDs  = []byte("owner_scids")  // "<owner>|<scid>" -> "" (prefix-scan owner → [scid])
 )
 
 // Key layout helpers: keep binary big-endian so bbolt's byte-order cursor
@@ -118,10 +124,11 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 		buckets := [][]byte{
 			bucketStats, bucketOwners, bucketHeaders,
 			bucketClass, bucketTags, bucketHeight,
-			bucketScVars, bucketNormTx, bucketInvalid,
+			bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
 			// Route B M0
 			bucketBlockHash, bucketInstalls, bucketClassIdx,
-			bucketAddrSCIDs, bucketTELAContent,
+			bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
+			bucketOwnerSCIDs,
 		}
 		for _, b := range buckets {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
@@ -135,7 +142,7 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 		return nil, fmt.Errorf("bbolt init buckets: %w", err)
 	}
 
-	logger.Infof("BoltDB opened: %s", dbPath)
+	logger.Debugf("BoltDB opened: %s", dbPath)
 	return store, nil
 }
 
@@ -184,7 +191,20 @@ func (s *BboltStore) StoreLastIndexHeight(height int64) error {
 
 func (s *BboltStore) StoreOwner(scid, owner string) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketOwners).Put([]byte(scid), []byte(owner))
+		owners := tx.Bucket(bucketOwners)
+		isNew := owners.Get([]byte(scid)) == nil
+		if err := owners.Put([]byte(scid), []byte(owner)); err != nil {
+			return err
+		}
+		if owner != "" {
+			if err := tx.Bucket(bucketOwnerSCIDs).Put(ownerSCIDKey(owner, scid), nil); err != nil {
+				return err
+			}
+		}
+		if isNew {
+			return addSCIDCountStat(tx, 1)
+		}
+		return nil
 	})
 }
 
@@ -243,31 +263,78 @@ func (s *BboltStore) StoreSCIDVariableDetails(scid string, vars []*structures.SC
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(key), val)
+		if err := b.Put([]byte(key), val); err != nil {
+			return err
+		}
+		return putLatestSCVarsHeight(tx.Bucket(bucketScVarsLatest), scid, height)
 	})
 }
 
 func (s *BboltStore) GetSCIDVariableDetailsAtHeight(scid string, height int64) ([]*structures.SCIDVariable, error) {
 	var vars []*structures.SCIDVariable
 	err := s.DB.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketScVars)
-		key := fmt.Sprintf("%s:%d", scid, height)
-		v := b.Get([]byte(key))
-		if v == nil {
-			return nil
-		}
-		// Tag-byte dispatch: 0x02 is typed v1, 0x9X is legacy msgpack array.
-		if structures.IsSCIDVariablesTyped(v) {
-			parsed, err := structures.UnmarshalSCIDVariablesTyped(v)
-			if err != nil {
-				return err
-			}
-			vars = parsed
-			return nil
-		}
-		return msgpack.Unmarshal(v, &vars)
+		var err error
+		vars, err = getSCIDVariablesAtHeightTx(tx, scid, height)
+		return err
 	})
 	return vars, err
+}
+
+func getSCIDVariablesAtHeightTx(tx *bolt.Tx, scid string, height int64) ([]*structures.SCIDVariable, error) {
+	if scid == "" || height <= 0 {
+		return nil, nil
+	}
+	key := fmt.Sprintf("%s:%d", scid, height)
+	v := tx.Bucket(bucketScVars).Get([]byte(key))
+	if v == nil {
+		return nil, nil
+	}
+	return decodeSCIDVariables(v)
+}
+
+func decodeSCIDVariables(v []byte) ([]*structures.SCIDVariable, error) {
+	if structures.IsSCIDVariablesTyped(v) {
+		return structures.UnmarshalSCIDVariablesTyped(v)
+	}
+	var vars []*structures.SCIDVariable
+	if err := msgpack.Unmarshal(v, &vars); err != nil {
+		return nil, err
+	}
+	return vars, nil
+}
+
+func latestSCVarsHeightTx(tx *bolt.Tx, scid string) int64 {
+	if scid == "" {
+		return 0
+	}
+	if v := tx.Bucket(bucketScVarsLatest).Get([]byte(scid)); len(v) >= 8 {
+		return decHeight(v)
+	}
+	prefix := []byte(scid + ":")
+	var maxH int64
+	c := tx.Bucket(bucketScVars).Cursor()
+	for k, _ := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, _ = c.Next() {
+		h, err := strconv.ParseInt(string(k[len(prefix):]), 10, 64)
+		if err != nil {
+			continue
+		}
+		if h > maxH {
+			maxH = h
+		}
+	}
+	return maxH
+}
+
+func putLatestSCVarsHeight(b *bolt.Bucket, scid string, height int64) error {
+	if scid == "" || height <= 0 {
+		return nil
+	}
+	if existing := b.Get([]byte(scid)); len(existing) >= 8 && decHeight(existing) >= height {
+		return nil
+	}
+	val := make([]byte, 8)
+	copy(val, encHeight(height))
+	return b.Put([]byte(scid), val)
 }
 
 func (s *BboltStore) StoreSCIDInteractionHeight(scid string, height int64) error {
@@ -350,6 +417,38 @@ func (s *BboltStore) StoreTxCounts(reg, burn, norm int64) error {
 	})
 }
 
+func addIntStat(b *bolt.Bucket, key string, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	existing := b.Get([]byte(key))
+	var current int64
+	if existing != nil {
+		current, _ = strconv.ParseInt(string(existing), 10, 64)
+	}
+	return b.Put([]byte(key), []byte(strconv.FormatInt(current+delta, 10)))
+}
+
+func addSCIDCountStat(tx *bolt.Tx, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	stats := tx.Bucket(bucketStats)
+	key := []byte("sc_count")
+	if existing := stats.Get(key); existing != nil {
+		n, _ := strconv.ParseInt(string(existing), 10, 64)
+		return stats.Put(key, []byte(strconv.FormatInt(n+delta, 10)))
+	}
+	var total int64
+	if err := tx.Bucket(bucketOwners).ForEach(func(_, _ []byte) error {
+		total++
+		return nil
+	}); err != nil {
+		return err
+	}
+	return stats.Put(key, []byte(strconv.FormatInt(total, 10)))
+}
+
 func (s *BboltStore) GetAllSCIDs() ([]string, error) {
 	var scids []string
 	err := s.DB.View(func(tx *bolt.Tx) error {
@@ -372,13 +471,60 @@ func (s *BboltStore) GetAllOwnersAndSCIDs() (map[string]string, error) {
 	return result, err
 }
 
+func (s *BboltStore) GetSCIDCount() (int64, error) {
+	var count int64
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(bucketStats).Get([]byte("sc_count")); v != nil {
+			n, err := strconv.ParseInt(string(v), 10, 64)
+			if err == nil {
+				count = n
+				return nil
+			}
+		}
+		var n int64
+		if err := tx.Bucket(bucketOwners).ForEach(func(_, _ []byte) error {
+			n++
+			return nil
+		}); err != nil {
+			return err
+		}
+		count = n
+		return nil
+	})
+	return count, err
+}
+
+func (s *BboltStore) GetOwnersForSCIDs(scids []string) (map[string]string, error) {
+	out := make(map[string]string, len(scids))
+	if len(scids) == 0 {
+		return out, nil
+	}
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketOwners)
+		for _, scid := range scids {
+			if scid == "" {
+				continue
+			}
+			if v := b.Get([]byte(scid)); v != nil {
+				out[scid] = string(v)
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // FlushBatch atomically writes all accumulated data in a single BoltDB transaction.
 // This is the arena-pattern payoff: one lock acquisition for potentially thousands of records.
 func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		// Store owners
 		ownerBucket := tx.Bucket(bucketOwners)
+		var newOwners int64
 		for scid, owner := range batch.Owners {
+			if ownerBucket.Get([]byte(scid)) == nil {
+				newOwners++
+			}
 			if err := ownerBucket.Put([]byte(scid), []byte(owner)); err != nil {
 				return fmt.Errorf("batch owner %s: %w", scid, err)
 			}
@@ -430,6 +576,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Keys are safe to reuse because bolt's bucket.Put copies keys
 		// eagerly (node.put clones the key into its own arena).
 		varBucket := tx.Bucket(bucketScVars)
+		varLatestBucket := tx.Bucket(bucketScVarsLatest)
 		for scid, heightVars := range batch.Variables {
 			for height, vars := range heightVars {
 				keyBuf = keyBuf[:0]
@@ -438,6 +585,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				keyBuf = strconv.AppendInt(keyBuf, height, 10)
 				val := structures.MarshalSCIDVariablesTypedAppend(nil, vars)
 				if err := varBucket.Put(keyBuf, val); err != nil {
+					return err
+				}
+				if err := putLatestSCVarsHeight(varLatestBucket, scid, height); err != nil {
 					return err
 				}
 			}
@@ -515,6 +665,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		if err := addCount("normtxcount", batch.NormTxCount); err != nil {
 			return err
 		}
+		if err := addSCIDCountStat(tx, newOwners); err != nil {
+			return err
+		}
 
 		// === Route B (DESIGN.md §3) — new buckets, same atomic txn ===
 
@@ -564,23 +717,67 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				if meta == nil || meta.Class == "" {
 					continue
 				}
+				// Preflight: if we're overwriting a record at a different
+				// (class, InstallHeight), delete the stale classPrefix row
+				// so each SCID appears exactly once in a class scan.
+				// decodeClassMeta transparently handles both typed v1 and
+				// legacy msgpack records during the transition window.
 				if prev := classIdx.Get([]byte(scid)); prev != nil {
-					var oldMeta structures.ClassMeta
-					if err := msgpack.Unmarshal(prev, &oldMeta); err == nil {
+					if oldMeta, err := decodeClassMeta(prev); err == nil && oldMeta != nil {
 						if oldMeta.Class != meta.Class || oldMeta.InstallHeight != meta.InstallHeight {
 							_ = classPrefix.Delete(classKey(oldMeta.Class, oldMeta.InstallHeight, scid))
 						}
 					}
 				}
-				val, err := msgpack.Marshal(meta)
-				if err != nil {
-					return fmt.Errorf("batch class marshal: %w", err)
-				}
+				// Typed v1 write — 1 alloc for the buffer, no msgpack
+				// reflection. Same slice serves both Puts (bbolt needs the
+				// bytes valid until commit, not unique per Put).
+				val := meta.MarshalTyped()
 				if err := classIdx.Put([]byte(scid), val); err != nil {
 					return err
 				}
 				if err := classPrefix.Put(classKey(meta.Class, meta.InstallHeight, scid), val); err != nil {
 					return err
+				}
+			}
+		}
+
+		// SC code snapshots: scid -> SCCodeEntry. Write-once semantics
+		// (DERO code is immutable), so we just Put unconditionally — any
+		// overwrite is a no-op byte-wise. Typed v1 encoding: 1 alloc
+		// per entry (the marshal buffer), zero framing overhead. Msgpack
+		// baseline paid 3 allocs + ~16% header bloat.
+		//
+		// bbolt.Put requires the supplied value to stay valid for the
+		// life of the transaction, so we can't reuse a single scratch
+		// buffer across iterations — fresh allocation matches the Classes
+		// / Installs loops above.
+		if len(batch.SCCodes) > 0 {
+			codeBucket := tx.Bucket(bucketSCCode)
+			for scid, entry := range batch.SCCodes {
+				if entry == nil || entry.Code == "" {
+					continue
+				}
+				if err := codeBucket.Put([]byte(scid), entry.MarshalTyped()); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Owner → SCIDs reverse index: populated from batch.OwnerSCIDs so
+		// listsc_byowner / getscidlist_byaddr don't need a full-owners scan.
+		// Value is empty (key-only); the key layout is "<owner>|<scid>" so
+		// a prefix scan returns every scid for the given owner.
+		if len(batch.OwnerSCIDs) > 0 {
+			osBucket := tx.Bucket(bucketOwnerSCIDs)
+			for owner, scids := range batch.OwnerSCIDs {
+				if owner == "" {
+					continue
+				}
+				for scid := range scids {
+					if err := osBucket.Put(ownerSCIDKey(owner, scid), nil); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -706,6 +903,27 @@ func (s *BboltStore) GetBlockHash(height int64) (string, error) {
 	return hash, err
 }
 
+// decodeClassMeta dispatches on the leading tag byte to pick between the
+// v1 typed decoder and the legacy msgpack decoder. Legacy records upgrade
+// in-place on next write (FlushBatch always emits v1). Returned meta is a
+// fresh allocation — callers own it.
+func decodeClassMeta(v []byte) (*structures.ClassMeta, error) {
+	if len(v) == 0 {
+		return nil, nil
+	}
+	var m structures.ClassMeta
+	if structures.IsClassMetaTyped(v) {
+		if err := m.UnmarshalTyped(v); err != nil {
+			return nil, err
+		}
+		return &m, nil
+	}
+	if err := msgpack.Unmarshal(v, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 // GetClassInstalls returns classified SCIDs for a given class, one entry
 // per unique SCID (the highest-height entry wins). Ordered by install
 // height ascending. limit<=0 means unlimited.
@@ -731,8 +949,8 @@ func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.Cla
 			}
 			h := decHeight(rem[:8])
 			scid := string(rem[9:])
-			var meta structures.ClassMeta
-			if err := msgpack.Unmarshal(v, &meta); err != nil {
+			meta, err := decodeClassMeta(v)
+			if err != nil {
 				logger.Warnf("GetClassInstalls decode %s/%d/%s: %v", class, h, scid, err)
 				continue
 			}
@@ -740,7 +958,7 @@ func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.Cla
 				latest[scid] = structures.ClassInstall{
 					SCID:          scid,
 					InstallHeight: h,
-					Meta:          &meta,
+					Meta:          meta,
 				}
 			}
 		}
@@ -762,6 +980,8 @@ func (s *BboltStore) GetClassInstalls(class string, limit int) ([]structures.Cla
 }
 
 // GetSCIDClass returns the classifier's stored metadata for a SCID, or nil.
+// Dispatches on the leading tag byte so legacy msgpack records still decode
+// until they're rewritten as typed v1 on the next class update.
 func (s *BboltStore) GetSCIDClass(scid string) (*structures.ClassMeta, error) {
 	var meta *structures.ClassMeta
 	err := s.DB.View(func(tx *bolt.Tx) error {
@@ -769,11 +989,11 @@ func (s *BboltStore) GetSCIDClass(scid string) (*structures.ClassMeta, error) {
 		if v == nil {
 			return nil
 		}
-		var m structures.ClassMeta
-		if err := msgpack.Unmarshal(v, &m); err != nil {
+		m, err := decodeClassMeta(v)
+		if err != nil {
 			return fmt.Errorf("class_scid decode %s: %w", scid, err)
 		}
-		meta = &m
+		meta = m
 		return nil
 	})
 	return meta, err
@@ -804,12 +1024,11 @@ func (s *BboltStore) GetInstallsInRange(fromHeight, toHeight int64, limit int) (
 				logger.Warnf("GetInstallsInRange decode h=%d scid=%s: %v", h, scid, err)
 				continue
 			}
-			// Pull class metadata if classified.
+			// Pull class metadata if classified (typed or legacy).
 			var meta *structures.ClassMeta
 			if cv := classBucket.Get([]byte(scid)); cv != nil {
-				var m structures.ClassMeta
-				if err := msgpack.Unmarshal(cv, &m); err == nil {
-					meta = &m
+				if m, err := decodeClassMeta(cv); err == nil {
+					meta = m
 				}
 			}
 			out = append(out, structures.ClassInstall{
@@ -858,6 +1077,383 @@ func (s *BboltStore) GetAddressSCIDs(addr string) (map[string]*structures.AddrSC
 		})
 	})
 	return out, err
+}
+
+// GetRatingsForSCID returns the TELA ratings stored as variables on scid at
+// the given snapshot height. height <= 0 picks the latest snapshot.
+//
+// Per the canonical TELA spec (github.com/civilware/tela):
+//   - The `Rate(r uint64)` entrypoint stores each rater's entry under a
+//     STORE key that **is** the rater's wallet address (e.g. "deto1qy…"),
+//     not a "rating_<addr>" prefix.
+//   - The value is hex-encoded `"<score>_<height>"`, e.g. "35_6937500" →
+//     hex "33355f36393337353030".
+//   - Score is 0–99; >=50 → like, <50 → dislike (aggregate keys `likes`
+//     and `dislikes` count these separately).
+//   - There is no `ratingMsg_<addr>` companion key; ratings carry no
+//     message payload.
+//
+// Returns ([], nil) when the SCID has no ratings, or an error on a DB issue.
+func (s *BboltStore) GetRatingsForSCID(scid string, height int64) ([]structures.Rating, error) {
+	ratings, _, err := s.GetRatingsAndSummaryForSCID(scid, height)
+	return ratings, err
+}
+
+// GetRatingSummary reads the `likes` and `dislikes` aggregate STORE keys
+// that the TELA `Rate()` entrypoint maintains alongside the per-rater
+// entries. Returns zero values if neither key is present.
+func (s *BboltStore) GetRatingSummary(scid string, height int64) (*structures.RatingSummary, error) {
+	_, summary, err := s.GetRatingsAndSummaryForSCID(scid, height)
+	return summary, err
+}
+
+func (s *BboltStore) GetRatingsAndSummaryForSCID(scid string, height int64) ([]structures.Rating, *structures.RatingSummary, error) {
+	if scid == "" {
+		return nil, nil, nil
+	}
+
+	var ratings []structures.Rating
+	var summary *structures.RatingSummary
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		resolvedHeight := height
+		if resolvedHeight <= 0 {
+			resolvedHeight = latestSCVarsHeightTx(tx, scid)
+		}
+		if resolvedHeight <= 0 {
+			summary = &structures.RatingSummary{Height: 0}
+			return nil
+		}
+		vars, err := getSCIDVariablesAtHeightTx(tx, scid, resolvedHeight)
+		if err != nil {
+			return err
+		}
+		summary = &structures.RatingSummary{Height: resolvedHeight}
+		ratings = ratingsFromVars(vars, resolvedHeight, summary)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return ratings, summary, nil
+}
+
+func ratingsFromVars(vars []*structures.SCIDVariable, height int64, sum *structures.RatingSummary) []structures.Rating {
+	if len(vars) == 0 {
+		return nil
+	}
+	out := make([]structures.Rating, 0, 4)
+	for _, v := range vars {
+		keyStr, ok := v.Key.(string)
+		if !ok {
+			continue
+		}
+		switch keyStr {
+		case "likes":
+			if sum != nil {
+				sum.Likes = uint64(ratingScore(v.Value))
+			}
+			continue
+		case "dislikes":
+			if sum != nil {
+				sum.Dislikes = uint64(ratingScore(v.Value))
+			}
+			continue
+		}
+		if !looksLikeDEROAddress(keyStr) {
+			continue
+		}
+		score, h, ok := parseTELARatingValue(v.Value)
+		if !ok {
+			continue
+		}
+		if h == 0 {
+			h = height
+		}
+		out = append(out, structures.Rating{
+			Rater:  keyStr,
+			Score:  score,
+			Height: h,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Rater < out[j].Rater })
+	return out
+}
+
+// looksLikeDEROAddress is a cheap shape check: DERO mainnet addresses
+// start with "dero1" and are ~66 chars Base58 (testnet "deto1"). We just
+// prefix-check + length-gate here; callers don't need strict checksum
+// validation, only "not a regular English variable name."
+func looksLikeDEROAddress(s string) bool {
+	if len(s) < 40 || len(s) > 128 {
+		return false
+	}
+	if strings.HasPrefix(s, "dero1") || strings.HasPrefix(s, "deto1") || strings.HasPrefix(s, "deroi1") {
+		return true
+	}
+	return false
+}
+
+// parseTELARatingValue decodes the TELA rating value format: the stored
+// value is hex-encoded `"<score>_<height>"`. Returns (score, height, ok).
+// ok=false means the value doesn't match the rating format at all.
+func parseTELARatingValue(raw interface{}) (float64, int64, bool) {
+	s, ok := raw.(string)
+	if !ok {
+		return 0, 0, false
+	}
+	// Best-effort hex decode; TELA stores the value as hex bytes of the
+	// ASCII "<score>_<height>" string. Legacy records may already be raw
+	// ASCII, so fall through if hex-decode fails.
+	decoded := hexDecodeIfHex(s)
+	parts := strings.SplitN(decoded, "_", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	scoreF, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if scoreF < 0 || scoreF >= 100 {
+		return 0, 0, false
+	}
+	height, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return scoreF, height, true
+}
+
+// hexDecodeIfHex returns the hex-decoded bytes of s if s is a valid hex
+// string, otherwise s unchanged. The TELA Rate() entrypoint stores rating
+// values as hex-encoded ASCII, so real on-chain data will always hex-decode;
+// this fallback is defensive for test fixtures that pre-decode.
+func hexDecodeIfHex(s string) string {
+	if len(s)%2 != 0 {
+		return s
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+			return s
+		}
+	}
+	out := make([]byte, len(s)/2)
+	for i := 0; i < len(out); i++ {
+		hi := hexNibble(s[i*2])
+		lo := hexNibble(s[i*2+1])
+		out[i] = hi<<4 | lo
+	}
+	return string(out)
+}
+
+func hexNibble(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	}
+	return 0
+}
+
+// ResetIndex drops every data bucket then recreates them empty. The block
+// hash bucket is preserved so reorg-detection has history to compare against
+// when the next scan reaches those heights again. Safe to call on an open
+// DB; callers should ensure no scan is running.
+func (s *BboltStore) ResetIndex() error {
+	toDrop := [][]byte{
+		bucketStats, bucketOwners, bucketHeaders,
+		bucketClass, bucketTags, bucketHeight,
+		bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
+		bucketInstalls, bucketClassIdx,
+		bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
+		bucketOwnerSCIDs,
+	}
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		for _, name := range toDrop {
+			if tx.Bucket(name) != nil {
+				if err := tx.DeleteBucket(name); err != nil {
+					return fmt.Errorf("drop bucket %s: %w", name, err)
+				}
+			}
+			if _, err := tx.CreateBucket(name); err != nil {
+				return fmt.Errorf("recreate bucket %s: %w", name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// GetSCIDsByOwner returns every SCID installed by the given owner address.
+// Prefix-scans the owner_scids bucket; linear in the count of SCIDs for
+// this owner (not the total — bbolt's cursor advances inside a shared page
+// as long as keys share the prefix).
+//
+// Ordering is by SCID bytewise ascending (bbolt's natural key order).
+// Returns ([], nil) on unknown owner.
+func (s *BboltStore) GetSCIDsByOwner(owner string) ([]string, error) {
+	if owner == "" {
+		return nil, nil
+	}
+	prefix := append([]byte(owner), '|')
+	var out []string
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketOwnerSCIDs).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, _ = c.Next() {
+			scid := string(k[len(prefix):])
+			if scid != "" {
+				out = append(out, scid)
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ownerSCIDKey packs owner + scid for the flat bucket layout.
+func ownerSCIDKey(owner, scid string) []byte {
+	k := make([]byte, 0, len(owner)+1+len(scid))
+	k = append(k, owner...)
+	k = append(k, '|')
+	k = append(k, scid...)
+	return k
+}
+
+// GetSCCode returns the install-time code snapshot for scid. (nil, nil) on
+// miss — caller (indexer.GetSCCode) handles lazy backfill from the daemon.
+// Uses the v1 typed encoding — one string allocation for the Code, zero
+// header allocations. The msgpack baseline was 3 allocs + ~16% framing
+// overhead on 2 KB contracts.
+func (s *BboltStore) GetSCCode(scid string) (*structures.SCCodeEntry, error) {
+	if scid == "" {
+		return nil, nil
+	}
+	var out *structures.SCCodeEntry
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketSCCode).Get([]byte(scid))
+		if v == nil {
+			return nil
+		}
+		var e structures.SCCodeEntry
+		if err := e.UnmarshalTyped(v); err != nil {
+			return err
+		}
+		out = &e
+		return nil
+	})
+	return out, err
+}
+
+// PutSCCode writes a code snapshot. Overwrites any previous entry for scid.
+// Normal install/lazy-backfill path is WriteBatch.AddSCCode + FlushBatch —
+// this direct method exists for tests and the lazy-backfill cache-fill path
+// in indexer.GetSCCode where a one-shot write is cheaper than a pooled batch.
+func (s *BboltStore) PutSCCode(scid string, entry *structures.SCCodeEntry) error {
+	if scid == "" || entry == nil {
+		return nil
+	}
+	val := entry.MarshalTyped()
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketSCCode).Put([]byte(scid), val)
+	})
+}
+
+// telaContentKey packs (scid, path) into a single bucket key. '|' is a safe
+// separator because SCIDs are 64-hex and TELA paths never contain '|'.
+func telaContentKey(scid, path string) []byte {
+	k := make([]byte, 0, len(scid)+1+len(path))
+	k = append(k, scid...)
+	k = append(k, '|')
+	k = append(k, path...)
+	return k
+}
+
+// GetTELAContent reads a cached TELA content entry. Returns (nil, nil) on miss.
+func (s *BboltStore) GetTELAContent(scid, path string) (*structures.TELAContentEntry, error) {
+	if scid == "" {
+		return nil, nil
+	}
+	var out *structures.TELAContentEntry
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketTELAContent).Get(telaContentKey(scid, path))
+		if v == nil {
+			return nil
+		}
+		var e structures.TELAContentEntry
+		if err := msgpack.Unmarshal(v, &e); err != nil {
+			return err
+		}
+		out = &e
+		return nil
+	})
+	return out, err
+}
+
+// PutTELAContent writes a content entry. Overwrites any previous entry for
+// the same (scid, path). Caller should have already computed ETag.
+func (s *BboltStore) PutTELAContent(scid, path string, entry *structures.TELAContentEntry) error {
+	if scid == "" || entry == nil {
+		return nil
+	}
+	val, err := msgpack.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTELAContent).Put(telaContentKey(scid, path), val)
+	})
+}
+
+// DeleteTELAContentForSCID removes every cached entry for the given SCID.
+// Called from the bus invalidator when EventInstall / EventVarChange fires
+// on a TELA app — the content may have been updated on-chain.
+func (s *BboltStore) DeleteTELAContentForSCID(scid string) error {
+	if scid == "" {
+		return nil
+	}
+	prefix := append([]byte(scid), '|')
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTELAContent)
+		c := b.Cursor()
+		var toDelete [][]byte
+		for k, _ := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, _ = c.Next() {
+			// Copy — bbolt key slices are only valid inside the callback.
+			kc := make([]byte, len(k))
+			copy(kc, k)
+			toDelete = append(toDelete, kc)
+		}
+		for _, k := range toDelete {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ratingScore converts a rating variable value to float64. TELA contracts
+// store ratings as uint64 / int / string depending on SDK version — tolerate
+// all three and return 0 for unparseable values (caller can filter).
+func ratingScore(v interface{}) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case int64:
+		return float64(t)
+	case uint64:
+		return float64(t)
+	case int:
+		return float64(t)
+	case string:
+		f, _ := strconv.ParseFloat(t, 64)
+		return f
+	}
+	return 0
 }
 
 // hasPrefix is a 2-operand []byte prefix test; avoids bytes.HasPrefix import

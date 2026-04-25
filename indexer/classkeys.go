@@ -67,9 +67,26 @@ func buildGetSCParams(scid string, keys []string) rpc.GetSC_Params {
 // plus class-specific fields.
 //
 // Leave empty → fall back to full Variables=true fetch.
+//
+// TELA-INDEX-1 is intentionally absent from this map so every refresh
+// fetches the full variable set. Rationale: the INDEX's route table is a
+// variable-length list of `DOC1..DOCn` entries (n unknown without a full
+// fetch), and we also need to tolerate both v1.0.0 legacy keys
+// (nameHdr/descrHdr/iconURLHdr/telaVersion) and v1.1.0 canonical keys
+// (var_header_*). There are only ~100 TELA-INDEX-1 contracts on mainnet,
+// so the per-refresh cost of 100 batched Variables=true calls is
+// negligible (under a second, end to end).
 var classKeys = map[string][]string{
-	"TELA-INDEX-1": {"telaVersion", "nameHdr", "descrHdr", "iconURLHdr"},
-	"TELA-DOC-1":   {"docVersion", "nameHdr", "descrHdr", "iconURLHdr"},
+	// TELA-DOC-1: bounded, known-shape — fast-path is a clear win. Covers
+	// both the v1.0.0 (nameHdr/descrHdr/iconURLHdr/docVersion) and v1.1.0
+	// (var_header_*) key families plus docType, subDir, and the two
+	// Schnorr signature components.
+	"TELA-DOC-1": {
+		"var_header_name", "var_header_description", "var_header_icon",
+		"nameHdr", "descrHdr", "iconURLHdr",
+		"dURL", "docType", "subDir",
+		"docVersion", "fileCheckC", "fileCheckS",
+	},
 }
 
 // fullRefreshEvery N: every N'th call to RefreshClassVars falls back to the
