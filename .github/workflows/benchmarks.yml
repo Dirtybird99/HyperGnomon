@@ -29,7 +29,11 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          go test -bench=. -benchmem -count=5 ./... | tee benchmark-results.txt
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            go test ./... -run='^$' -bench=. -benchmem -count=1 | tee benchmark-results.txt
+          else
+            go test ./... -run='^$' -bench=. -benchmem -count=5 | tee benchmark-results.txt
+          fi
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
