@@ -108,12 +108,6 @@ func NewIndexer(
 		return newDeadIndexer(fmt.Errorf("boltDB arg is %T, expected *storage.BboltStore", boltDB))
 	}
 
-	hgCfg := hgindexer.Config{
-		Endpoint:       strings.TrimPrefix(strings.TrimPrefix(endpoint, "http://"), "https://"),
-		SearchFilter:   splitCivilwareFilter(filter),
-		SCIDExclusions: exclusions,
-		TurboMode:      true, // civilware's fastsync is trust-the-registry in spirit; HyperGnomon turbo matches
-	}
 	if config != nil {
 		// Civilware's FastSyncConfig isn't a HyperGnomon concept —
 		// we drop most of it and only honor Enabled as a hint.
@@ -125,8 +119,6 @@ func NewIndexer(
 		// clearly rather than guess a path.
 		return newDeadIndexer(fmt.Errorf("boltDB arg is nil — open one with storage.NewBBoltDB(path, name) first"))
 	}
-	hgCfg.DBDir = ""  // Not used when we wire the store in via a later option (v1.x).
-
 	// HyperGnomon's current New() opens its own store from cfg.DBDir.
 	// That's a v1.0 limitation — the compat shim can't inject a
 	// pre-opened store yet. Tell the caller to pass a path via

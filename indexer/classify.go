@@ -94,7 +94,7 @@ func tagsForClass(class string) []string {
 	return []string{"all"}
 }
 
-// classifyDEROAsset is a last-resort fallback that recognises pre-G45 token
+// classifyDEROAsset is a last-resort fallback that recognizes pre-G45 token
 // contracts — those using `InitializePrivate` + `SEND_ASSET_TO_ADDRESS`
 // without any G45 / NFA / TELA headers. Civilware's classifier carries this
 // fallback so the `all` filter shows every SC, not just the branded ones.
@@ -284,7 +284,7 @@ func decodeHexIfPrintable(s string) string {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return s
 		}
 	}
@@ -293,7 +293,7 @@ func decodeHexIfPrintable(s string) string {
 		decoded[i] = hexNibbleByte(s[i*2])<<4 | hexNibbleByte(s[i*2+1])
 	}
 	// Printability check: ASCII printable (space..tilde) or common whitespace,
-	// OR any byte >= 0x80 that's valid UTF-8 when combined with neighbours.
+	// OR any byte >= 0x80 that's valid UTF-8 when combined with neighbors.
 	// Conservative: require all bytes to be printable ASCII or valid UTF-8
 	// multibyte sequence. If any byte is a control char below 0x20 (except
 	// tab/newline), reject the hex interpretation.

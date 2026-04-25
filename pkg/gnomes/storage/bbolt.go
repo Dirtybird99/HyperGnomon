@@ -5,12 +5,7 @@
 package storage
 
 import (
-	"fmt"
-	"strconv"
-	"strings"
-
 	hgstorage "github.com/hypergnomon/hypergnomon/storage"
-	hgstructures "github.com/hypergnomon/hypergnomon/structures"
 
 	compatstructures "github.com/hypergnomon/hypergnomon/pkg/gnomes/structures"
 )
@@ -89,17 +84,14 @@ func (b *BboltStore) GetAllSCIDVariableDetails(scid string) []*compatstructures.
 // search ALL stored heights and return every distinct value; `any=false`
 // means just the snapshot at `height`. Returns (values, heights) so
 // callers can correlate each value to the height it was recorded at.
-//
-// Civilware's name uses `any` as a flag parameter; Go lets us use it
-// as an identifier since it's the pre-Go-1.18 meaning.
-func (b *BboltStore) GetSCIDValuesByKey(scid, key string, height int64, any bool) ([]string, []int64) {
-	return b.findVars(scid, "", key, height, any, true /*byKey*/)
+func (b *BboltStore) GetSCIDValuesByKey(scid, key string, height int64, matchAny bool) ([]string, []int64) {
+	return b.findVars(scid, "", key, height, matchAny, true /*byKey*/)
 }
 
 // GetSCIDKeysByValue is the reverse of GetSCIDValuesByKey: given a
 // value, return every key that currently holds it on `scid`.
-func (b *BboltStore) GetSCIDKeysByValue(scid, value string, height int64, any bool) ([]string, []int64) {
-	return b.findVars(scid, value, "", height, any, false /*byKey*/)
+func (b *BboltStore) GetSCIDKeysByValue(scid, value string, height int64, matchAny bool) ([]string, []int64) {
+	return b.findVars(scid, value, "", height, matchAny, false /*byKey*/)
 }
 
 // GetSCIDInteractionHeight returns every height at which `scid`'s
@@ -156,43 +148,4 @@ func (b *BboltStore) findVars(scid, matchValue, matchKey string, height int64, a
 		scan(h)
 	}
 	return matches, heights
-}
-
-// String helpers so callers can pretty-print an SCID's variable dump
-// without repeatedly asserting interface{} types. Not on civilware's
-// surface — HyperGnomon-only convenience.
-func varKeyString(v *hgstructures.SCIDVariable) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.Key.(string); ok {
-		return s
-	}
-	return fmt.Sprintf("%v", v.Key)
-}
-
-func varValueString(v *hgstructures.SCIDVariable) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.Value.(string); ok {
-		return s
-	}
-	if u, ok := v.Value.(uint64); ok {
-		return strconv.FormatUint(u, 10)
-	}
-	return fmt.Sprintf("%v", v.Value)
-}
-
-// looksLikeHexAddress is a cheap heuristic for civilware's any-height
-// filter semantics: "value" matches loosely when the stored value is
-// the hex-encoded form of the probe. Kept local to the findVars path
-// so we don't re-import the heuristic from elsewhere.
-var _ = looksLikeHexAddressUnused
-
-// looksLikeHexAddressUnused is referenced from _ so `fmt` + `strings`
-// stay imported if future expansion of findVars needs them — otherwise
-// the vet-unused-import gate complains.
-func looksLikeHexAddressUnused(s string) bool {
-	return strings.HasPrefix(s, "dero1") || strings.HasPrefix(s, "deto1")
 }

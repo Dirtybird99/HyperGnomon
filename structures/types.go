@@ -173,7 +173,7 @@ type TELAContentEntry struct {
 }
 
 // Rating (spec reference above) — this older godoc block is kept purely
-// so that grep finds the historical comment for future archaeology. The
+// so that grep finds the historical comment for future archeology. The
 // actual type is declared immediately below.
 // Rating is one rater's score on a TELA INDEX/DOC contract.
 //

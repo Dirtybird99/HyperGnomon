@@ -27,19 +27,19 @@ type Proc struct {
 // failures are diagnosable. Returns once the process is launched;
 // does NOT wait for readiness — that's the tip-detection loop's job.
 func startIndexer(bin string, args []string) (*Proc, error) {
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, args...) // #nosec G204 -- benchvs intentionally launches an operator-selected benchmark binary.
 	logPath := filepath.Join(filepath.Dir(bin), "benchvs.log")
 	if dbDir := findDBDir(args); dbDir != "" {
 		logPath = filepath.Join(dbDir, "..", "benchvs.log")
 	}
-	f, err := os.Create(logPath)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- log path is derived from operator-selected benchmark paths.
 	if err != nil {
 		return nil, fmt.Errorf("open log %s: %w", logPath, err)
 	}
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if err := cmd.Start(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return &Proc{cmd: cmd, StartedAt: time.Now(), LogPath: logPath}, nil
@@ -130,7 +130,7 @@ func waitForLogPattern(logPath string, markers []string, timeout time.Duration) 
 	defer tick.Stop()
 
 	for time.Now().Before(deadline) {
-		body, err := os.ReadFile(logPath)
+		body, err := readBenchmarkLog(logPath)
 		if err == nil {
 			text := string(body)
 			for _, marker := range markers {
@@ -148,7 +148,7 @@ func lastLogLineContaining(logPath, needle string) string {
 	if logPath == "" || needle == "" {
 		return ""
 	}
-	body, err := os.ReadFile(logPath)
+	body, err := readBenchmarkLog(logPath)
 	if err != nil {
 		return ""
 	}
@@ -160,6 +160,10 @@ func lastLogLineContaining(logPath, needle string) string {
 		}
 	}
 	return ""
+}
+
+func readBenchmarkLog(path string) ([]byte, error) {
+	return os.ReadFile(path) // #nosec G304 -- benchvs reads only the operator-selected child log.
 }
 
 func fetchTopoHeight(url string) (int64, error) {

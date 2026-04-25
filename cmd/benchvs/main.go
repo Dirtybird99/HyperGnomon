@@ -72,7 +72,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "benchvs: cleanup of --db-dir failed: %v\n", err)
 		os.Exit(1)
 	}
-	if err := os.MkdirAll(*dbDir, 0o755); err != nil {
+	if err := os.MkdirAll(*dbDir, 0o750); err != nil {
 		fmt.Fprintf(os.Stderr, "benchvs: mkdir --db-dir: %v\n", err)
 		os.Exit(1)
 	}

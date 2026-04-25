@@ -108,7 +108,7 @@ type Config struct {
 	//   "tela" — only TELA-{INDEX,DOC,MOD}-1 classes. Default; matches
 	//            the real use case (TELA content server needs DOC source
 	//            to parse the /* ... */ body block).
-	//   "all"  — persist every classified SCID's code. Previous behaviour.
+	//   "all"  — persist every classified SCID's code. Previous behavior.
 	//            Grows the DB ~134 MB on mainnet; use only if an operator
 	//            actually serves GetInitialSCIDCode for arbitrary SCIDs.
 	//

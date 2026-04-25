@@ -45,9 +45,9 @@ var ErrInvalidAddrSCIDEntry = errors.New("invalid AddrSCIDEntry encoding")
 func (e *AddrSCIDEntry) MarshalTyped() []byte {
 	buf := make([]byte, EncodedAddrSCIDEntrySize)
 	buf[0] = TagAddrSCIDEntryV1
-	binary.BigEndian.PutUint64(buf[1:9], uint64(e.FirstHeight))
-	binary.BigEndian.PutUint64(buf[9:17], uint64(e.LastHeight))
-	binary.BigEndian.PutUint64(buf[17:25], uint64(e.Count))
+	binary.BigEndian.PutUint64(buf[1:9], int64Bits(e.FirstHeight))
+	binary.BigEndian.PutUint64(buf[9:17], int64Bits(e.LastHeight))
+	binary.BigEndian.PutUint64(buf[17:25], int64Bits(e.Count))
 	return buf
 }
 
@@ -59,9 +59,9 @@ func (e *AddrSCIDEntry) MarshalTypedAppend(dst []byte) []byte {
 	// wants to pack multiple records (they currently don't, but the API is
 	// allocation-flexible).
 	dst = append(dst, TagAddrSCIDEntryV1)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.FirstHeight))
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.LastHeight))
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.Count))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.FirstHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.LastHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.Count))
 	return dst
 }
 
@@ -71,9 +71,9 @@ func (e *AddrSCIDEntry) UnmarshalTyped(b []byte) error {
 	if len(b) != EncodedAddrSCIDEntrySize || b[0] != TagAddrSCIDEntryV1 {
 		return ErrInvalidAddrSCIDEntry
 	}
-	e.FirstHeight = int64(binary.BigEndian.Uint64(b[1:9]))
-	e.LastHeight = int64(binary.BigEndian.Uint64(b[9:17]))
-	e.Count = int64(binary.BigEndian.Uint64(b[17:25]))
+	e.FirstHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
+	e.LastHeight = int64FromBits(binary.BigEndian.Uint64(b[9:17]))
+	e.Count = int64FromBits(binary.BigEndian.Uint64(b[17:25]))
 	return nil
 }
 
@@ -129,7 +129,7 @@ var ErrInvalidSCIDVariables = errors.New("invalid SCIDVariable slice encoding")
 func MarshalSCIDVariablesTypedAppend(dst []byte, vars []*SCIDVariable) []byte {
 	dst = append(dst, TagSCIDVariablesV1)
 	// count (BE uint32)
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(vars)))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(vars))) // #nosec G115 -- SC variable snapshots cannot approach uint32 capacity in memory.
 	for _, v := range vars {
 		dst = appendVarField(dst, v.Key)
 		dst = appendVarField(dst, v.Value)
@@ -201,7 +201,11 @@ func readVarField(b []byte, pos int) (interface{}, int, error) {
 			return nil, pos, ErrInvalidSCIDVariables
 		}
 		pos += nLen
-		end := pos + int(n)
+		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by prior slice and varint checks.
+		if n > remaining {
+			return nil, pos, ErrInvalidSCIDVariables
+		}
+		end := pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
 		if end > len(b) {
 			return nil, pos, ErrInvalidSCIDVariables
 		}
@@ -280,8 +284,8 @@ func (m *ClassMeta) MarshalTyped() []byte {
 // MarshalTypedAppend writes into dst and returns the grown slice.
 func (m *ClassMeta) MarshalTypedAppend(dst []byte) []byte {
 	dst = append(dst, TagClassMetaV1)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(m.InstallHeight))
-	dst = binary.BigEndian.AppendUint64(dst, uint64(m.LastHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(m.InstallHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(m.LastHeight))
 	dst = binary.AppendUvarint(dst, uint64(len(m.Tags)))
 	for _, t := range m.Tags {
 		dst = binary.AppendUvarint(dst, uint64(len(t)))
@@ -305,8 +309,8 @@ func (m *ClassMeta) UnmarshalTyped(b []byte) error {
 	if len(b) < classMetaMinHeaderSize || b[0] != TagClassMetaV1 {
 		return ErrInvalidClassMeta
 	}
-	m.InstallHeight = int64(binary.BigEndian.Uint64(b[1:9]))
-	m.LastHeight = int64(binary.BigEndian.Uint64(b[9:17]))
+	m.InstallHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
+	m.LastHeight = int64FromBits(binary.BigEndian.Uint64(b[9:17]))
 	pos := 17
 
 	tagCount, nLen := binary.Uvarint(b[pos:])
@@ -315,7 +319,11 @@ func (m *ClassMeta) UnmarshalTyped(b []byte) error {
 	}
 	pos += nLen
 	if tagCount > 0 {
-		m.Tags = make([]string, tagCount)
+		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by the fixed header and varint checks.
+		if tagCount > remaining {
+			return ErrInvalidClassMeta
+		}
+		m.Tags = make([]string, int(tagCount)) // #nosec G115 -- bounded by remaining bytes above.
 		for i := range m.Tags {
 			s, next, err := readLenString(b, pos)
 			if err != nil {
@@ -374,7 +382,11 @@ func readLenString(b []byte, pos int) (string, int, error) {
 		return "", pos, ErrInvalidClassMeta
 	}
 	pos += nLen
-	end := pos + int(n)
+	remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by prior slice and varint checks.
+	if n > remaining {
+		return "", pos, ErrInvalidClassMeta
+	}
+	end := pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
 	if end > len(b) {
 		return "", pos, ErrInvalidClassMeta
 	}
@@ -413,7 +425,7 @@ var ErrInvalidSCCodeEntry = errors.New("invalid SCCodeEntry encoding")
 func (e *SCCodeEntry) MarshalTyped() []byte {
 	buf := make([]byte, sccodeHeaderSize, sccodeHeaderSize+len(e.Code))
 	buf[0] = TagSCCodeEntryV1
-	binary.BigEndian.PutUint64(buf[1:9], uint64(e.InstallHeight))
+	binary.BigEndian.PutUint64(buf[1:9], int64Bits(e.InstallHeight))
 	return append(buf, e.Code...)
 }
 
@@ -421,7 +433,7 @@ func (e *SCCodeEntry) MarshalTyped() []byte {
 // hot-path callers who recycle a keyBuf-style scratch buffer.
 func (e *SCCodeEntry) MarshalTypedAppend(dst []byte) []byte {
 	dst = append(dst, TagSCCodeEntryV1)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.InstallHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.InstallHeight))
 	dst = append(dst, e.Code...)
 	return dst
 }
@@ -433,7 +445,7 @@ func (e *SCCodeEntry) UnmarshalTyped(b []byte) error {
 	if len(b) < sccodeHeaderSize || b[0] != TagSCCodeEntryV1 {
 		return ErrInvalidSCCodeEntry
 	}
-	e.InstallHeight = int64(binary.BigEndian.Uint64(b[1:9]))
+	e.InstallHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
 	e.Code = string(b[sccodeHeaderSize:])
 	return nil
 }
@@ -443,6 +455,14 @@ func (e *SCCodeEntry) UnmarshalTyped(b []byte) error {
 // the check is mostly defensive.
 func IsSCCodeEntryTyped(b []byte) bool {
 	return len(b) >= 1 && b[0] == TagSCCodeEntryV1
+}
+
+func int64Bits(n int64) uint64 {
+	return uint64(n) // #nosec G115 -- fixed-width storage preserves the int64 bit pattern.
+}
+
+func int64FromBits(n uint64) int64 {
+	return int64(n) // #nosec G115 -- inverse of int64Bits for typed storage round-trips.
 }
 
 func itoaBase10(n int64) string {
