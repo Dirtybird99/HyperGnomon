@@ -1,16 +1,16 @@
 package rpc
 
 import (
+	"fmt"
 	"testing"
 )
 
 // The RPC pool is a buffered-channel pool. Get is `<-conns`, Put is
 // `conns <- c` with an atomic.Bool guard. These benches measure the
 // raw channel-pool primitive cost independently of the `*Client`
-// instance they shuttle — so we fill the pool with typed-nil
-// pointers and never actually use the returned value. NewPool
-// requires a live daemon; we bypass it and construct Pool{} fields
-// directly for that reason.
+// instance they shuttle, so the dummy clients are never connected to
+// a daemon. NewPool requires a live daemon; we bypass it and construct
+// Pool{} fields directly for that reason.
 
 func newBenchPool(size int) *Pool {
 	p := &Pool{
@@ -18,10 +18,7 @@ func newBenchPool(size int) *Pool {
 		size:  size,
 	}
 	for i := 0; i < size; i++ {
-		// Typed-nil *Client. Put's closed-check + channel send is the
-		// only path exercised in-bench, so no Close() is ever called
-		// on these pointers.
-		p.conns <- (*Client)(nil)
+		p.conns <- &Client{Endpoint: fmt.Sprintf("bench-%d", i)}
 	}
 	return p
 }
