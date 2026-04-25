@@ -45,9 +45,9 @@ var ErrInvalidAddrSCIDEntry = errors.New("invalid AddrSCIDEntry encoding")
 func (e *AddrSCIDEntry) MarshalTyped() []byte {
 	buf := make([]byte, EncodedAddrSCIDEntrySize)
 	buf[0] = TagAddrSCIDEntryV1
-	binary.BigEndian.PutUint64(buf[1:9], uint64(e.FirstHeight))
-	binary.BigEndian.PutUint64(buf[9:17], uint64(e.LastHeight))
-	binary.BigEndian.PutUint64(buf[17:25], uint64(e.Count))
+	binary.BigEndian.PutUint64(buf[1:9], int64Bits(e.FirstHeight))
+	binary.BigEndian.PutUint64(buf[9:17], int64Bits(e.LastHeight))
+	binary.BigEndian.PutUint64(buf[17:25], int64Bits(e.Count))
 	return buf
 }
 
@@ -59,9 +59,9 @@ func (e *AddrSCIDEntry) MarshalTypedAppend(dst []byte) []byte {
 	// wants to pack multiple records (they currently don't, but the API is
 	// allocation-flexible).
 	dst = append(dst, TagAddrSCIDEntryV1)
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.FirstHeight))
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.LastHeight))
-	dst = binary.BigEndian.AppendUint64(dst, uint64(e.Count))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.FirstHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.LastHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.Count))
 	return dst
 }
 
@@ -71,9 +71,9 @@ func (e *AddrSCIDEntry) UnmarshalTyped(b []byte) error {
 	if len(b) != EncodedAddrSCIDEntrySize || b[0] != TagAddrSCIDEntryV1 {
 		return ErrInvalidAddrSCIDEntry
 	}
-	e.FirstHeight = int64(binary.BigEndian.Uint64(b[1:9]))
-	e.LastHeight = int64(binary.BigEndian.Uint64(b[9:17]))
-	e.Count = int64(binary.BigEndian.Uint64(b[17:25]))
+	e.FirstHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
+	e.LastHeight = int64FromBits(binary.BigEndian.Uint64(b[9:17]))
+	e.Count = int64FromBits(binary.BigEndian.Uint64(b[17:25]))
 	return nil
 }
 
@@ -129,7 +129,7 @@ var ErrInvalidSCIDVariables = errors.New("invalid SCIDVariable slice encoding")
 func MarshalSCIDVariablesTypedAppend(dst []byte, vars []*SCIDVariable) []byte {
 	dst = append(dst, TagSCIDVariablesV1)
 	// count (BE uint32)
-	dst = binary.BigEndian.AppendUint32(dst, uint32(len(vars)))
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(vars))) // #nosec G115 -- SC variable snapshots cannot approach uint32 capacity in memory.
 	for _, v := range vars {
 		dst = appendVarField(dst, v.Key)
 		dst = appendVarField(dst, v.Value)
@@ -201,7 +201,11 @@ func readVarField(b []byte, pos int) (interface{}, int, error) {
 			return nil, pos, ErrInvalidSCIDVariables
 		}
 		pos += nLen
-		end := pos + int(n)
+		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by prior slice and varint checks.
+		if n > remaining {
+			return nil, pos, ErrInvalidSCIDVariables
+		}
+		end := pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
 		if end > len(b) {
 			return nil, pos, ErrInvalidSCIDVariables
 		}
@@ -234,6 +238,231 @@ func toStringBest(v interface{}) string {
 	default:
 		return ""
 	}
+}
+
+// ============================================================================
+// ClassMeta — typed v1 encoding
+// ============================================================================
+//
+// Format layout:
+//
+//   byte 0           : tag 0x04
+//   bytes 1..8       : InstallHeight (BE int64)
+//   bytes 9..16      : LastHeight    (BE int64)
+//   varint           : len(Tags)
+//   for each tag     : varint-len-prefixed bytes
+//   varint+bytes     : Class
+//   varint+bytes     : Name
+//   varint+bytes     : Desc
+//   varint+bytes     : IconURL
+//   varint+bytes     : DURL
+//   varint+bytes     : Version
+//
+// Backward-compat: existing class/class_scid bucket records are msgpack
+// fixmaps (tag 0x80-0x8f) or map16 (0xde). Tag 0x04 does not collide with
+// either, so reader dispatch by byte[0] is unambiguous. See IsClassMetaTyped.
+
+const (
+	TagClassMetaV1 byte = 0x04
+
+	classMetaMinHeaderSize = 1 + 8 + 8 // tag + InstallHeight + LastHeight
+)
+
+// ErrInvalidClassMeta is returned when the wire bytes don't match the v1
+// typed ClassMeta layout.
+var ErrInvalidClassMeta = errors.New("invalid ClassMeta encoding")
+
+// MarshalTyped encodes m into a fresh byte slice. Hand the result to
+// bbolt.Put (which must hold the slice until commit — we never reuse).
+func (m *ClassMeta) MarshalTyped() []byte {
+	// Rough lower bound: header + 6 zero-length strings (1 byte each) +
+	// 1 byte tagCount. Growing amortizes into a single alloc in practice.
+	buf := make([]byte, 0, classMetaMinHeaderSize+8+len(m.Class)+len(m.Name)+len(m.Desc)+len(m.IconURL)+len(m.DURL)+len(m.Version))
+	return m.MarshalTypedAppend(buf)
+}
+
+// MarshalTypedAppend writes into dst and returns the grown slice.
+func (m *ClassMeta) MarshalTypedAppend(dst []byte) []byte {
+	dst = append(dst, TagClassMetaV1)
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(m.InstallHeight))
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(m.LastHeight))
+	dst = binary.AppendUvarint(dst, uint64(len(m.Tags)))
+	for _, t := range m.Tags {
+		dst = binary.AppendUvarint(dst, uint64(len(t)))
+		dst = append(dst, t...)
+	}
+	dst = appendLenString(dst, m.Class)
+	dst = appendLenString(dst, m.Name)
+	dst = appendLenString(dst, m.Desc)
+	dst = appendLenString(dst, m.IconURL)
+	dst = appendLenString(dst, m.DURL)
+	dst = appendLenString(dst, m.Version)
+	return dst
+}
+
+// UnmarshalTyped decodes a v1 typed ClassMeta from b. Six string fields
+// each get one allocation (unavoidable — they must outlive the bbolt View
+// that supplied b). Tags slice gets one allocation for its header plus one
+// per element string. Typical ClassMeta with 2 tags: 1+2+6 = 9 allocs,
+// vs msgpack's 11.
+func (m *ClassMeta) UnmarshalTyped(b []byte) error {
+	if len(b) < classMetaMinHeaderSize || b[0] != TagClassMetaV1 {
+		return ErrInvalidClassMeta
+	}
+	m.InstallHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
+	m.LastHeight = int64FromBits(binary.BigEndian.Uint64(b[9:17]))
+	pos := 17
+
+	tagCount, nLen := binary.Uvarint(b[pos:])
+	if nLen <= 0 {
+		return ErrInvalidClassMeta
+	}
+	pos += nLen
+	if tagCount > 0 {
+		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by the fixed header and varint checks.
+		if tagCount > remaining {
+			return ErrInvalidClassMeta
+		}
+		m.Tags = make([]string, int(tagCount)) // #nosec G115 -- bounded by remaining bytes above.
+		for i := range m.Tags {
+			s, next, err := readLenString(b, pos)
+			if err != nil {
+				return err
+			}
+			m.Tags[i] = s
+			pos = next
+		}
+	} else {
+		m.Tags = nil
+	}
+	var err error
+	if m.Class, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	if m.Name, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	if m.Desc, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	if m.IconURL, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	if m.DURL, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	if m.Version, pos, err = readLenString(b, pos); err != nil {
+		return err
+	}
+	_ = pos // trailing bytes (forward-compat slack) are ignored
+	return nil
+}
+
+// IsClassMetaTyped reports whether b is a v1 typed record. The msgpack
+// fallback range (0x80-0x8f fixmap, 0xde map16) is disjoint from 0x04.
+func IsClassMetaTyped(b []byte) bool {
+	return len(b) >= 1 && b[0] == TagClassMetaV1
+}
+
+// appendLenString writes a uvarint-prefixed string into dst.
+func appendLenString(dst []byte, s string) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(s)))
+	return append(dst, s...)
+}
+
+// readLenString reads a uvarint-prefixed string starting at pos. Returns
+// the string, next position, and any error. Shared helper for ClassMeta
+// and any future typed struct that needs the same primitive.
+func readLenString(b []byte, pos int) (string, int, error) {
+	if pos >= len(b) {
+		return "", pos, ErrInvalidClassMeta
+	}
+	n, nLen := binary.Uvarint(b[pos:])
+	if nLen <= 0 {
+		return "", pos, ErrInvalidClassMeta
+	}
+	pos += nLen
+	remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by prior slice and varint checks.
+	if n > remaining {
+		return "", pos, ErrInvalidClassMeta
+	}
+	end := pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
+	if end > len(b) {
+		return "", pos, ErrInvalidClassMeta
+	}
+	return string(b[pos:end]), end, nil
+}
+
+// ============================================================================
+// SCCodeEntry — typed v1 encoding
+// ============================================================================
+//
+// Code is the dominant payload; stash it raw after a fixed 9-byte prefix so
+// decode is one string allocation (unavoidable — the string must outlive the
+// bbolt View closure) and encode is a single append-chain, no allocation
+// beyond the eventual grow.
+//
+// Wire layout:
+//
+//   +------+------+------+------+------+------+------+------+------+--------+
+//   | 0x03 |  InstallHeight (BE 8 bytes)                            | code … |
+//   +------+------+------+------+------+------+------+------+------+--------+
+//
+// Backward compat: no legacy records — sccode is a brand-new bucket, so we
+// unconditionally use typed v1.
+
+const (
+	TagSCCodeEntryV1 byte = 0x03
+
+	sccodeHeaderSize = 1 + 8 // tag + BE InstallHeight
+)
+
+// ErrInvalidSCCodeEntry marks a decode error on a supposed SCCodeEntry.
+var ErrInvalidSCCodeEntry = errors.New("invalid SCCodeEntry encoding")
+
+// MarshalTyped encodes e into a freshly-allocated byte slice. Caller
+// hands the slice to bbolt.Put, which copies into the page.
+func (e *SCCodeEntry) MarshalTyped() []byte {
+	buf := make([]byte, sccodeHeaderSize, sccodeHeaderSize+len(e.Code))
+	buf[0] = TagSCCodeEntryV1
+	binary.BigEndian.PutUint64(buf[1:9], int64Bits(e.InstallHeight))
+	return append(buf, e.Code...)
+}
+
+// MarshalTypedAppend writes into dst, returning the grown slice. For
+// hot-path callers who recycle a keyBuf-style scratch buffer.
+func (e *SCCodeEntry) MarshalTypedAppend(dst []byte) []byte {
+	dst = append(dst, TagSCCodeEntryV1)
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(e.InstallHeight))
+	dst = append(dst, e.Code...)
+	return dst
+}
+
+// UnmarshalTyped populates e from b. One string allocation (the code); no
+// header allocations. Returns ErrInvalidSCCodeEntry on tag mismatch or
+// truncated buffer.
+func (e *SCCodeEntry) UnmarshalTyped(b []byte) error {
+	if len(b) < sccodeHeaderSize || b[0] != TagSCCodeEntryV1 {
+		return ErrInvalidSCCodeEntry
+	}
+	e.InstallHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
+	e.Code = string(b[sccodeHeaderSize:])
+	return nil
+}
+
+// IsSCCodeEntryTyped reports whether b is the v1 typed encoding. Held for
+// symmetry with the other typed detectors; sccode has no legacy records so
+// the check is mostly defensive.
+func IsSCCodeEntryTyped(b []byte) bool {
+	return len(b) >= 1 && b[0] == TagSCCodeEntryV1
+}
+
+func int64Bits(n int64) uint64 {
+	return uint64(n) // #nosec G115 -- fixed-width storage preserves the int64 bit pattern.
+}
+
+func int64FromBits(n uint64) int64 {
+	return int64(n) // #nosec G115 -- inverse of int64Bits for typed storage round-trips.
 }
 
 func itoaBase10(n int64) string {

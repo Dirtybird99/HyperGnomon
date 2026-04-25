@@ -46,6 +46,8 @@ type Storage interface {
 	// Queries
 	GetAllSCIDs() ([]string, error)
 	GetAllOwnersAndSCIDs() (map[string]string, error)
+	GetSCIDCount() (int64, error)
+	GetOwnersForSCIDs(scids []string) (map[string]string, error)
 	GetInvalidSCIDDeploys() (map[string]uint64, error)
 	GetTxCounts() (reg, burn, norm int64, err error)
 	GetNormalTxWithSCIDByAddr(addr string) ([]*structures.NormalTXWithSCIDParse, error)
@@ -69,6 +71,36 @@ type Storage interface {
 
 	// Address reverse index — SCIDs touched by an address.
 	GetAddressSCIDs(addr string) (map[string]*structures.AddrSCIDEntry, error)
+
+	// Ratings extracted from scvars. Canonical TELA format: STORE keys that
+	// equal a DERO address, hex-encoded `"<score>_<height>"` values. height
+	// <= 0 resolves to the latest snapshot for scid.
+	GetRatingsForSCID(scid string, height int64) ([]structures.Rating, error)
+
+	// Rating aggregates: the `likes` and `dislikes` STORE keys that the
+	// TELA Rate() entrypoint maintains. Cheap read, independent of per-rater
+	// enumeration.
+	GetRatingSummary(scid string, height int64) (*structures.RatingSummary, error)
+	GetRatingsAndSummaryForSCID(scid string, height int64) ([]structures.Rating, *structures.RatingSummary, error)
+
+	// Owner → SCIDs reverse lookup for listsc_byowner / getscidlist_byaddr.
+	// Populated from WriteBatch.OwnerSCIDs at install time.
+	GetSCIDsByOwner(owner string) ([]string, error)
+
+	// TELA content cache (2-tier with api/tela_content.go's in-memory LRU).
+	GetTELAContent(scid, path string) (*structures.TELAContentEntry, error)
+	PutTELAContent(scid, path string, entry *structures.TELAContentEntry) error
+	DeleteTELAContentForSCID(scid string) error
+
+	// SC code snapshots (install-time DVM code). Backfill path is
+	// indexer.GetSCCode; direct Put is exposed for tests + lazy-fill.
+	GetSCCode(scid string) (*structures.SCCodeEntry, error)
+	PutSCCode(scid string, entry *structures.SCCodeEntry) error
+
+	// ResetIndex drops every index bucket so the next indexer startup
+	// rescans from height 0. Block-hash history is kept so reorg-detection
+	// replay still works. Intended for the `hypergnomon resync` subcommand.
+	ResetIndex() error
 }
 
 // WriteBatch accumulates writes across multiple blocks for atomic commit.
@@ -104,6 +136,16 @@ type WriteBatch struct {
 	// bucket. FirstHeight=oldest, LastHeight=newest in batch, Count=delta.
 	// FlushBatch merges with existing entries (min/max/sum).
 	AddrSCIDs map[string]map[string]*structures.AddrSCIDEntry
+
+	// SCCodes: scid -> install-time code snapshot. Populated at install time
+	// and on lazy backfill reads. Write-once per scid (DERO code is
+	// immutable); duplicates in one batch coalesce on the map.
+	SCCodes map[string]*structures.SCCodeEntry
+
+	// OwnerSCIDs: owner address → set of SCIDs installed by that owner.
+	// Populated at install time and read by listsc_byowner /
+	// getscidlist_byaddr. The nested map is a set — value is struct{}.
+	OwnerSCIDs map[string]map[string]struct{}
 }
 
 // batchPool recycles WriteBatch instances. At steady state, a batch is pulled,
@@ -128,6 +170,8 @@ func newEmptyBatch() *WriteBatch {
 		Installs:     make(map[string]*structures.InstallRecord, 4),
 		Classes:      make(map[string]*structures.ClassMeta, 8),
 		AddrSCIDs:    make(map[string]map[string]*structures.AddrSCIDEntry, 16),
+		SCCodes:      make(map[string]*structures.SCCodeEntry, 4),
+		OwnerSCIDs:   make(map[string]map[string]struct{}, 16),
 	}
 }
 
@@ -153,6 +197,19 @@ func PutWriteBatch(b *WriteBatch) {
 // AddOwner adds an owner record to the batch.
 func (b *WriteBatch) AddOwner(scid, owner string) {
 	b.Owners[scid] = owner
+	// Keep the reverse index in lockstep — listsc_byowner reads this.
+	if owner == "" || scid == "" {
+		return
+	}
+	if b.OwnerSCIDs == nil {
+		b.OwnerSCIDs = make(map[string]map[string]struct{}, 4)
+	}
+	set, ok := b.OwnerSCIDs[owner]
+	if !ok {
+		set = make(map[string]struct{}, 2)
+		b.OwnerSCIDs[owner] = set
+	}
+	set[scid] = struct{}{}
 }
 
 // AddInvocation adds an invocation record to the batch.
@@ -194,6 +251,23 @@ func (b *WriteBatch) AddInstall(scid string, height int64, rec *structures.Insta
 // invokes that update metadata (e.g. TELA version bump).
 func (b *WriteBatch) AddClass(scid string, meta *structures.ClassMeta) {
 	b.Classes[scid] = meta
+}
+
+// AddSCCode records the install-time DVM code for scid. Called from the four
+// indexer install sites and from the lazy-backfill path when an existing
+// SCID gets its first read. Empty code strings are dropped — the populate
+// guards are all upstream, but defense in depth keeps the bucket clean.
+func (b *WriteBatch) AddSCCode(scid string, installHeight int64, code string) {
+	if scid == "" || code == "" {
+		return
+	}
+	if b.SCCodes == nil {
+		b.SCCodes = make(map[string]*structures.SCCodeEntry, 4)
+	}
+	b.SCCodes[scid] = &structures.SCCodeEntry{
+		Code:          code,
+		InstallHeight: installHeight,
+	}
 }
 
 // AddAddrSCID records a single interaction of addr touching scid at height.
@@ -269,6 +343,8 @@ func (b *WriteBatch) Reset() {
 	clear(b.Installs)
 	clear(b.Classes)
 	clear(b.AddrSCIDs)
+	clear(b.SCCodes)
+	clear(b.OwnerSCIDs)
 	b.RegTxCount = 0
 	b.BurnTxCount = 0
 	b.NormTxCount = 0

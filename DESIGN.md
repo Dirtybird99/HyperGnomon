@@ -2,7 +2,7 @@
 
 **Realtime query layer for DERO client applications.**
 
-Status: design, not implemented. See milestones (§14) for sequencing.
+Status: **partially implemented**. v0.8 and v0.9 shipped M0 + M1 + M5 and partial M3. M2 truncate-replay is deferred to v1.x — see §14 for per-milestone status. See [README.md](README.md) for the current shipped feature surface and [CHANGELOG.md](CHANGELOG.md) for what landed when.
 
 ## 0. Why Route B
 
@@ -308,21 +308,19 @@ Multi-prefix daemon connect (`http/https/ws/wss`) is a small change in `rpc/clie
 
 Each milestone is shippable on its own. Rough estimates assume one developer.
 
-| # | Milestone | Size | Unlocks |
+| # | Milestone | Status | Notes |
 |---|---|---|---|
-| M0 | Wire `ClassifySC`, block-hash bucket, `safe_height`, addr reverse index, inject logger | 1 wk | foundation for everything |
-| M1 | Subscription API: event bus, WS methods, filter engine, backfill, disconnect cleanup | 2 wk | realtime push for Commando et al. |
-| M2 | Reorg detection + truncate-replay, `reorg` events, fake-daemon test harness | 1.5 wk | safe atomic-swap primitive |
-| M3 | civilware ports (addscid_toindex, listsc_*, multi-prefix daemon) | 2 wk (parallel) | feature parity |
-| M4 | Query cost estimator, token bucket, `explain` method | 1 wk | public-facing viable |
-| M5 | TELA content server + 2-tier cache | 1 wk | PureWolf/Commando consolidation |
-| M6 | Mempool speculative path + reconcile loop | 2 wk | sub-10 s new-SC visibility |
-| M7 | Embedded mode: logger injection, ctx cancel, snapshot export/import | 1.5 wk | mobile + tests + bootstrap |
-| M8 | Ops polish: metrics, health, config file, grafana dash | 1 wk | production-ready |
+| M0 | Wire `ClassifySC`, block-hash bucket, `safe_height`, addr reverse index, inject logger | **done** (v0.8) | foundation for everything |
+| M1 | Subscription API: event bus, WS methods, filter engine, backfill, disconnect cleanup | **done** (v0.8/v0.9) | realtime push |
+| M2 | Reorg detection + truncate-replay, `reorg` events, fake-daemon test harness | **partial / deferred** | Detection (`SafeHeight` atomic, `CheckReorgAt` stub) shipped in v0.9; truncate-replay deferred to v1.x. Rationale: DERO `STABLE_LIMIT=8` + DAG side-block absorption means reorgs are rare and shallow; civilware/Gnomon ships zero reorg handling, operators use manual `pop`. Our `resync` subcommand covers the operator path. |
+| M3 | civilware ports (addscid_toindex, listsc_*, multi-prefix daemon) | **partial** | core list methods + multi-prefix in v0.9; HOLOGRAM extras (SCIDTagStore, `resolvedurl`, `gettelaapps`) tracked for v1.x |
+| M4 | Query cost estimator, token bucket, `explain` method | pending | public-facing viability |
+| M5 | TELA content server + 2-tier cache | **done** (v1.0) | canonical-spec compliant: base64+gunzip `.gz`, DocShard dispatch, `X-TELA-Verify` header (signature presence in v1.0; crypto check in v1.1) |
+| M6 | Mempool speculative path + reconcile loop | pending | sub-10 s new-SC visibility |
+| M7 | Embedded mode: logger injection, ctx cancel, snapshot export/import | **partial** (v1.0) | `pkg/gnomes` civilware-shape drop-in shipped; external-store injection + snapshot import/export in v1.1 |
+| M8 | Ops polish: metrics, health, config file, grafana dash | pending | production polish |
 
-Total ~12 weeks serial; M3 runs parallel to M1 so calendar target is ~10 weeks.
-
-**First PR to merge:** M0. It is the prerequisite for everything else and delivers immediate /api/tela speedup on its own.
+**Shipped to date (v1.0 RC):** M0, M1, M5 complete; M2, M3, M7 partial. The §3-§4 design is normative for what has shipped; §6 + §8 remain forward-looking.
 
 ## 15. Risks & open questions
 

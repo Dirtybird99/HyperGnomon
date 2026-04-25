@@ -121,6 +121,8 @@ type ClassMeta struct {
 	Name          string   `msgpack:"name,omitempty"`
 	Desc          string   `msgpack:"desc,omitempty"`
 	IconURL       string   `msgpack:"icon,omitempty"`
+	DURL          string   `msgpack:"durl,omitempty"`
+	Version       string   `msgpack:"version,omitempty"`
 	InstallHeight int64    `msgpack:"install_h"`
 	LastHeight    int64    `msgpack:"last_h"`
 }
@@ -148,4 +150,47 @@ type ClassInstall struct {
 	SCID          string
 	InstallHeight int64
 	Meta          *ClassMeta
+}
+
+// SCCodeEntry is the install-time smart contract code snapshot, keyed by
+// scid. DERO SC code is immutable once installed, so this is a write-once
+// record. Populated on install (four sites in the indexer) and lazily
+// backfilled on first read for SCIDs indexed before the sccode bucket
+// existed.
+type SCCodeEntry struct {
+	Code          string `msgpack:"code"`
+	InstallHeight int64  `msgpack:"h"`
+}
+
+// TELAContentEntry is the durable cache value for one (scid, path) pair. The
+// ETag is the sha256 hex of Body — precomputed so every cache hit is a
+// zero-alloc 304 comparison.
+type TELAContentEntry struct {
+	Body   []byte `msgpack:"body"`
+	MIME   string `msgpack:"mime,omitempty"`
+	ETag   string `msgpack:"etag,omitempty"`
+	Height int64  `msgpack:"h"`
+}
+
+// Rating (spec reference above) — this older godoc block is kept purely
+// so that grep finds the historical comment for future archeology. The
+// actual type is declared immediately below.
+// Rating is one rater's score on a TELA INDEX/DOC contract.
+//
+// Per the canonical TELA spec (github.com/civilware/tela), the STORE key
+// is the rater's wallet address; the value is hex-encoded `"<score>_<height>"`.
+// Score is 0-99. No comment field: ratings do not carry a message.
+type Rating struct {
+	Rater  string  `json:"rater"`
+	Score  float64 `json:"score"`
+	Height int64   `json:"height"`
+}
+
+// RatingSummary aggregates the `likes` / `dislikes` counters that the TELA
+// Rate() entrypoint maintains as separate STORE keys. Height is the snapshot
+// height the counters were read at.
+type RatingSummary struct {
+	Height   int64  `json:"height"`
+	Likes    uint64 `json:"likes"`
+	Dislikes uint64 `json:"dislikes"`
 }

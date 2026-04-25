@@ -123,6 +123,51 @@ func TestBus_MultipleSubs(t *testing.T) {
 	}
 }
 
+func TestBus_SpeculativeOptIn(t *testing.T) {
+	b := New(16)
+	go b.Run()
+	defer b.Close()
+
+	_, chDefault, cancelDefault := b.Subscribe(Filter{})
+	defer cancelDefault()
+	_, chSpec, cancelSpec := b.Subscribe(Filter{IncludeSpeculative: true})
+	defer cancelSpec()
+
+	b.Publish(Event{Type: EventInstall, SCID: "sp", Speculative: true})
+	b.Publish(Event{Type: EventInstall, SCID: "fin", Speculative: false})
+	b.WaitForDrain(time.Second)
+
+	// Default sub: only the finalized event.
+	seenDefault := drain(chDefault, 200*time.Millisecond)
+	if len(seenDefault) != 1 || seenDefault[0].SCID != "fin" {
+		t.Fatalf("default sub expected [fin], got %+v", seenDefault)
+	}
+
+	// Opt-in sub: both.
+	seenSpec := drain(chSpec, 200*time.Millisecond)
+	if len(seenSpec) != 2 {
+		t.Fatalf("speculative sub expected 2 events, got %d: %+v", len(seenSpec), seenSpec)
+	}
+}
+
+// drain reads all events available on ch within d. Used by tests that need
+// to assert "at most N events" with an upper time bound.
+func drain(ch <-chan Event, d time.Duration) []Event {
+	deadline := time.After(d)
+	var out []Event
+	for {
+		select {
+		case e, ok := <-ch:
+			if !ok {
+				return out
+			}
+			out = append(out, e)
+		case <-deadline:
+			return out
+		}
+	}
+}
+
 func TestBus_CancelClosesChannel(t *testing.T) {
 	b := New(16)
 	go b.Run()

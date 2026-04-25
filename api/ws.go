@@ -145,10 +145,31 @@ func NewWSServer(addr string, store storage.Storage, safeHeight *atomic.Int64, b
 		"listsc_byclass":   ws.handleListSCByClass,
 		"listsc_variables": ws.handleListSCVariables,
 		"listsc_hardcoded": ws.handleListSCHardcoded,
+		"listsc_ratings":   ws.handleListSCRatings,
 
 		// addscid_toindex: on-demand import of a single SCID. Useful for
 		// contracts not registered in GnomonSC. Port of civilware/Gnomon.
 		"addscid_toindex": ws.handleAddSCIDToIndex,
+
+		// GetInitialSCIDCode: install-time code for scid. Drop-in compat
+		// with simple-gnomon's method of the same name. Reads from the
+		// sccode bucket with lazy-backfill via the RPC pool for SCIDs
+		// indexed before the bucket existed.
+		"GetInitialSCIDCode": ws.handleGetInitialSCIDCode,
+
+		// validatesc: diagnostic — run ClassifySC + header/TELA-field
+		// extraction on a single scid and return the full class shape.
+		// Useful for operators debugging why a contract is/isn't
+		// classified as expected.
+		"validatesc": ws.handleValidateSC,
+
+		// listsc_byowner: SCIDs installed by a given wallet address.
+		// Reads the reverse owner→scid index populated at install time.
+		"listsc_byowner": ws.handleListSCByOwner,
+
+		// getscidlist_byaddr: alias of listsc_byowner for civilware naming
+		// compatibility (both spellings appear in upstream client code).
+		"getscidlist_byaddr": ws.handleListSCByOwner,
 	}
 	return ws
 }
@@ -423,8 +444,8 @@ func (ws *WSServer) handleGetAllSCIDInvokeDetails(_ *connContext, raw json.RawMe
 // subscribeParams describes the subscribe request payload. Events is a list
 // of wire-level event-type names; unknown names are skipped silently. Filters
 // holds the scalar AND-filters (scid/owner/sender/class). IncludeSpeculative
-// is accepted for forward compatibility but currently ignored — M1 only
-// publishes finalized events.
+// opts into mempool-derived events once they start publishing (M6); the bus
+// filter drops speculative events for subscribers who didn't opt in.
 type subscribeParams struct {
 	Events             []string               `json:"events"`
 	Filters            map[string]interface{} `json:"filters"`
@@ -503,7 +524,7 @@ func (ws *WSServer) handleSubscribe(cctx *connContext, raw json.RawMessage) (int
 // accept missing or explicit-empty keys without imposing a rigid struct on
 // clients.
 func buildFilter(p subscribeParams) eventbus.Filter {
-	f := eventbus.Filter{}
+	f := eventbus.Filter{IncludeSpeculative: p.IncludeSpeculative}
 	if len(p.Events) > 0 {
 		f.Events = make(map[eventbus.EventType]struct{}, len(p.Events))
 		for _, name := range p.Events {
@@ -679,12 +700,16 @@ func (ws *WSServer) handleListSC(_ *connContext, raw json.RawMessage) (interface
 
 		// Owners lookup only needed for the window we return. Do it once
 		// and index by SCID so we don't re-query per row.
-		owners, err := ws.store.GetAllOwnersAndSCIDs()
+		win := sliceWindow(total, p.Offset, limit)
+		windowSCIDs := make([]string, 0, win.end-win.start)
+		for i := win.start; i < win.end; i++ {
+			windowSCIDs = append(windowSCIDs, installs[i].SCID)
+		}
+		owners, err := ws.store.GetOwnersForSCIDs(windowSCIDs)
 		if err != nil {
 			return nil, internalErr(err)
 		}
 
-		win := sliceWindow(total, p.Offset, limit)
 		results := make([]listSCResult, 0, win.end-win.start)
 		for i := win.start; i < win.end; i++ {
 			inst := installs[i]
@@ -775,7 +800,11 @@ func (ws *WSServer) handleListSCByHeight(_ *connContext, raw json.RawMessage) (i
 	if err != nil {
 		return nil, internalErr(err)
 	}
-	owners, err := ws.store.GetAllOwnersAndSCIDs()
+	scids := make([]string, 0, len(installs))
+	for _, inst := range installs {
+		scids = append(scids, inst.SCID)
+	}
+	owners, err := ws.store.GetOwnersForSCIDs(scids)
 	if err != nil {
 		return nil, internalErr(err)
 	}
@@ -836,7 +865,11 @@ func (ws *WSServer) handleListSCByClass(_ *connContext, raw json.RawMessage) (in
 	if err != nil {
 		return nil, internalErr(err)
 	}
-	owners, err := ws.store.GetAllOwnersAndSCIDs()
+	scids := make([]string, 0, len(installs))
+	for _, inst := range installs {
+		scids = append(scids, inst.SCID)
+	}
+	owners, err := ws.store.GetOwnersForSCIDs(scids)
 	if err != nil {
 		return nil, internalErr(err)
 	}
@@ -925,6 +958,63 @@ func (ws *WSServer) handleListSCVariables(_ *connContext, raw json.RawMessage) (
 		SCID:      p.SCID,
 		Height:    height,
 		Variables: rows,
+	}, nil
+}
+
+// listSCRatingsParams selects the SCID and (optional) snapshot height. height
+// <= 0 resolves to the latest snapshot — same semantics as listsc_variables.
+type listSCRatingsParams struct {
+	SCID   string `json:"scid"`
+	Height int64  `json:"height,omitempty"`
+}
+
+// listSCRatingsResponse is the wire shape for listsc_ratings. Mirrors the
+// REST /api/tela/{scid}/ratings envelope so clients can share code.
+type listSCRatingsResponse struct {
+	SCID    string              `json:"scid"`
+	Height  int64               `json:"height"`
+	Ratings []structures.Rating `json:"ratings"`
+	Count   int                 `json:"count"`
+	Avg     float64             `json:"avg"`
+}
+
+// handleListSCRatings returns TELA ratings for the given SCID as stored in
+// scvars. Intended for TELA app UIs that want inline rating display without
+// issuing a second REST call.
+func (ws *WSServer) handleListSCRatings(_ *connContext, raw json.RawMessage) (interface{}, *jsonRPCError) {
+	var p listSCRatingsParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
+	}
+	if !isValidSCID(p.SCID) {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid scid"}
+	}
+
+	ratings, err := ws.store.GetRatingsForSCID(p.SCID, p.Height)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	if ratings == nil {
+		ratings = []structures.Rating{}
+	}
+	height := p.Height
+	if height <= 0 && len(ratings) > 0 {
+		height = ratings[0].Height
+	}
+	var sum float64
+	for _, r := range ratings {
+		sum += r.Score
+	}
+	var avg float64
+	if len(ratings) > 0 {
+		avg = sum / float64(len(ratings))
+	}
+	return listSCRatingsResponse{
+		SCID:    p.SCID,
+		Height:  height,
+		Ratings: ratings,
+		Count:   len(ratings),
+		Avg:     avg,
 	}, nil
 }
 
@@ -1068,6 +1158,180 @@ func (ws *WSServer) handleAddSCIDToIndex(_ *connContext, raw json.RawMessage) (i
 // isValidSCID tests the DERO 32-byte (64-hex) SCID shape. Anything else is
 // rejected up front with -32602 so we never hand a bad hex string to the
 // daemon.
+// getInitialSCIDCodeParams is the wire shape for GetInitialSCIDCode.
+type getInitialSCIDCodeParams struct {
+	SCID string `json:"scid"`
+}
+
+// getInitialSCIDCodeResult is the wire shape for GetInitialSCIDCode.
+// Mirrors the REST /api/initialscidcode envelope so clients can share a
+// decoder. code is the raw DVM source; install_height is the best-known
+// height (exact on forward-populated entries, chain-tip-at-backfill for
+// pre-feature SCIDs).
+type getInitialSCIDCodeResult struct {
+	SCID          string `json:"scid"`
+	Code          string `json:"code"`
+	InstallHeight int64  `json:"install_height"`
+}
+
+// handleGetInitialSCIDCode is the WS entry for simple-gnomon interop. Routes
+// through idx.GetSCCode so both REST and WS share the lazy-backfill path
+// and its single-flight guarantee.
+func (ws *WSServer) handleGetInitialSCIDCode(_ *connContext, raw json.RawMessage) (interface{}, *jsonRPCError) {
+	if ws.idx == nil {
+		return nil, &jsonRPCError{Code: codeInternalError, Message: "indexer not configured"}
+	}
+	var p getInitialSCIDCodeParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
+	}
+	if !isValidSCID(p.SCID) {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid scid"}
+	}
+	entry, err := ws.idx.GetSCCode(p.SCID)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	if entry == nil {
+		return nil, &jsonRPCError{Code: codeNotFound, Message: "scid not found"}
+	}
+	return getInitialSCIDCodeResult{
+		SCID:          p.SCID,
+		Code:          entry.Code,
+		InstallHeight: entry.InstallHeight,
+	}, nil
+}
+
+// validateSCParams is the wire shape for validatesc. Accepts just the scid.
+type validateSCParams struct {
+	SCID string `json:"scid"`
+}
+
+// validateSCResult mirrors ClassMeta + the dynamic SCClass fields so
+// operators can see everything the classifier decided. Populated fields
+// only (JSON omitempty) so a report on an UNKNOWN scid doesn't carry
+// noise like empty strings for 10 fields.
+type validateSCResult struct {
+	SCID     string   `json:"scid"`
+	Found    bool     `json:"found"`
+	Class    string   `json:"class,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Desc     string   `json:"description,omitempty"`
+	IconURL  string   `json:"icon,omitempty"`
+	DURL     string   `json:"durl,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	DocType  string   `json:"doc_type,omitempty"`
+	Mods     []string `json:"mods,omitempty"`
+	DocShard bool     `json:"doc_shard,omitempty"`
+	VarCount int      `json:"var_count"`
+	Height   int64    `json:"height"`
+}
+
+// handleValidateSC re-runs ClassifySC on a requested scid and returns the
+// full classification diagnostic. Reads only — no writes. Useful to verify
+// what the indexer thinks of a specific contract without grepping scvars
+// manually. Falls back to current-vars-only classification when the code
+// isn't in the sccode bucket (we don't touch the daemon here).
+func (ws *WSServer) handleValidateSC(_ *connContext, raw json.RawMessage) (interface{}, *jsonRPCError) {
+	var p validateSCParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
+	}
+	if !isValidSCID(p.SCID) {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid scid"}
+	}
+	meta, err := ws.store.GetSCIDClass(p.SCID)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	if meta == nil {
+		return validateSCResult{SCID: p.SCID, Found: false}, nil
+	}
+	vars, _ := ws.store.GetSCIDVariableDetailsAtHeight(p.SCID, meta.LastHeight)
+	// Convert to map so we can run the dynamic-field extractors (docType,
+	// mods, docShard) that ClassMeta doesn't currently store.
+	varsMap := make(map[string]interface{}, len(vars))
+	for _, v := range vars {
+		if k, ok := v.Key.(string); ok {
+			varsMap[k] = v.Value
+		}
+	}
+	// ClassifySC with empty code produces the UNKNOWN class but still runs
+	// the TELA-field extractors — so sc.DocType / sc.Mods / sc.DocShard
+	// come from here, while class/name/desc/icon/durl/version come from
+	// the stored ClassMeta (authoritative, populated at probe time with
+	// fresh vars the fast-path ordering skipped).
+	sc := indexer.ClassifySC(p.SCID, "", varsMap)
+	return validateSCResult{
+		SCID:     p.SCID,
+		Found:    true,
+		Class:    meta.Class,
+		Tags:     meta.Tags,
+		Name:     meta.Name,
+		Desc:     meta.Desc,
+		IconURL:  meta.IconURL,
+		DURL:     meta.DURL,
+		Version:  meta.Version,
+		DocType:  sc.DocType,
+		Mods:     sc.Mods,
+		DocShard: sc.DocShard,
+		VarCount: len(vars),
+		Height:   meta.LastHeight,
+	}, nil
+}
+
+// listSCByOwnerParams is the wire shape for listsc_byowner / getscidlist_byaddr.
+type listSCByOwnerParams struct {
+	Owner string `json:"owner"`
+}
+
+// listSCByOwnerEntry carries one scid + its ClassMeta Name + Class for
+// quick client-side rendering.
+type listSCByOwnerEntry struct {
+	SCID  string `json:"scid"`
+	Class string `json:"class,omitempty"`
+	Name  string `json:"name,omitempty"`
+}
+
+// listSCByOwnerResponse is the envelope.
+type listSCByOwnerResponse struct {
+	Owner string               `json:"owner"`
+	SCIDs []listSCByOwnerEntry `json:"scids"`
+	Count int                  `json:"count"`
+}
+
+// handleListSCByOwner reads the reverse owner→scid index populated at
+// install time. Returns each scid plus its current class + name.
+// getscidlist_byaddr dispatches through this same handler.
+func (ws *WSServer) handleListSCByOwner(_ *connContext, raw json.RawMessage) (interface{}, *jsonRPCError) {
+	var p listSCByOwnerParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
+	}
+	if p.Owner == "" {
+		return nil, &jsonRPCError{Code: codeInvalidParams, Message: "missing owner"}
+	}
+	scids, err := ws.store.GetSCIDsByOwner(p.Owner)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	out := listSCByOwnerResponse{
+		Owner: p.Owner,
+		SCIDs: make([]listSCByOwnerEntry, 0, len(scids)),
+	}
+	for _, scid := range scids {
+		entry := listSCByOwnerEntry{SCID: scid}
+		if meta, err := ws.store.GetSCIDClass(scid); err == nil && meta != nil {
+			entry.Class = meta.Class
+			entry.Name = meta.Name
+		}
+		out.SCIDs = append(out.SCIDs, entry)
+	}
+	out.Count = len(out.SCIDs)
+	return out, nil
+}
+
 func isValidSCID(s string) bool {
 	if len(s) != 64 {
 		return false
