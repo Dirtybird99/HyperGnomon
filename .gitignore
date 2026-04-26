@@ -43,3 +43,7 @@ vendor/
 # Segments temp (parallel sync)
 segments/
 bench-*.txt
+
+# Local agent/temp artifacts
+.claude/
+.tmp_*
