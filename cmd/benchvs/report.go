@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -11,6 +12,8 @@ import (
 // invocations (one per indexer) produce a side-by-side document.
 type Result struct {
 	Name           string
+	TargetRef      string
+	Trial          int
 	Binary         string
 	Daemon         string
 	GoVersion      string
@@ -27,6 +30,7 @@ type Result struct {
 	ProbePaths     []string
 	Latency        []PathLatency
 	ClassifyTiming string
+	LogPath        string
 }
 
 // writeReport appends a markdown section describing r to path. On
@@ -98,6 +102,88 @@ func writeReport(path string, r Result) error {
 	}
 
 	return nil
+}
+
+type jsonResult struct {
+	Name           string        `json:"name"`
+	TargetRef      string        `json:"target_ref"`
+	Trial          int           `json:"trial"`
+	Binary         string        `json:"binary"`
+	Daemon         string        `json:"daemon"`
+	GoVersion      string        `json:"go_version"`
+	HostOS         string        `json:"host_os"`
+	Timestamp      string        `json:"timestamp"`
+	TipReached     bool          `json:"tip_reached"`
+	TimeToTipMS    int64         `json:"time_to_tip_ms"`
+	ReadyPattern   string        `json:"ready_pattern"`
+	ReadyReached   bool          `json:"ready_reached"`
+	TimeToReadyMS  int64         `json:"time_to_ready_ms"`
+	DBBytes        int64         `json:"db_bytes"`
+	ProbeDuration  string        `json:"probe_duration"`
+	ProbeWorkers   int           `json:"probe_workers"`
+	ProbePaths     []string      `json:"probe_paths"`
+	Latency        []jsonLatency `json:"latency"`
+	ClassifyTiming string        `json:"classify_timing"`
+	LogPath        string        `json:"log_path"`
+}
+
+type jsonLatency struct {
+	Path   string `json:"path"`
+	N      int    `json:"n"`
+	Errors int    `json:"errors"`
+	P50MS  int64  `json:"p50_ms"`
+	P95MS  int64  `json:"p95_ms"`
+	P99MS  int64  `json:"p99_ms"`
+	MaxMS  int64  `json:"max_ms"`
+}
+
+func appendJSONReport(path string, r Result) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) // #nosec G304 -- report path is operator-selected output.
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	targetRef := r.TargetRef
+	if targetRef == "" {
+		targetRef = r.Name
+	}
+	row := jsonResult{
+		Name:           r.Name,
+		TargetRef:      targetRef,
+		Trial:          r.Trial,
+		Binary:         r.Binary,
+		Daemon:         r.Daemon,
+		GoVersion:      r.GoVersion,
+		HostOS:         r.HostOS,
+		Timestamp:      r.Timestamp,
+		TipReached:     r.TipReached,
+		TimeToTipMS:    r.TimeToTip.Milliseconds(),
+		ReadyPattern:   r.ReadyPattern,
+		ReadyReached:   r.ReadyReached,
+		TimeToReadyMS:  r.TimeToReady.Milliseconds(),
+		DBBytes:        r.DBBytes,
+		ProbeDuration:  r.ProbeDuration.String(),
+		ProbeWorkers:   r.ProbeWorkers,
+		ProbePaths:     append([]string(nil), r.ProbePaths...),
+		ClassifyTiming: r.ClassifyTiming,
+		LogPath:        r.LogPath,
+	}
+	row.Latency = make([]jsonLatency, 0, len(r.Latency))
+	for _, lat := range r.Latency {
+		row.Latency = append(row.Latency, jsonLatency{
+			Path:   lat.Path,
+			N:      lat.N,
+			Errors: lat.Errors,
+			P50MS:  lat.P50.Milliseconds(),
+			P95MS:  lat.P95.Milliseconds(),
+			P99MS:  lat.P99.Milliseconds(),
+			MaxMS:  lat.Max.Milliseconds(),
+		})
+	}
+
+	enc := json.NewEncoder(f)
+	return enc.Encode(row)
 }
 
 // humanBytes formats a byte count into a compact human-readable
