@@ -30,7 +30,7 @@ var benchClass = ClassMeta{
 
 func BenchmarkInstallRecord_Marshal_Msgpack(b *testing.B) {
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		_, err := msgpack.Marshal(&benchInstall)
 		if err != nil {
 			b.Fatal(err)
@@ -42,7 +42,7 @@ func BenchmarkInstallRecord_Unmarshal_Msgpack(b *testing.B) {
 	blob, _ := msgpack.Marshal(&benchInstall)
 	b.ResetTimer()
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		var r InstallRecord
 		if err := msgpack.Unmarshal(blob, &r); err != nil {
 			b.Fatal(err)
@@ -50,9 +50,36 @@ func BenchmarkInstallRecord_Unmarshal_Msgpack(b *testing.B) {
 	}
 }
 
+func BenchmarkInstallRecord_Marshal_Typed(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		benchSinkBytes = benchInstall.MarshalTyped()
+	}
+}
+
+func BenchmarkInstallRecord_MarshalTypedAppend(b *testing.B) {
+	buf := make([]byte, 0, 160)
+	b.ReportAllocs()
+	for b.Loop() {
+		benchSinkBytes = benchInstall.MarshalTypedAppend(buf[:0])
+	}
+}
+
+func BenchmarkInstallRecord_Unmarshal_Typed(b *testing.B) {
+	blob := benchInstall.MarshalTyped()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r InstallRecord
+		if err := r.UnmarshalTyped(blob); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkClassMeta_Marshal_Msgpack(b *testing.B) {
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		_, err := msgpack.Marshal(&benchClass)
 		if err != nil {
 			b.Fatal(err)
@@ -64,7 +91,7 @@ func BenchmarkClassMeta_Unmarshal_Msgpack(b *testing.B) {
 	blob, _ := msgpack.Marshal(&benchClass)
 	b.ResetTimer()
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		var r ClassMeta
 		if err := msgpack.Unmarshal(blob, &r); err != nil {
 			b.Fatal(err)
@@ -77,8 +104,8 @@ func BenchmarkClassMeta_Unmarshal_Msgpack(b *testing.B) {
 // Target: strictly fewer ns/op and fewer allocs.
 func BenchmarkClassMeta_Marshal_Typed(b *testing.B) {
 	b.ReportAllocs()
-	for range b.N {
-		_ = benchClass.MarshalTyped()
+	for b.Loop() {
+		benchSinkBytes = benchClass.MarshalTyped()
 	}
 }
 
@@ -86,7 +113,7 @@ func BenchmarkClassMeta_Unmarshal_Typed(b *testing.B) {
 	blob := benchClass.MarshalTyped()
 	b.ResetTimer()
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		var r ClassMeta
 		if err := r.UnmarshalTyped(blob); err != nil {
 			b.Fatal(err)
@@ -102,8 +129,8 @@ func BenchmarkClassMeta_MarshalTypedAppend(b *testing.B) {
 	// Big enough that no iteration re-grows the underlying array.
 	buf := make([]byte, 0, 512)
 	b.ReportAllocs()
-	for range b.N {
-		_ = benchClass.MarshalTypedAppend(buf[:0])
+	for b.Loop() {
+		benchSinkBytes = benchClass.MarshalTypedAppend(buf[:0])
 	}
 }
 
@@ -123,7 +150,7 @@ var benchSCTXParseTurbo = SCTXParse{
 
 func BenchmarkSCTXParse_Turbo_Marshal_Msgpack(b *testing.B) {
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		_, err := msgpack.Marshal(&benchSCTXParseTurbo)
 		if err != nil {
 			b.Fatal(err)
@@ -135,9 +162,36 @@ func BenchmarkSCTXParse_Turbo_Unmarshal_Msgpack(b *testing.B) {
 	blob, _ := msgpack.Marshal(&benchSCTXParseTurbo)
 	b.ResetTimer()
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		var r SCTXParse
 		if err := msgpack.Unmarshal(blob, &r); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSCTXParse_Turbo_Marshal_Typed(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		benchSinkBytes = benchSCTXParseTurbo.MarshalTurboTyped()
+	}
+}
+
+func BenchmarkSCTXParse_Turbo_MarshalTypedAppend(b *testing.B) {
+	buf := make([]byte, 0, 320)
+	b.ReportAllocs()
+	for b.Loop() {
+		benchSinkBytes = benchSCTXParseTurbo.MarshalTurboTypedAppend(buf[:0])
+	}
+}
+
+func BenchmarkSCTXParse_Turbo_Unmarshal_Typed(b *testing.B) {
+	blob := benchSCTXParseTurbo.MarshalTurboTyped()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r SCTXParse
+		if err := r.UnmarshalTurboTyped(blob); err != nil {
 			b.Fatal(err)
 		}
 	}
