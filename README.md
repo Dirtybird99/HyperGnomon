@@ -101,17 +101,18 @@ The flags below are the ones worth knowing. For the full list with rationale for
 | `--fastsync` | `false` | Bootstrap from GnomonSC on-chain registry instead of full scan |
 | `--turbo` | `true` | Skip per-SC variable fetch during scan |
 | `--postscan-vars` | `lazy` | Turbo follow-up variable policy: `lazy` skips all-SCID sweep, `all` keeps it |
+| `--classify-seed-cache-dir` | `""` | Optional cross-DB classify seed cache location (empty = OS user cache) |
 | `--tela-only` | `false` | Discover TELA apps, print, and exit |
 | `--num-parallel-blocks` | `8` | Parallel block fetchers. Higher risks daemon rate-limit (tested ceiling per TELA-CLI guide: ~16) |
 | `--rpc-pool-size` | `8` | WebSocket connection pool size |
-| `--batch-size` | `100` | Blocks per atomic bbolt flush. Adaptive up to 2000 when `--adapt-batch` is on |
+| `--batch-size` | `100` | Blocks per atomic bbolt flush. Adaptive up to 1000 when `--adapt-batch` is on |
 | `--persist-install-code` | `tela` | sccode bucket policy: `none`, `tela` (TELA-INDEX/DOC/MOD only), or `all` |
 | `--tela-verify-sigs` | `false` | Report `X-TELA-Verify` header on `/tela/…` responses (v1.0: presence only, v1.1: cryptographic check) |
-| `--search-filter` | `""` | Semicolon-separated substring filter on SC code |
+| `--search-filter` | `""` | Substring filter on SC code, separated by literal `;;;` |
 | `--recent-blocks` | `0` | Scan only last N blocks from tip (0 = all) |
 | `--segment-sync` | `false` | MapReduce parallel initial sync |
 | `--adapt-batch` | `true` | Auto-tune batch size based on flush latency |
-| `--mem-limit` | `0` | `GOMEMLIMIT` in bytes (0 = auto) |
+| `--mem-limit` | `0` | `GOMEMLIMIT` in bytes (0 = no explicit limit; Go runtime default) |
 | `--api-address` | `127.0.0.1:8082` | REST API listen address |
 | `--ws-address` | `127.0.0.1:9190` | WebSocket listen address |
 
@@ -127,8 +128,10 @@ GET /api/indexedscs               All SCIDs with owners
 GET /api/indexbyscid?scid=X       Invocation details for one SCID
 GET /api/scvarsbyheight?scid=X&height=N   SC variables snapshot
 GET /api/initialscidcode?scid=X   Install-time SC code
+GET /api/scidprivtx?address=A     Normal (non-SC-invoke) TXs carrying SCID payloads for an address
 GET /api/tela                     All TELA apps with metadata
 GET /api/tela/count               TELA app count (lightweight polling)
+GET /api/tela/{scid}/ratings      On-chain TELA ratings for one SCID (per-rater scores, count, average)
 GET /api/assets                   Asset/NFT catalog (NFA, G45, legacy DERO assets)
 GET /api/assets/{scid}            Asset/NFT metadata for one SCID
 GET /api/address/{addr}/created-assets  Asset contracts deployed by address
@@ -191,6 +194,8 @@ idx.StartDaemonMode(8)
 
 See [`pkg/gnomes/example/main.go`](pkg/gnomes/example/main.go) for a complete 30-line program.
 
+Note: `NewIndexerWithDBDir` accepts the `FastSyncConfig` argument for signature compatibility with civilware's shape, but does not apply it in v1.0 — to fastsync, run the `hypergnomon` binary with `--fastsync`, or call the native indexer's `Indexer.FastSync` method (`github.com/hypergnomon/hypergnomon/indexer`).
+
 Compat scope: bbolt backend, `daemon` runmode, civilware-shape `Indexer` fields (`LastIndexedHeight`, `ChainHeight`, `DBType`, `GravDBBackend`, `BBSBackend`) and store methods (`GetLastIndexHeight`, `GetAllOwnersAndSCIDs`, `GetAllSCIDVariableDetails`, `GetSCIDValuesByKey`, `GetSCIDKeysByValue`, `GetSCIDInteractionHeight`). Graviton and non-daemon runmodes return a dead indexer — see §10.
 
 ## 9. Benchmarks
@@ -209,24 +214,34 @@ Every number below has a reproducible harness. Hardware, date, daemon endpoint, 
 
 | Bench | Msgpack / baseline | Typed / optimized | Factor |
 |---|---|---|---|
-| `ClassMeta_Marshal` | 1,480 ns / 11 allocs | 239 ns / 2 allocs | **6.2×** |
-| `ClassMeta_MarshalTypedAppend` | 1,480 ns / 11 allocs | 53 ns / 0 allocs | **28×** |
-| `SCIDVariables_Marshal` | 1,360 ns / 6 allocs | 85 ns / 0 allocs | **16×** |
-| `AddrSCIDEntry_MarshalTypedAppend` | 364 ns / 2 allocs | 1.4 ns / 0 allocs | **255×** |
+| `ClassMeta_Marshal` | 641 ns / 11 allocs | 133 ns / 2 allocs | **4.8×** |
+| `ClassMeta_MarshalTypedAppend` | 641 ns / 11 allocs | 24 ns / 0 allocs | **27×** |
+| `SCIDVariables_Marshal` | 1,043 ns / 6 allocs | 51.5 ns / 0 allocs | **20×** |
+| `AddrSCIDEntry_Marshal_TypedAppend` | 156 ns / 2 allocs | 1.5 ns / 0 allocs | **104×** |
 | `TELAContentCache_InvalidatePrefix` (fill=8192) | O(fill) quadratic | 1.1 µs, flat across fills | O(k) |
 | `WorkItem_Pool` vs `New` | 2,300 ns / 5.7 KB | 18 ns / 0 B | **127×** |
-| `FlushBatch_100` vs individual writes | 264 µs/record | 39 µs/record | **6.8×** |
+| `FlushBatch_100` vs individual writes | 88 µs/record | 6.1 µs/record | **14×** |
+| `FlushBatch` vs 100k-interaction history (heights) | 5,684 µs (blob layout) | 118 µs (composite keys) | **48×, flat in history size** |
 
 Full table with reproduction command, hardware, and methodology: [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
 
 **TELA correctness**: content server output is byte-identical (SHA256) to civilware/tela `parseDocCode` for `.html`, `.js`, `.css`, `.gz`, and DocShard paths. Live-fixture test: `api/tela_content_test.go`.
 
-Head-to-head harness vs civilware/Gnomon@dev is planned for v1.0:
+The head-to-head harness vs civilware/Gnomon ships as `cmd/benchvs`: sequential single-target runs — one per indexer, with an operator-supplied civilware wrapper binary — appending to `bench_vs_civilware.md`. See [`cmd/benchvs/README.md`](cmd/benchvs/README.md) for the civilware recipe and the full flag list (RSS is not measured in v1.0).
 
 ```bash
-go run ./cmd/benchvs --daemon=203.0.113.10:10102 --duration=5m --civilware-branch=dev
-# Output: bench_vs_civilware.md — wall-clock, DB size, RSS, p50/p95/p99 API latency.
+go run ./cmd/benchvs \
+    --name=HyperGnomon \
+    --binary=./hypergnomon \
+    --daemon=203.0.113.10:10102 \
+    --db-dir=/tmp/hg-bench \
+    --probe-duration=60s \
+    --probe-workers=32 \
+    --out=bench_vs_civilware.md
+# Appends: time-to-tip, time-to-ready, DB size, REST p50/p95/p99 per probe path.
 ```
+
+For multi-target A/B matrices across release tags, `origin/main`, and the current workspace, `cmd/benchmatrix` orchestrates repeated sequential `benchvs` trials and aggregates the results — see [`cmd/benchmatrix/README.md`](cmd/benchmatrix/README.md).
 
 Numbers reported as "228×", "96×", "3,240×", "1,786×", "8,571×" in earlier README revisions were inherited without reproducible methodology and have been retired. If you have a repro case we should own, file an issue.
 

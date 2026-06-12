@@ -47,18 +47,26 @@ Hardware at time of measurement: Windows 11, Intel Core i7-13700HX (24 logical c
 
 ### Typed encoding vs msgpack
 
+Re-measured June 2026 after the benchmark-integrity fix†: medians of `-count=3`.
+
 | Bench | Msgpack (ns/op, allocs) | Typed (ns/op, allocs) | Factor |
 |---|---|---|---|
-| `ClassMeta_Marshal` | 1,480 / 11 allocs | 239 / 2 allocs | **6.2×** |
-| `ClassMeta_MarshalTypedAppend` | 1,480 / 11 allocs | 53 / **0 allocs** | **28×** |
-| `ClassMeta_Unmarshal` | 1,310 / 9 allocs | 286 / 7 allocs | 4.6× |
-| `SCIDVariables_Marshal` | 1,360 / 6 allocs | 85 / **0 allocs** | **16×** |
-| `SCIDVariables_Unmarshal` | 3,990 / 36 allocs | 1,260 / 30 allocs | 3.2× |
-| `AddrSCIDEntry_Marshal` | 364 / 2 allocs | 0.46 / **0 allocs** | **~800×** † |
-| `AddrSCIDEntry_MarshalTypedAppend` | 364 / 2 allocs | 1.43 / **0 allocs** | **255×** |
-| `AddrSCIDEntry_Unmarshal` | 487 / 2 allocs | 1.08 / **0 allocs** | **~450×** † |
+| `ClassMeta_Marshal` | 641 / 11 allocs | 133 / 2 allocs | **4.8×** |
+| `ClassMeta_MarshalTypedAppend` | 641 / 11 allocs | 24.2 / **0 allocs** | **27×** |
+| `ClassMeta_Unmarshal` | 572 / 9 allocs | 125 / 7 allocs | 4.6× |
+| `SCIDVariables_Marshal` | 1,043 / 6 allocs | 51.5 / **0 allocs** | **20×** |
+| `SCIDVariables_Unmarshal` | 2,103 / 36 allocs | 488 / 25 allocs | 4.3× |
+| `InstallRecord_Marshal` | 281 / 5 allocs | 37.0 / 1 alloc | **7.6×** |
+| `InstallRecord_MarshalTypedAppend` | 281 / 5 allocs | 6.1 / **0 allocs** | **46×** |
+| `InstallRecord_Unmarshal` | 284 / 4 allocs | 48.1 / 2 allocs | 5.9× |
+| `SCTXParse_Turbo_Marshal` | 667 / 5 allocs | 108 / 1 alloc | **6.2×** |
+| `SCTXParse_Turbo_MarshalTypedAppend` | 667 / 5 allocs | 12.9 / **0 allocs** | **52×** |
+| `SCTXParse_Turbo_Unmarshal` | 610 / 6 allocs | 112 / 4 allocs | 5.5× |
+| `AddrSCIDEntry_Marshal` | 156 / 2 allocs | 14.8 / 1 alloc | **11×** |
+| `AddrSCIDEntry_Marshal_TypedAppend` | 156 / 2 allocs | 1.50 / **0 allocs** | **104×** |
+| `AddrSCIDEntry_Unmarshal` | 222 / 2 allocs | 1.47 / **0 allocs** | **151×** |
 
-† The `AddrSCIDEntry` typed path compiles to a handful of byte-order writes into a caller-provided buffer. At sub-nanosecond times, compiler inlining + branch prediction dominate — we report the number honestly but treat the exact multiplier as an upper bound.
+† Earlier revisions of this table reported sub-nanosecond `AddrSCIDEntry` typed times (0.46–1.08 ns) with multipliers up to ~800×. Those benchmarks discarded their results, so the fully-inlinable fixed-size codecs were dead-code-eliminated — the loop measured nothing. The benchmarks now use `b.Loop()` plus package-level sinks; the ~1.5 ns append/unmarshal rows are genuine (a tag check plus three big-endian word moves against a cache-hot buffer), and the multipliers above are the defensible ones.
 
 Drives the Phase-2 writes improvement: every classified SC writes one `ClassMeta` + N `AddrSCIDEntry` rows per scan cycle. Moving these off msgpack was worth ~59% of Phase-2 wall-clock.
 
@@ -118,14 +126,46 @@ BenchmarkInternSCID_NoIntern          290 ns/op    320 B / 5 allocs
 
 ### bbolt batch vs individual writes
 
+Re-measured June 2026 (medians of `-count=3`) after the composite-key history
+layout, `NoFreelistSync`, exact-size variable marshal, and invocation
+bucket-handle memoization landed:
+
 ```
-BenchmarkFlushBatch_100      3.9 ms/op   (100 records per atomic flush = 39 µs/record)
-BenchmarkFlushBatch_1000     24.6 ms/op  (1000 records per flush = 24.6 µs/record)
-BenchmarkFlushBatch_10000    780 ms/op   (10000 records per flush = 78 µs/record)
-BenchmarkIndividualWrites    26.4 ms/op  (100 records one-at-a-time = 264 µs/record)
+BenchmarkFlushBatch_100      0.61 ms/op  (100 records per atomic flush = 6.1 µs/record)
+BenchmarkFlushBatch_1000     8.0 ms/op   (1000 records per flush = 8.0 µs/record)
+BenchmarkFlushBatch_10000    99 ms/op    (10000 records per flush = 9.9 µs/record)
+BenchmarkIndividualWrites    8.8 ms/op   (100 records one-at-a-time = 88 µs/record)
 ```
 
-**6.8× faster** at n=100 (individual 264 µs/rec vs batched 39 µs/rec); **11× faster** at n=1000. The curve turns back up past n=1000 because the bbolt freelist and allocation cost dominate for mega-transactions. 100–1000 is the sweet spot, which is why `--batch-size` defaults to 100 with adaptive scaling up to 2000.
+**14× faster** at n=100 (individual 88 µs/rec vs batched 6.1 µs/rec); **11×
+faster** at n=1000. Per-record cost now rises only gently with batch size
+(6.1 → 9.9 µs across 100 → 10,000) since `NoFreelistSync` removed the
+freelist-serialization cost that used to dominate mega-transactions. 100–1000
+remains the sweet spot, which is why `--batch-size` defaults to 100 with
+adaptive scaling up to 1000.
+
+### Append-only history layout (O(delta) flushes)
+
+Interaction heights and per-address normal-TX history used to live as one
+msgpack blob per SCID/address: every flush decoded the full history, appended
+the delta, re-encoded, and rewrote — quadratic over the life of an active
+contract during initial sync. They now use composite keys
+(`<scid>:<BE8:h>` → uvarint count, `<addr>:<BE8:h>:<txid>` → one record) so a
+flush costs O(batch delta) regardless of accumulated history. Legacy blobs
+remain readable; readers merge both layouts.
+
+`BenchmarkFlushBatch_HeightsAccumulation` / `_NormalTxAccumulation`
+(storage/interaction_history_test.go) pre-seed one key with N records, then
+time a constant-size flush against it:
+
+| Pre-seeded history | Heights: blob layout | Heights: composite | NormalTx: blob | NormalTx: composite |
+|---|---|---|---|---|
+| 1,000 | 173 µs | 116 µs | 1,333 µs | 44 µs |
+| 10,000 | 612 µs | 115 µs | 6,709 µs | 44 µs |
+| 100,000 | 5,684 µs | 118 µs | — | — |
+
+Flat vs linear: at 100k accumulated heights the composite layout flushes
+**48× faster**, and the gap keeps widening with chain history.
 
 ### Event bus
 
@@ -177,23 +217,110 @@ Synthetic cases (`api/tela_content_test.go`):
 
 ## Head-to-head vs civilware/Gnomon
 
-Planned for v1.0 via `cmd/benchvs` (tracked as task P4).
+Shipped in v1.0 as `cmd/benchvs` — a single-target harness the operator runs **sequentially**, once per indexer, against the same daemon. Both runs append to the same markdown file (`--out`, default `bench_vs_civilware.md`), so the comparison accumulates in one document. It deliberately does not run the indexers concurrently: concurrent runs would starve whichever started second via RPC contention, so sequential runs at full daemon bandwidth are the honest comparison. Full usage, including the civilware wrapper recipe, in [`cmd/benchvs/README.md`](../cmd/benchvs/README.md).
 
 ```bash
+# HyperGnomon side
 go run ./cmd/benchvs \
+    --name=HyperGnomon \
+    --binary=./hypergnomon \
     --daemon=203.0.113.10:10102 \
-    --duration=5m \
-    --civilware-branch=dev
+    --db-dir=/tmp/hg-bench \
+    --probe-duration=60s \
+    --probe-workers=32 \
+    --out=bench_vs_civilware.md
+
+# civilware/Gnomon side: civilware is primarily a Go library, so the
+# operator supplies a small wrapper binary that embeds it and exposes
+# /api/getinfo + /api/getstats (recipe in cmd/benchvs/README.md), then
+# points benchvs at it via --binary / --api-url / --probe-paths.
 ```
 
-Clones civilware/Gnomon at the specified branch, builds, runs both indexers concurrently against the same daemon. Measures:
+Measured per run:
 
-- FastSync wall-clock (both)
-- DB size at chain tip (both)
-- RSS at steady state
-- API query p50 / p95 / p99 under 32 concurrent clients hitting `GetAllSCIDs`, `GetAllSCIDInvokeDetails`, `GetSCIDVariableDetailsAtTopoheight`
+- **Time-to-tip** — process start until the index height is within `STABLE_LIMIT=8` of daemon tip (polled via `/api/getinfo` + `/api/getstats`)
+- **Time-to-ready** — optional, when `--ready-log-pattern` markers are set (e.g. `Classify probe complete`); waited for in the child log after tip
+- **DB size** — `--db-dir` is wiped before launch and measured at teardown
+- **REST latency p50 / p95 / p99** (and max) per probe path, under `--probe-workers` (default 32) concurrent clients for `--probe-duration` (default 60s)
 
-Output committed to `bench_vs_civilware.md`, pulled into [README §9](../README.md#9-benchmarks) verbatim. Regenerated per release tag.
+RSS at steady state is explicitly **not** measured in v1.0: cross-platform child-process memory sampling would need a platform-specific shim or child-side cooperation — see "What benchvs does not measure" in [`cmd/benchvs/README.md`](../cmd/benchvs/README.md).
+
+Output appended to `bench_vs_civilware.md`, pulled into [README §9](../README.md#9-benchmarks). Regenerated per release tag.
+
+## Release A/B matrix
+
+Use `cmd/benchmatrix` when comparing HyperGnomon release tags, `origin/main`,
+and the current workspace branch. It is a sequential orchestrator around
+`cmd/benchvs`: each trial gets a fresh DB directory, unique API/WS ports, and
+the same daemon bandwidth. It never runs targets concurrently.
+
+Default release check:
+
+```bash
+go run ./cmd/benchmatrix \
+    --daemon=203.0.113.10:10102 \
+    --trials=5 \
+    --probe-duration=60s
+```
+
+LAN tuning sweep:
+
+```bash
+go run ./cmd/benchmatrix \
+    --daemon=203.0.113.10:10102 \
+    --trials=5 \
+    --targets="main=origin/main,workspace-pool8=workspace,workspace-pool12=workspace|--rpc-pool-size=12,workspace-pool16=workspace|--rpc-pool-size=16"
+```
+
+Defaults:
+
+- Targets: `v1.0.0`, `origin/main`, `workspace`.
+- Readiness marker: `Classify probe complete`.
+- Target args: `--fastsync --timing --timing-every=10`.
+- Output root: timestamped `hypergnomon-benchmatrix` directory under the system temp dir.
+
+Outputs:
+
+- `benchmatrix.jsonl` — one machine-readable row per `benchvs` run.
+- `benchmatrix.md` — median/p95 comparison table with deltas versus `origin/main`.
+- `benchmatrix-runs.md` — the raw per-run `benchvs` markdown sections.
+- Per-run child logs next to the DB directories.
+
+Dry-run command:
+
+```bash
+go run ./cmd/benchmatrix --dry-run --trials=1 --probe-duration=5s
+```
+
+Interpretation rule: deltas under 5%, or deltas where matched trials do not all
+move in the same direction, are labeled as noise. The `workspace` target is
+intentionally built from the active checkout, including uncommitted changes,
+so it is the right target for validating pending optimization branches.
+
+Target entries support `label=ref|extra args`; the extra args are appended to
+the launched indexer only for that target. Use this for pool-size and
+classify-batch sweeps without adding wrapper scripts.
+
+### Classify seed cache
+
+Current builds also maintain a cross-DB classify seed cache under the OS user
+cache directory, or `--classify-seed-cache-dir` when set. The cache is keyed by
+network, GnomonSC SCID, schema version, registry hash, and height. On clean DB
+runs, a matching seed writes class metadata, TELA INDEX/DOC variable snapshots,
+and persisted TELA install code into the fresh DB before probing only SCIDs
+newer than the cached height.
+
+This is a readiness optimization, not a replacement for live verification: a
+missing, stale, corrupt, or registry-mismatched seed falls back to the full
+classify probe.
+
+`benchmatrix` isolates this cache automatically: for any target binary whose
+`--help` advertises `--classify-seed-cache-dir`, each trial gets a fresh seed
+directory under the run root, so every trial measures the cold full-probe path
+and a seed written by an earlier trial (or a prior operator run in the OS user
+cache) cannot skew the comparison. Targets predating the flag launch without
+it. To measure the warm seed-hit path on purpose, pin a shared directory via
+target extra args: `workspace-seeded=workspace|--classify-seed-cache-dir=C:\seedpin`.
 
 ## Retired claims
 
@@ -203,7 +330,7 @@ The earlier README carried speedup multipliers inherited without methodology. Th
 |---|---|---|
 | "1,786× faster than Engram cached TELA" | **retired** | No methodology, no harness, no hardware, no date. No path to reproduction; Engram is a different tool class. |
 | "8,571× faster than PureWolf cached TELA" | **retired** | Same. |
-| "228× faster than individual writes" (batch flush) | **measured: 6.8× at n=100, 11× at n=1000** | See `BenchmarkFlushBatch_100` vs `BenchmarkIndividualWrites` above. The original 228× likely compared batched WriteBatch against pre-v0.7 one-Put-per-txn code that no longer exists. Current multiplier is honest and reproducible. |
+| "228× faster than individual writes" (batch flush) | **measured: 14× at n=100, 11× at n=1000** (June 2026, post composite-key + NoFreelistSync layout) | See `BenchmarkFlushBatch_100` vs `BenchmarkIndividualWrites` above. The original 228× likely compared batched WriteBatch against pre-v0.7 one-Put-per-txn code that no longer exists. Current multiplier is honest and reproducible. |
 | "96× faster than `new` (WorkItem pool)" | **measured: 127× (exceeds original claim)** | `BenchmarkWorkItem_Pool` = 18 ns/op; `BenchmarkWorkItem_New` = 2,300 ns/op. The original 96× was conservative; the current number is higher. |
 | "3,240× faster (Buffer256K pool)" | **retired** | No `BenchmarkBuffer256K_*` harness exists in the current tree (`grep Buffer256K` returns nothing). Either the bench was removed in a refactor and the claim lived on, or the number was invented. No path to reproduction. |
 

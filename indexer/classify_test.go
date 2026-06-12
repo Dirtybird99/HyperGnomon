@@ -1,6 +1,12 @@
 package indexer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/deroproject/derohe/rpc"
+
+	"github.com/hypergnomon/hypergnomon/structures"
+)
 
 func TestClassifySC_TELAIndex_DURLAndVersion(t *testing.T) {
 	code := "some DVM code that includes telaVersion somewhere"
@@ -182,5 +188,128 @@ func TestTELAFieldsForClass(t *testing.T) {
 	durl, version = telaFieldsForClass("NFA", vars)
 	if durl != "x.tela" || version != "" {
 		t.Fatalf("NFA: got (%q, %q), want (x.tela, empty)", durl, version)
+	}
+}
+
+func TestClassifySCVarsMatchesMapClassifier(t *testing.T) {
+	code := "Function Initialize() ... TELA-INDEX-1 ..."
+	vars := []*structures.SCIDVariable{
+		{Key: "var_header_name", Value: "Algorithm of Faith"},
+		{Key: "var_header_description", Value: "A Decentralized Guide"},
+		{Key: "var_header_icon", Value: "https://example.test/icon.png"},
+		{Key: "dURL", Value: "algorithm-of-faith.shards"},
+		{Key: "mods", Value: "VSOO, TXDWA"},
+		{Key: uint64(7), Value: "ignored"},
+	}
+	asMap := varsToMap(vars)
+
+	got := ClassifySCVars("scid-real", code, vars)
+	want := ClassifySC("scid-real", code, asMap)
+
+	if got.Class != want.Class || got.Name != want.Name || got.Desc != want.Desc ||
+		got.IconURL != want.IconURL || got.DURL != want.DURL || got.DocShard != want.DocShard ||
+		got.Version != want.Version {
+		t.Fatalf("ClassifySCVars mismatch:\n got=%+v\nwant=%+v", got, want)
+	}
+	if len(got.Mods) != len(want.Mods) {
+		t.Fatalf("Mods len = %d, want %d", len(got.Mods), len(want.Mods))
+	}
+	for i := range got.Mods {
+		if got.Mods[i] != want.Mods[i] {
+			t.Fatalf("Mods[%d] = %q, want %q", i, got.Mods[i], want.Mods[i])
+		}
+	}
+
+	// Absolute anchors: differential equality alone would let a common-mode
+	// bug in BOTH classifiers pass silently. Pin the expected values.
+	if got.Class != "TELA-INDEX-1" {
+		t.Fatalf("Class = %q, want TELA-INDEX-1", got.Class)
+	}
+	if !got.DocShard {
+		t.Fatal("DocShard = false, want true (.shards dURL suffix)")
+	}
+	if got.Name != "Algorithm of Faith" {
+		t.Fatalf("Name = %q, want 'Algorithm of Faith'", got.Name)
+	}
+}
+
+// TestClassifySCVarsWithClass covers the single-pass class-seeded variant
+// used by fastsync phase 2 and RefreshClassVars, including a uint64-valued
+// docVersion (exercises varString's numeric path) and a hex-encoded dURL
+// (exercises decodeHexIfPrintable).
+func TestClassifySCVarsWithClass(t *testing.T) {
+	// hex("algorithm-of-faith.shard") — derod returns STORE strings hex-encoded.
+	hexDURL := "616c676f726974686d2d6f662d66616974682e7368617264"
+	vars := []*structures.SCIDVariable{
+		{Key: "var_header_name", Value: "index.html"},
+		{Key: "docVersion", Value: uint64(1)},
+		{Key: "dURL", Value: hexDURL},
+		{Key: "docType", Value: "TELA-HTML-1"},
+		{Key: "likes", Value: uint64(42)},
+	}
+
+	sc := ClassifySCVarsWithClass("scid-doc", "TELA-DOC-1", vars)
+	if sc.Class != "TELA-DOC-1" {
+		t.Fatalf("Class = %q, want TELA-DOC-1", sc.Class)
+	}
+	if len(sc.Tags) != 2 || sc.Tags[0] != "all" || sc.Tags[1] != "tela" {
+		t.Fatalf("Tags = %v, want [all tela]", sc.Tags)
+	}
+	if sc.Version != "1" {
+		t.Fatalf("Version = %q, want 1 (uint64 docVersion through varString)", sc.Version)
+	}
+	if sc.DURL != "algorithm-of-faith.shard" {
+		t.Fatalf("DURL = %q, want hex-decoded algorithm-of-faith.shard", sc.DURL)
+	}
+	if !sc.DocShard {
+		t.Fatal("DocShard = false, want true (.shard suffix after hex decode)")
+	}
+	if sc.DocType != "TELA-HTML-1" {
+		t.Fatalf("DocType = %q, want TELA-HTML-1", sc.DocType)
+	}
+	if sc.Name != "index.html" {
+		t.Fatalf("Name = %q, want index.html", sc.Name)
+	}
+
+	// INDEX class applies telaVersion + mods instead of docVersion/docType.
+	indexVars := []*structures.SCIDVariable{
+		{Key: "telaVersion", Value: "1.1.0"},
+		{Key: "mods", Value: "VSOO, TXDWA"},
+		{Key: "docVersion", Value: uint64(9)}, // must be ignored on INDEX
+	}
+	idx := ClassifySCVarsWithClass("scid-index", "TELA-INDEX-1", indexVars)
+	if idx.Version != "1.1.0" {
+		t.Fatalf("INDEX Version = %q, want 1.1.0", idx.Version)
+	}
+	if len(idx.Mods) != 2 || idx.Mods[0] != "VSOO" || idx.Mods[1] != "TXDWA" {
+		t.Fatalf("INDEX Mods = %v, want [VSOO TXDWA]", idx.Mods)
+	}
+	if idx.DocType != "" {
+		t.Fatalf("INDEX DocType = %q, want empty", idx.DocType)
+	}
+
+	// Empty class falls back to the code-less classifier (UNKNOWN).
+	fb := ClassifySCVarsWithClass("scid-doc", "", vars)
+	if fb.Class != "UNKNOWN" {
+		t.Fatalf("fallback Class = %q, want UNKNOWN", fb.Class)
+	}
+	if fb.Version != "" {
+		t.Fatalf("fallback Version = %q, want empty (class gates version keys)", fb.Version)
+	}
+}
+
+func TestArgStringReadsTypedDVMArguments(t *testing.T) {
+	args := rpc.Arguments{
+		{Name: "entrypoint", DataType: rpc.DataString, Value: "Initialize"},
+		{Name: "SC_ACTION", DataType: rpc.DataUint64, Value: uint64(1)},
+	}
+	if got := argString(args, "entrypoint", rpc.DataString); got != "Initialize" {
+		t.Fatalf("entrypoint = %q, want Initialize", got)
+	}
+	if got := argString(args, "SC_ACTION", rpc.DataUint64); got != "1" {
+		t.Fatalf("SC_ACTION = %q, want 1", got)
+	}
+	if got := argString(args, "missing", rpc.DataString); got != "" {
+		t.Fatalf("missing = %q, want empty", got)
 	}
 }

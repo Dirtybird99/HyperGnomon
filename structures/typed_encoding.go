@@ -85,6 +85,128 @@ func IsAddrSCIDEntryTyped(b []byte) bool {
 }
 
 // ============================================================================
+// InstallRecord — typed v1 encoding
+// ============================================================================
+//
+// Wire layout:
+//
+//   byte 0        : tag 0x05
+//   bytes 1..8    : Fees (BE uint64)
+//   varint+bytes  : Owner
+//   varint+bytes  : Entrypoint
+
+const (
+	TagInstallRecordV1 byte = 0x05
+
+	installRecordMinHeaderSize = 1 + 8
+)
+
+var ErrInvalidInstallRecord = errors.New("invalid InstallRecord encoding")
+
+func (r *InstallRecord) MarshalTyped() []byte {
+	buf := make([]byte, 0, installRecordMinHeaderSize+2+len(r.Owner)+len(r.Entrypoint))
+	return r.MarshalTypedAppend(buf)
+}
+
+func (r *InstallRecord) MarshalTypedAppend(dst []byte) []byte {
+	dst = append(dst, TagInstallRecordV1)
+	dst = binary.BigEndian.AppendUint64(dst, r.Fees)
+	dst = appendLenString(dst, r.Owner)
+	dst = appendLenString(dst, r.Entrypoint)
+	return dst
+}
+
+func (r *InstallRecord) UnmarshalTyped(b []byte) error {
+	if len(b) < installRecordMinHeaderSize || b[0] != TagInstallRecordV1 {
+		return ErrInvalidInstallRecord
+	}
+	r.Fees = binary.BigEndian.Uint64(b[1:9])
+	pos := 9
+	var err error
+	if r.Owner, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidInstallRecord
+	}
+	if r.Entrypoint, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidInstallRecord
+	}
+	_ = pos
+	return nil
+}
+
+func IsInstallRecordTyped(b []byte) bool {
+	return len(b) >= 1 && b[0] == TagInstallRecordV1
+}
+
+// ============================================================================
+// SCTXParse turbo subset — typed v1 encoding
+// ============================================================================
+//
+// Turbo-mode scan records do not persist ScArgs or Payloads. This compact
+// record stores the fields queried by the existing API without msgpack
+// reflection.
+
+const (
+	TagSCTXParseTurboV1 byte = 0x06
+
+	sctxParseTurboMinHeaderSize = 1 + 1 + 8 + 8 // tag + method + fees + height
+)
+
+var ErrInvalidSCTXParseTurbo = errors.New("invalid SCTXParse turbo encoding")
+
+func (s *SCTXParse) CanMarshalTurboTyped() bool {
+	return s != nil && len(s.ScArgs) == 0 && len(s.Payloads) == 0
+}
+
+func (s *SCTXParse) MarshalTurboTyped() []byte {
+	buf := make([]byte, 0, sctxParseTurboMinHeaderSize+
+		len(s.Txid)+len(s.Scid)+len(s.Entrypoint)+len(s.Sender)+4)
+	return s.MarshalTurboTypedAppend(buf)
+}
+
+func (s *SCTXParse) MarshalTurboTypedAppend(dst []byte) []byte {
+	dst = append(dst, TagSCTXParseTurboV1)
+	dst = append(dst, s.Method)
+	dst = binary.BigEndian.AppendUint64(dst, s.Fees)
+	dst = binary.BigEndian.AppendUint64(dst, int64Bits(s.Height))
+	dst = appendLenString(dst, s.Txid)
+	dst = appendLenString(dst, s.Scid)
+	dst = appendLenString(dst, s.Entrypoint)
+	dst = appendLenString(dst, s.Sender)
+	return dst
+}
+
+func (s *SCTXParse) UnmarshalTurboTyped(b []byte) error {
+	if len(b) < sctxParseTurboMinHeaderSize || b[0] != TagSCTXParseTurboV1 {
+		return ErrInvalidSCTXParseTurbo
+	}
+	s.Method = b[1]
+	s.Fees = binary.BigEndian.Uint64(b[2:10])
+	s.Height = int64FromBits(binary.BigEndian.Uint64(b[10:18]))
+	pos := 18
+	var err error
+	if s.Txid, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidSCTXParseTurbo
+	}
+	if s.Scid, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidSCTXParseTurbo
+	}
+	if s.Entrypoint, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidSCTXParseTurbo
+	}
+	if s.Sender, pos, err = readLenString(b, pos); err != nil {
+		return ErrInvalidSCTXParseTurbo
+	}
+	s.ScArgs = nil
+	s.Payloads = nil
+	_ = pos
+	return nil
+}
+
+func IsSCTXParseTurboTyped(b []byte) bool {
+	return len(b) >= 1 && b[0] == TagSCTXParseTurboV1
+}
+
+// ============================================================================
 // SCIDVariable slice — typed v1 encoding
 // ============================================================================
 //
@@ -137,17 +259,73 @@ func MarshalSCIDVariablesTypedAppend(dst []byte, vars []*SCIDVariable) []byte {
 	return dst
 }
 
+// MarshalSCIDVariablesTyped encodes vars into a freshly-allocated,
+// exactly-sized byte slice. One cheap sizing pass computes the encoded
+// length up front, so the append chain never reallocates — unlike the
+// MarshalSCIDVariablesTypedAppend(nil, vars) pattern, which pays
+// log2(size) grow+copy cycles per snapshot. Wire bytes are identical to
+// MarshalSCIDVariablesTypedAppend (it delegates to it).
+func MarshalSCIDVariablesTyped(vars []*SCIDVariable) []byte {
+	size := 1 + 4 // tag + count (BE uint32)
+	for _, v := range vars {
+		size += sizeVarField(v.Key) + sizeVarField(v.Value)
+	}
+	return MarshalSCIDVariablesTypedAppend(make([]byte, 0, size), vars)
+}
+
+// sizeVarField returns the exact number of bytes appendVarField will
+// write for v. Must stay in lockstep with appendVarField.
+func sizeVarField(v interface{}) int {
+	switch x := v.(type) {
+	case string:
+		return 1 + uvarintLen(uint64(len(x))) + len(x)
+	case uint64:
+		return 1 + 8
+	default:
+		// Rare fallback path: mirrors appendVarField's stringification.
+		// toStringBest may allocate here (and again during encode), but
+		// unknown types only appear via filter-bypass SCs, never on the
+		// hot string/uint64 path.
+		s := toStringBest(v)
+		return 1 + uvarintLen(uint64(len(s))) + len(s)
+	}
+}
+
+// uvarintLen returns the number of bytes binary.AppendUvarint emits for u.
+func uvarintLen(u uint64) int {
+	n := 1
+	for u >= 0x80 {
+		u >>= 7
+		n++
+	}
+	return n
+}
+
 // UnmarshalSCIDVariablesTyped decodes a v1 typed slice from b.
 // Returns a freshly-allocated slice; callers own it.
+//
+// Arena allocation: all SCIDVariable structs come from one backing array
+// (a single make) instead of one heap object per variable. The returned
+// []*SCIDVariable still hands out stable pointers — callers never reslice
+// or free individual elements, so the shared backing array is invisible
+// to them.
 func UnmarshalSCIDVariablesTyped(b []byte) ([]*SCIDVariable, error) {
 	if len(b) < 5 || b[0] != TagSCIDVariablesV1 {
 		return nil, ErrInvalidSCIDVariables
 	}
 	n := binary.BigEndian.Uint32(b[1:5])
 	pos := 5
+	// Sanity-bound the declared count before allocating: each variable
+	// occupies at least 4 wire bytes (2 fields × (kind byte + ≥1 payload
+	// byte)), so a count exceeding remaining/4 is corrupt and would only
+	// fail later — reject it before the arena make can balloon.
+	if uint64(n)*4 > uint64(len(b)-5) { // #nosec G115 -- len(b) >= 5 is guaranteed by the header check above, so the operand is non-negative.
+		return nil, ErrInvalidSCIDVariables
+	}
 	out := make([]*SCIDVariable, n)
+	arena := make([]SCIDVariable, n)
 	for i := uint32(0); i < n; i++ {
-		var v SCIDVariable
+		v := &arena[i]
 		var err error
 		v.Key, pos, err = readVarField(b, pos)
 		if err != nil {
@@ -157,7 +335,7 @@ func UnmarshalSCIDVariablesTyped(b []byte) ([]*SCIDVariable, error) {
 		if err != nil {
 			return nil, err
 		}
-		out[i] = &v
+		out[i] = v
 	}
 	return out, nil
 }

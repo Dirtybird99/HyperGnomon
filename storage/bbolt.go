@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,17 +28,25 @@ var (
 	bucketHeaders = []byte("headers")
 	bucketClass   = []byte("class") // Route B: "<class>|<BE8:h>|<scid>" -> ClassMeta (typed v1 tag 0x04; legacy msgpack fixmap reads via decodeClassMeta)
 	bucketTags    = []byte("tags")  // reserved; populated when tag indexes ship
-	bucketHeight  = []byte("height")
-	bucketScVars  = []byte("scvars")
+	// bucketHeight: "<scid>:<BE8:h>" -> uvarint occurrence count. Append-only,
+	// so a flush costs O(batch delta) instead of rewriting the SCID's full
+	// history blob. Legacy layout "<scid>" -> msgpack []int64 stays readable;
+	// readers merge legacy-then-composite (chronological for upgraded DBs).
+	bucketHeight = []byte("height")
+	bucketScVars = []byte("scvars")
 	// bucketScVarsLatest stores scid -> BE8 latest snapshot height. It avoids
 	// prefix-scanning every scvars snapshot for latest-rating reads.
 	bucketScVarsLatest = []byte("scvars_latest")
-	bucketNormTx       = []byte("normaltxwithscid")
-	bucketInvalid      = []byte("invalidscidinvokes")
+	// bucketNormTx: "<addr>:<BE8:h>:<txid>:<scid>" -> msgpack
+	// NormalTXWithSCIDParse (single record, append-only). Legacy layout
+	// "<addr>" -> msgpack list stays readable; readers merge
+	// legacy-then-composite.
+	bucketNormTx  = []byte("normaltxwithscid")
+	bucketInvalid = []byte("invalidscidinvokes")
 
 	// Route B (DESIGN.md §3) buckets.
 	bucketBlockHash   = []byte("blockhashes")  // BE8 height -> 64-hex block hash
-	bucketInstalls    = []byte("installs")     // "<BE8:h>|<scid>" -> InstallRecord msgpack
+	bucketInstalls    = []byte("installs")     // "<BE8:h>|<scid>" -> InstallRecord typed v1; legacy msgpack reads via decodeInstallRecord
 	bucketClassIdx    = []byte("class_scid")   // scid -> ClassMeta (typed v1 tag 0x04; legacy msgpack reads via decodeClassMeta; O(1) lookup)
 	bucketAddrSCIDs   = []byte("addr_scids")   // parent; per-addr sub-bucket created on demand
 	bucketTELAContent = []byte("tela_content") // scid|path -> {body, mime, sha256}
@@ -90,6 +101,102 @@ func classKey(class string, h int64, scid string) []byte {
 	return k
 }
 
+// appendHeightKey packs <scid>:<BE8:h> into dst. ':' never occurs in a
+// 64-hex SCID, so composite keys can't collide with legacy whole-SCID keys.
+func appendHeightKey(dst []byte, scid string, h int64) []byte {
+	dst = append(dst, scid...)
+	dst = append(dst, ':')
+	return append(dst, encHeight(h)...)
+}
+
+// appendNormTxKey packs <addr>:<BE8:h>:<txid>:<scid> into dst. ':' never
+// occurs in a DERO address, a hex txid, or a hex scid. The SCID is part of
+// the key because one multi-asset TX emits one record per (payload SCID,
+// ring member) sharing the same (addr, height, txid) — omitting it made the
+// later Put silently overwrite the earlier record's SCID association.
+// Exact-duplicate records (same addr/height/txid/scid, e.g. two payloads of
+// one asset) intentionally coalesce: they are byte-identical.
+func appendNormTxKey(dst []byte, addr string, h int64, txid, scid string) []byte {
+	dst = append(dst, addr...)
+	dst = append(dst, ':')
+	dst = append(dst, encHeight(h)...)
+	dst = append(dst, ':')
+	dst = append(dst, txid...)
+	dst = append(dst, ':')
+	return append(dst, scid...)
+}
+
+// sortedBatchKeys returns a map's keys in ascending order. Go map iteration
+// is deliberately randomized, but bbolt B+tree inserts are cheaper in key
+// order (sequential page fill instead of random splits), so the large
+// FlushBatch loops iterate sorted. Measured on the classify-probe flush
+// shape (2k snapshots + class metas in one txn, fresh store,
+// BenchmarkFlushBatch_VarSnapshotBurst): 19.8 ms random vs 17.5 ms sorted
+// (-12%); the sort itself is microseconds.
+func sortedBatchKeys[M ~map[string]V, V any](m M) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// DecodeHeightEntry interprets one KV pair from the "height" bucket in
+// either layout and returns the SCID plus the heights it contributes
+// (composite uvarint counts expand to repeated heights, matching the legacy
+// list semantics). Exposed for the segment-merge path.
+func DecodeHeightEntry(k, v []byte) (string, []int64, error) {
+	if sep := bytes.IndexByte(k, ':'); sep >= 0 && len(k) == sep+1+8 {
+		h := decHeight(k[sep+1:])
+		n := uint64(1)
+		if len(v) > 0 {
+			if cnt, read := binary.Uvarint(v); read > 0 && cnt > 0 {
+				n = cnt
+			}
+		}
+		// The store runs NoSync during initial sync, so a torn value after a
+		// crash is in-model; bound the count before allocating so one corrupt
+		// byte hits the callers' warn-and-skip handling instead of an
+		// out-of-memory panic. Same pattern as UnmarshalSCIDVariablesTyped.
+		const maxHeightCount = 1 << 20
+		if n > maxHeightCount {
+			return string(k[:sep]), nil, fmt.Errorf("height count %d exceeds sanity bound %d", n, maxHeightCount)
+		}
+		heights := make([]int64, n)
+		for i := range heights {
+			heights[i] = h
+		}
+		return string(k[:sep]), heights, nil
+	}
+	var heights []int64
+	if err := msgpack.Unmarshal(v, &heights); err != nil {
+		return string(k), nil, err
+	}
+	return string(k), heights, nil
+}
+
+// DecodeNormalTxEntry interprets one KV pair from the "normaltxwithscid"
+// bucket in either layout and returns the address plus its records.
+// Exposed for the segment-merge path. Composite detection only needs the
+// first two separators — the full record lives in the value — so the
+// <addr>:<BE8:h>:<txid>:<scid> form and the briefly-used scid-less form
+// decode identically.
+func DecodeNormalTxEntry(k, v []byte) (string, []*structures.NormalTXWithSCIDParse, error) {
+	if sep := bytes.IndexByte(k, ':'); sep >= 0 && len(k) > sep+1+8 && k[sep+1+8] == ':' {
+		var rec structures.NormalTXWithSCIDParse
+		if err := msgpack.Unmarshal(v, &rec); err != nil {
+			return string(k[:sep]), nil, err
+		}
+		return string(k[:sep]), []*structures.NormalTXWithSCIDParse{&rec}, nil
+	}
+	var txs []*structures.NormalTXWithSCIDParse
+	if err := msgpack.Unmarshal(v, &txs); err != nil {
+		return string(k), nil, err
+	}
+	return string(k), txs, nil
+}
+
 // BboltStore implements Storage backed by BoltDB.
 //
 // No external mutex: bbolt is already single-writer internally (db.rwlock in
@@ -100,19 +207,48 @@ type BboltStore struct {
 	Path string
 }
 
-// NewBboltStore opens or creates a BoltDB database.
+// NewBboltStore opens or creates a BoltDB database with the 256 MiB mmap
+// reservation appropriate for the long-lived main store.
 func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
+	return NewBboltStoreWithMmap(dbDir, searchFilter, mainStoreMmapSize)
+}
+
+// mainStoreMmapSize reserves the main store's mmap up front. Without it,
+// bbolt re-mmaps each time the file doubles — on Windows that tears down and
+// recreates the file mapping with transactions quiesced, which stalled write
+// bursts: the classify-probe variable flush measured 4.1-4.3 s against a
+// growing DB vs 0.41-0.44 s with the reservation (live mainnet daemon, June
+// 2026). 256 MiB covers today's ~131 MiB mainnet DB with headroom; bbolt
+// ignores the option once the file is larger. Trade-off: on Windows the file
+// mapping requires the file itself to be extended, so the DB occupies
+// 256 MiB on disk from the start (documented in DOCS/FLAGS.md). On Unix only
+// address space is reserved.
+const mainStoreMmapSize = 256 << 20
+
+// NewBboltStoreWithMmap opens or creates a BoltDB database with an explicit
+// initial mmap reservation. Short-lived bounded stores — the per-segment
+// temp DBs hold ~10k blocks each and many coexist before the merge — pass 0
+// so they don't each pre-extend their file on Windows.
+func NewBboltStoreWithMmap(dbDir string, searchFilter string, initialMmapSize int) (*BboltStore, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir %s: %w", dbDir, err)
 	}
 	dbPath := filepath.Join(dbDir, "HYPERGNOMON.db")
 
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{
-		Timeout:      0,    // 0 = wait indefinitely for lock
-		NoGrowSync:   true, // skip fsync on db file growth — safe because NoSync already skips fsync
-		NoSync:       true, // skip fsync during initial sync for speed; call EnableSync() at chain tip
-		FreelistType: bolt.FreelistMapType,
-	})
+	opts := &bolt.Options{
+		Timeout:    0,    // 0 = wait indefinitely for lock
+		NoGrowSync: true, // skip fsync on db file growth — safe because NoSync already skips fsync
+		NoSync:     true, // skip fsync during initial sync for speed; call EnableSync() at chain tip
+		// Skip serializing the freelist into every commit; it is rebuilt by
+		// scanning the file on open. Removes a per-FlushBatch cost that grows
+		// with DB size during initial sync (same trade etcd ships with).
+		NoFreelistSync: true,
+		FreelistType:   bolt.FreelistMapType,
+	}
+	if strconv.IntSize == 64 && initialMmapSize > 0 {
+		opts.InitialMmapSize = initialMmapSize
+	}
+	db, err := bolt.Open(dbPath, 0600, opts)
 	if err != nil {
 		return nil, fmt.Errorf("bbolt open %s: %w", dbPath, err)
 	}
@@ -147,8 +283,17 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 }
 
 // EnableSync re-enables fsync after initial sync is complete (caught up to chain tip).
+//
+// The flip happens inside an empty Update txn: bbolt serializes Update calls
+// on its writer mutex and every commit reads db.NoSync, so a bare assignment
+// would race with concurrent committers (probeTELA flushes, IndexSingleSCID)
+// right at the caught-up transition. The empty txn gives the write a
+// happens-before edge with every other commit.
 func (s *BboltStore) EnableSync() {
-	s.DB.NoSync = false
+	_ = s.DB.Update(func(*bolt.Tx) error {
+		s.DB.NoSync = false
+		return nil
+	})
 	if err := s.DB.Sync(); err != nil {
 		logger.Warnf("EnableSync: bbolt Sync returned: %v", err)
 	}
@@ -156,8 +301,12 @@ func (s *BboltStore) EnableSync() {
 }
 
 // DisableSync disables fsync for bulk initial sync performance.
+// See EnableSync for why the flip rides an empty write txn.
 func (s *BboltStore) DisableSync() {
-	s.DB.NoSync = true
+	_ = s.DB.Update(func(*bolt.Tx) error {
+		s.DB.NoSync = true
+		return nil
+	})
 	logger.Info("BoltDB sync disabled (initial sync mode)")
 }
 
@@ -244,11 +393,16 @@ func (s *BboltStore) GetInvokeDetailsBySCID(scid string) ([]*structures.SCTXPars
 			return nil
 		}
 		return b.ForEach(func(k, v []byte) error {
-			var detail structures.SCTXParse
-			if err := msgpack.Unmarshal(v, &detail); err != nil {
+			detail, err := DecodeSCTXParse(v)
+			if err != nil {
 				return err
 			}
-			results = append(results, &detail)
+			if detail == nil {
+				// Empty stored value — skip rather than append a nil entry
+				// (mirrors the segment-merge guard).
+				return nil
+			}
+			results = append(results, detail)
 			return nil
 		})
 	})
@@ -340,31 +494,42 @@ func putLatestSCVarsHeight(b *bolt.Bucket, scid string, height int64) error {
 func (s *BboltStore) StoreSCIDInteractionHeight(scid string, height int64) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketHeight)
-		existing := b.Get([]byte(scid))
-		var heights []int64
-		if existing != nil {
-			if err := msgpack.Unmarshal(existing, &heights); err != nil {
-				logger.Warnf("heights decode for %s: %v (starting fresh list)", scid, err)
-				heights = nil
+		key := appendHeightKey(make([]byte, 0, len(scid)+1+8), scid, height)
+		count := uint64(1)
+		if existing := b.Get(key); len(existing) > 0 {
+			if prev, read := binary.Uvarint(existing); read > 0 {
+				count += prev
 			}
 		}
-		heights = append(heights, height)
-		val, err := msgpack.Marshal(heights)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(scid), val)
+		val := make([]byte, binary.MaxVarintLen64)
+		val = val[:binary.PutUvarint(val, count)]
+		return b.Put(key, val)
 	})
 }
 
 func (s *BboltStore) GetSCIDInteractionHeights(scid string) ([]int64, error) {
 	var heights []int64
 	err := s.DB.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketHeight).Get([]byte(scid))
-		if v == nil {
-			return nil
+		b := tx.Bucket(bucketHeight)
+		// Legacy whole-history blob first (pre-composite writes), then the
+		// composite keys in ascending-height cursor order.
+		if v := b.Get([]byte(scid)); v != nil {
+			if err := msgpack.Unmarshal(v, &heights); err != nil {
+				logger.Warnf("heights legacy decode for %s: %v (skipping blob)", scid, err)
+				heights = nil
+			}
 		}
-		return msgpack.Unmarshal(v, &heights)
+		prefix := append([]byte(scid), ':')
+		c := b.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			_, hs, err := DecodeHeightEntry(k, v)
+			if err != nil {
+				logger.Warnf("heights composite decode for %s: %v", scid, err)
+				continue
+			}
+			heights = append(heights, hs...)
+		}
+		return nil
 	})
 	return heights, err
 }
@@ -372,20 +537,12 @@ func (s *BboltStore) GetSCIDInteractionHeights(scid string) ([]int64, error) {
 func (s *BboltStore) StoreNormalTxWithSCIDByAddr(addr string, ntx *structures.NormalTXWithSCIDParse) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNormTx)
-		existing := b.Get([]byte(addr))
-		var txs []*structures.NormalTXWithSCIDParse
-		if existing != nil {
-			if err := msgpack.Unmarshal(existing, &txs); err != nil {
-				logger.Warnf("normaltx decode for %s: %v (starting fresh list)", addr, err)
-				txs = nil
-			}
-		}
-		txs = append(txs, ntx)
-		val, err := msgpack.Marshal(txs)
+		key := appendNormTxKey(make([]byte, 0, len(addr)+1+8+1+len(ntx.Txid)+1+len(ntx.Scid)), addr, ntx.Height, ntx.Txid, ntx.Scid)
+		val, err := msgpack.Marshal(ntx)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(addr), val)
+		return b.Put(key, val)
 	})
 }
 
@@ -529,10 +686,27 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Old path used fmt.Sprintf("%s:%s:%d:%s", ...) which allocates a fresh string
 		// per invocation. Replaced with append + strconv.AppendInt to produce the
 		// exact same key bytes without any per-iteration allocation.
+		// Invocations cluster by SCID (per-block ordering), so memoizing the
+		// last bucket handle skips the CreateBucketIfNotExists lookup and the
+		// []byte(scid) copy for consecutive same-SCID records.
+		var lastInvScid string
+		var lastInvBucket *bolt.Bucket
 		for _, inv := range batch.Invocations {
-			b, err := tx.CreateBucketIfNotExists([]byte(inv.Scid))
-			if err != nil {
-				return fmt.Errorf("batch invoke bucket %s: %w", inv.Scid, err)
+			if inv.Scid == "" {
+				// Defense in depth: an empty bucket name makes bbolt error
+				// and FlushBatch is all-or-nothing — one malformed record
+				// must not drop the whole batch.
+				logger.Warnf("batch invoke with empty scid skipped (txid=%s height=%d)", inv.Details.Txid, inv.Height)
+				continue
+			}
+			b := lastInvBucket
+			if b == nil || inv.Scid != lastInvScid {
+				var err error
+				b, err = tx.CreateBucketIfNotExists([]byte(inv.Scid))
+				if err != nil {
+					return fmt.Errorf("batch invoke bucket %s: %w", inv.Scid, err)
+				}
+				lastInvScid, lastInvBucket = inv.Scid, b
 			}
 			keyBuf = keyBuf[:0]
 			keyBuf = append(keyBuf, inv.Sender...)
@@ -542,9 +716,15 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			keyBuf = strconv.AppendInt(keyBuf, inv.Height, 10)
 			keyBuf = append(keyBuf, ':')
 			keyBuf = append(keyBuf, inv.Entrypoint...)
-			val, err := msgpack.Marshal(inv.Details)
-			if err != nil {
-				return fmt.Errorf("batch invoke marshal: %w", err)
+			var val []byte
+			if inv.Details.CanMarshalTurboTyped() {
+				val = inv.Details.MarshalTurboTyped()
+			} else {
+				var err error
+				val, err = msgpack.Marshal(inv.Details)
+				if err != nil {
+					return fmt.Errorf("batch invoke marshal: %w", err)
+				}
 			}
 			if err := b.Put(keyBuf, val); err != nil {
 				return err
@@ -565,13 +745,16 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// eagerly (node.put clones the key into its own arena).
 		varBucket := tx.Bucket(bucketScVars)
 		varLatestBucket := tx.Bucket(bucketScVarsLatest)
-		for scid, heightVars := range batch.Variables {
+		for _, scid := range sortedBatchKeys(batch.Variables) {
+			heightVars := batch.Variables[scid]
 			for height, vars := range heightVars {
 				keyBuf = keyBuf[:0]
 				keyBuf = append(keyBuf, scid...)
 				keyBuf = append(keyBuf, ':')
 				keyBuf = strconv.AppendInt(keyBuf, height, 10)
-				val := structures.MarshalSCIDVariablesTypedAppend(nil, vars)
+				// Exact-size single allocation; the nil-append pattern paid
+				// log2(size) realloc+copies per snapshot.
+				val := structures.MarshalSCIDVariablesTyped(vars)
 				if err := varBucket.Put(keyBuf, val); err != nil {
 					return err
 				}
@@ -581,45 +764,59 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			}
 		}
 
-		// Store interaction heights
+		// Store interaction heights. Composite keys (<scid>:<BE8:h> -> uvarint
+		// count) make this O(batch delta): the legacy one-blob-per-SCID layout
+		// re-decoded and rewrote the SCID's entire history every flush, which
+		// is quadratic over the life of an active contract during initial sync
+		// (measured: 173µs -> 5.7ms per identical flush as history grows
+		// 1k -> 100k). Only same-height duplicates read back a (tiny) count.
 		heightBucket := tx.Bucket(bucketHeight)
-		for scid, heights := range batch.Heights {
-			existing := heightBucket.Get([]byte(scid))
-			var current []int64
-			if existing != nil {
-				if err := msgpack.Unmarshal(existing, &current); err != nil {
-					logger.Warnf("batch heights decode for %s: %v (starting fresh list)", scid, err)
-					current = nil
+		for _, scid := range sortedBatchKeys(batch.Heights) {
+			heights := batch.Heights[scid]
+			// heights is batch-owned scratch (Reset after flush) and arrives
+			// near-sorted (ascending block order), so sorting in place to
+			// group same-height duplicates is effectively free.
+			slices.Sort(heights)
+			for i := 0; i < len(heights); {
+				h := heights[i]
+				count := uint64(1)
+				j := i + 1
+				for j < len(heights) && heights[j] == h {
+					j++
+					count++
 				}
-			}
-			current = append(current, heights...)
-			val, err := msgpack.Marshal(current)
-			if err != nil {
-				return fmt.Errorf("batch heights marshal: %w", err)
-			}
-			if err := heightBucket.Put([]byte(scid), val); err != nil {
-				return err
+				i = j
+				keyBuf = appendHeightKey(keyBuf[:0], scid, h)
+				if existing := heightBucket.Get(keyBuf); len(existing) > 0 {
+					if prev, read := binary.Uvarint(existing); read > 0 {
+						count += prev
+					}
+				}
+				val := make([]byte, binary.MaxVarintLen64)
+				val = val[:binary.PutUvarint(val, count)]
+				if err := heightBucket.Put(keyBuf, val); err != nil {
+					return err
+				}
 			}
 		}
 
-		// Store normal txs
+		// Store normal txs: one composite key per record (append-only), same
+		// O(total^2) -> O(delta) reasoning as heights above.
 		normBucket := tx.Bucket(bucketNormTx)
-		for addr, txs := range batch.NormalTxs {
-			existing := normBucket.Get([]byte(addr))
-			var current []*structures.NormalTXWithSCIDParse
-			if existing != nil {
-				if err := msgpack.Unmarshal(existing, &current); err != nil {
-					logger.Warnf("batch normaltx decode for %s: %v (starting fresh list)", addr, err)
-					current = nil
+		for _, addr := range sortedBatchKeys(batch.NormalTxs) {
+			txs := batch.NormalTxs[addr]
+			for _, ntx := range txs {
+				if ntx == nil {
+					continue
 				}
-			}
-			current = append(current, txs...)
-			val, err := msgpack.Marshal(current)
-			if err != nil {
-				return err
-			}
-			if err := normBucket.Put([]byte(addr), val); err != nil {
-				return err
+				keyBuf = appendNormTxKey(keyBuf[:0], addr, ntx.Height, ntx.Txid, ntx.Scid)
+				val, err := msgpack.Marshal(ntx)
+				if err != nil {
+					return fmt.Errorf("batch normaltx marshal: %w", err)
+				}
+				if err := normBucket.Put(keyBuf, val); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -677,11 +874,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				if !ok {
 					continue
 				}
-				val, err := msgpack.Marshal(rec)
-				if err != nil {
-					return fmt.Errorf("batch install marshal: %w", err)
-				}
-				if err := insBucket.Put(installKey(h, scid), val); err != nil {
+				if err := insBucket.Put(installKey(h, scid), rec.MarshalTyped()); err != nil {
 					return err
 				}
 			}
@@ -701,7 +894,8 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		if len(batch.Classes) > 0 {
 			classIdx := tx.Bucket(bucketClassIdx)
 			classPrefix := tx.Bucket(bucketClass)
-			for scid, meta := range batch.Classes {
+			for _, scid := range sortedBatchKeys(batch.Classes) {
+				meta := batch.Classes[scid]
 				if meta == nil || meta.Class == "" {
 					continue
 				}
@@ -742,7 +936,8 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// / Installs loops above.
 		if len(batch.SCCodes) > 0 {
 			codeBucket := tx.Bucket(bucketSCCode)
-			for scid, entry := range batch.SCCodes {
+			for _, scid := range sortedBatchKeys(batch.SCCodes) {
+				entry := batch.SCCodes[scid]
 				if entry == nil || entry.Code == "" {
 					continue
 				}
@@ -912,6 +1107,40 @@ func decodeClassMeta(v []byte) (*structures.ClassMeta, error) {
 	return &m, nil
 }
 
+func decodeInstallRecord(v []byte) (*structures.InstallRecord, error) {
+	if len(v) == 0 {
+		return nil, nil
+	}
+	var r structures.InstallRecord
+	if structures.IsInstallRecordTyped(v) {
+		if err := r.UnmarshalTyped(v); err != nil {
+			return nil, err
+		}
+		return &r, nil
+	}
+	if err := msgpack.Unmarshal(v, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func DecodeSCTXParse(v []byte) (*structures.SCTXParse, error) {
+	if len(v) == 0 {
+		return nil, nil
+	}
+	var detail structures.SCTXParse
+	if structures.IsSCTXParseTurboTyped(v) {
+		if err := detail.UnmarshalTurboTyped(v); err != nil {
+			return nil, err
+		}
+		return &detail, nil
+	}
+	if err := msgpack.Unmarshal(v, &detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
 // GetClassInstalls returns classified SCIDs for a given class, one entry
 // per unique SCID (the highest-height entry wins). Ordered by install
 // height ascending. limit<=0 means unlimited.
@@ -1007,8 +1236,7 @@ func (s *BboltStore) GetInstallsInRange(fromHeight, toHeight int64, limit int) (
 				break
 			}
 			scid := string(k[9:])
-			var rec structures.InstallRecord
-			if err := msgpack.Unmarshal(v, &rec); err != nil {
+			if _, err := decodeInstallRecord(v); err != nil {
 				logger.Warnf("GetInstallsInRange decode h=%d scid=%s: %v", h, scid, err)
 				continue
 			}
@@ -1492,11 +1720,26 @@ func (s *BboltStore) GetTxCounts() (reg, burn, norm int64, err error) {
 func (s *BboltStore) GetNormalTxWithSCIDByAddr(addr string) ([]*structures.NormalTXWithSCIDParse, error) {
 	var txs []*structures.NormalTXWithSCIDParse
 	err := s.DB.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketNormTx).Get([]byte(addr))
-		if v == nil {
-			return nil
+		b := tx.Bucket(bucketNormTx)
+		// Legacy whole-history blob first, then composite keys (ascending
+		// height in cursor order).
+		if v := b.Get([]byte(addr)); v != nil {
+			if err := msgpack.Unmarshal(v, &txs); err != nil {
+				logger.Warnf("normaltx legacy decode for %s: %v (skipping blob)", addr, err)
+				txs = nil
+			}
 		}
-		return msgpack.Unmarshal(v, &txs)
+		prefix := append([]byte(addr), ':')
+		c := b.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			_, recs, err := DecodeNormalTxEntry(k, v)
+			if err != nil {
+				logger.Warnf("normaltx composite decode for %s: %v", addr, err)
+				continue
+			}
+			txs = append(txs, recs...)
+		}
+		return nil
 	})
 	return txs, err
 }

@@ -42,8 +42,10 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 	// Select the correct GnomonSC SCID for the network
 	gnomonSCID := structures.GnomonSCID_Mainnet
+	network := "mainnet"
 	if testnet {
 		gnomonSCID = structures.GnomonSCID_Testnet
+		network = "testnet"
 	}
 
 	// JOFITO: Skip registry fetch if cache is fresh (within 1000 blocks)
@@ -83,6 +85,9 @@ func (idx *Indexer) FastSync(testnet bool) error {
 					logger.Infof("FastSync: cache fresh v%d (height %d, %d blocks behind) — %d INDEX + %d DOC + %d other classes loaded in %s",
 						cached.Version, cached.Height, chainHeight-cached.Height,
 						len(cached.IndexSCIDs), len(cached.DocSCIDs), otherCount, elapsed.Round(time.Millisecond))
+					// Readiness marker: cmd/benchvs --ready-log-pattern waits for
+					// this exact phrase, and no probe will run on this path.
+					logger.Infof("Classify probe complete: cache fresh | Total: 0s")
 					return nil
 				}
 				logger.Warnf("FastSync: cache height-fresh but scvars reads failed — forcing re-probe to heal corrupted variable blobs (pre-fix HyperGnomon artifact)")
@@ -185,10 +190,19 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 	if len(candidates) == 0 {
 		logger.Warn("FastSync: no SCIDs found in GnomonSC registry")
+		// Readiness marker: nothing to classify, but consumers (benchvs)
+		// still wait for this phrase before declaring the node ready.
+		logger.Infof("Classify probe complete: empty registry | Total: 0s")
 		return idx.Store.StoreLastIndexHeight(chainHeight)
 	}
 
 	logger.Infof("FastSync: %d SCIDs in registry, %d candidates after filtering", len(scidSet), len(candidates))
+	registryHash := classifySeedRegistryHash(candidates, chainHeight)
+	seedCtx := &classifySeedProbeContext{
+		Network:      network,
+		GnomonSCID:   gnomonSCID,
+		RegistryHash: registryHash,
+	}
 
 	// Step 4: Import SCIDs into database
 	batch := storage.NewWriteBatch()
@@ -232,6 +246,13 @@ func (idx *Indexer) FastSync(testnet bool) error {
 		cached, cacheErr := loadTELACache(idx.DBDir)
 		cacheUsable := cacheErr == nil && cached != nil && cached.Height > 0 &&
 			cached.Version == telaCacheVersion && cachedScvarsLookReadable(idx, cached)
+		// A TRUE cache miss is "loadTELACache returned nothing". A cache that
+		// loaded but was version-rejected or failed the scvars sanity probe is
+		// NOT a miss — it is evidence of stale/corrupt local state, and the
+		// documented self-heal contract is a FULL re-probe that overwrites the
+		// bad blobs. The classify seed cache must never intercept that path:
+		// applying a seed would leave the corrupt historical scvars in place.
+		trueCacheMiss := cacheErr != nil || cached == nil
 		if cacheUsable {
 			// Cache hit! Load known TELA SCIDs instantly.
 			structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
@@ -248,21 +269,31 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 			if len(deltaCandidates) > 0 {
 				logger.Infof("TELA delta probe: %d new SCIDs since height %d", len(deltaCandidates), cached.Height)
-				go idx.probeTELA(deltaCandidates, chainHeight, true)
+				go idx.probeTELA(deltaCandidates, chainHeight, true, nil)
 			} else {
 				logger.Info("TELA delta probe: no new SCIDs since last run")
+				// Readiness marker — every terminal classify path must emit it.
+				logger.Infof("Classify probe complete: tela cache | Total: 0s")
+			}
+		} else if deltaCandidates, ok := trueLocalCacheMissSeed(idx, trueCacheMiss, network, gnomonSCID, candidates); ok {
+			if len(deltaCandidates) > 0 {
+				logger.Infof("Classify seed delta probe: %d new SCIDs since seed height", len(deltaCandidates))
+				go idx.probeTELA(deltaCandidates, chainHeight, true, nil)
+			} else {
+				logger.Info("Classify seed delta probe: no new SCIDs since seed cache")
+				logger.Infof("Classify probe complete: seed cache | Total: 0s")
 			}
 		} else {
 			// Cache missing, old-version, or corrupt — full probe. This is the
 			// self-heal path that overwrites historical malformed scvars blobs
 			// with cleanly-encoded bytes from the current marshaler.
-			if cacheErr != nil {
+			if trueCacheMiss {
 				logger.Info("TELA cache miss: running full probe")
 			} else {
 				logger.Infof("TELA cache reject: v%d != v%d or scvars sanity failed — running full probe to heal",
 					cached.Version, telaCacheVersion)
 			}
-			go idx.probeTELA(candidates, chainHeight, false)
+			go idx.probeTELA(candidates, chainHeight, false, seedCtx)
 		}
 
 		return nil
@@ -365,7 +396,7 @@ func (idx *Indexer) FastSync(testnet bool) error {
 	// FastSync path populates the TELA bucket regardless of scan strategy.
 	// The turbo branch above has its own cache-aware probe launch; this
 	// only fires on the non-turbo codepath.
-	go idx.probeTELA(candidates, chainHeight, false)
+	go idx.probeTELA(candidates, chainHeight, false, seedCtx)
 
 	return nil
 }
@@ -373,7 +404,7 @@ func (idx *Indexer) FastSync(testnet bool) error {
 // probeTELA discovers TELA apps using batch code probing, then fetches their variables.
 // Phase 1: Batch GetSC(code=true) across 8 connections to find SCIDs with telaVersion/docVersion
 // Phase 2: Batch GetSC(variables=true) for only the matched TELA SCIDs to get metadata
-func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, allowEarlyExit bool) {
+func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, allowEarlyExit bool, seedCtx *classifySeedProbeContext) {
 	start := time.Now()
 	probeBatchSize := normalizeClassifyProbeBatchSize(idx.ClassifyProbeBatchSize)
 	var probed atomic.Int64
@@ -439,7 +470,12 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 			defer wg.Done()
 			for batch := range work {
 				if idx.Closing.Load() || probeComplete.Load() {
-					return
+					// Keep draining the channel instead of returning: a worker
+					// that returns early leaves the feeder blocked on a full
+					// channel forever, leaking the goroutine and both pooled
+					// WriteBatches. `continue` skips the RPC work but lets the
+					// feeder finish and close(work) unblock everyone.
+					continue
 				}
 				var lastErr error
 				for attempt := 1; attempt <= 2; attempt++ {
@@ -502,8 +538,9 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 							default:
 								otherClassSCIDs[matched] = append(otherClassSCIDs[matched], scidStr)
 							}
-							// Persist the install-time code. Skip TELA-DOC-1 when
-							// the operator opted out (flag --skip-tela-doc-code).
+							// Persist the install-time code per the --persist-install-code
+							// policy (the legacy --skip-tela-doc-code flag was removed;
+							// shouldPersistCode/CodePolicy is the single source of truth).
 							persistCode := idx.shouldPersistCode(matched)
 							telaMu.Unlock()
 							if persistCode {
@@ -564,7 +601,8 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 	}
 
 	for i := 0; i < len(scids); i += probeBatchSize {
-		if probeComplete.Load() {
+		// Stop feeding on shutdown too — workers only drain past this point.
+		if idx.Closing.Load() || probeComplete.Load() {
 			break
 		}
 		end := min(i+probeBatchSize, len(scids))
@@ -598,6 +636,10 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 			time.Duration(phase1ScanNanos.Load()).Round(time.Millisecond),
 			phase1Batches.Load(), probeBatchSize, phase1RPCErrors.Load(), phase1DecodeErrors.Load(),
 			phase1CodeBytes.Load(), allowEarlyExit)
+		// Readiness marker: cmd/benchvs --ready-log-pattern waits for this
+		// phrase, so it must fire even when a (delta) probe classifies nothing.
+		logger.Infof("Classify probe complete: 0 INDEX + 0 DOC + 0 other | Phase1: %s Phase2: 0s Total: %s",
+			phase1Time.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 		storage.PutWriteBatch(codeBatch)
 		return
 	}
@@ -612,7 +654,6 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 		}
 		codeFlushTime = time.Since(codeFlushStart)
 	}
-	storage.PutWriteBatch(codeBatch)
 
 	// Phase 2: Batch fetch full variables for BOTH INDEX and DOC SCIDs.
 	// HOLOGRAM's GetMyDOCs / SearchByKey("docVersion") / GetAllDOCTypes / GetMyINDEXes
@@ -633,7 +674,8 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 			defer wg2.Done()
 			for item := range varWork {
 				if idx.Closing.Load() {
-					return
+					// Drain, don't return — see the phase-1 worker comment.
+					continue
 				}
 				var lastErr error
 				for attempt := 1; attempt <= 2; attempt++ {
@@ -672,17 +714,18 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 							phase2ParseNanos.Add(time.Since(tParse).Nanoseconds())
 							phase2Vars.Add(int64(len(vars)))
 							tClassify := time.Now()
-							varMap := varsToMap(vars)
-							sc := ClassifySC(item.scids[i], "", varMap)
-							durl, version := telaFieldsForClass(item.class, varMap)
+							// Single-pass: the class was proven by the phase-1 code
+							// probe, so seed it and let extractClassVars pull DURL/
+							// Version/DocType/Mods in the same walk (audit #8).
+							sc := ClassifySCVarsWithClass(item.scids[i], item.class, vars)
 							meta := &structures.ClassMeta{
-								Class:         item.class,
-								Tags:          tagsForClass(item.class),
+								Class:         sc.Class,
+								Tags:          sc.Tags,
 								Name:          sc.Name,
 								Desc:          sc.Desc,
 								IconURL:       sc.IconURL,
-								DURL:          durl,
-								Version:       version,
+								DURL:          sc.DURL,
+								Version:       sc.Version,
 								InstallHeight: chainHeight,
 								LastHeight:    chainHeight,
 							}
@@ -710,13 +753,20 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 		}()
 	}
 
-	// Feed INDEX SCIDs in batches of 25 (variables are larger than code)
+	// Feed INDEX SCIDs in batches of 25 (variables are larger than code).
+	// Both feeders stop on shutdown; workers drain whatever was queued.
 	varBatchSize := 25
 	for i := 0; i < len(telaIndexSCIDs); i += varBatchSize {
+		if idx.Closing.Load() {
+			break
+		}
 		end := min(i+varBatchSize, len(telaIndexSCIDs))
 		varWork <- varBatchItem{scids: telaIndexSCIDs[i:end], class: "TELA-INDEX-1"}
 	}
 	for i := 0; i < len(telaDocSCIDs); i += varBatchSize {
+		if idx.Closing.Load() {
+			break
+		}
 		end := min(i+varBatchSize, len(telaDocSCIDs))
 		varWork <- varBatchItem{scids: telaDocSCIDs[i:end], class: "TELA-DOC-1"}
 	}
@@ -742,12 +792,13 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 	wg2.Wait()
 
 	// Flush classified variables + class metadata to DB
+	varFlushOK := true
 	varFlushStart := time.Now()
 	if err := idx.Store.FlushBatch(varBatch); err != nil {
 		logger.Errorf("Classify flush: %v", err)
+		varFlushOK = false
 	}
 	varFlushTime = time.Since(varFlushStart)
-	storage.PutWriteBatch(varBatch)
 
 	phase2Time := time.Since(phase2Start)
 	totalTime := time.Since(start)
@@ -775,20 +826,100 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 		phase1DecodeErrors.Load(), phase2DecodeErrors.Load(),
 		phase1CodeBytes.Load(), phase2Vars.Load(), allowEarlyExit)
 
-	structures.TELACount.Store(int64(telaCount))
-
-	// Save cache for instant subsequent startups (Jofito: never repeat work)
-	cacheSaveStart := time.Now()
-	if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, otherClassSCIDs, chainHeight); err != nil {
-		logger.Errorf("Classify cache save: %v", err)
+	if allowEarlyExit {
+		structures.TELACount.Add(int64(telaCount))
 	} else {
-		cacheSaveTime = time.Since(cacheSaveStart)
-		logger.Infof("Classify cache v%d saved: %d INDEX + %d DOC + %d other classes at height %d",
-			telaCacheVersion, len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, chainHeight)
+		structures.TELACount.Store(int64(telaCount))
 	}
-	if cacheSaveTime > 0 {
-		logger.Infof("Classify cache save timing: cache_save=%s", cacheSaveTime.Round(time.Millisecond))
+
+	// Save cache for instant subsequent startups (Jofito: never repeat work).
+	//
+	// Gated on a clean probe: the drain-on-shutdown rework means the tail now
+	// RUNS on Ctrl-C (workers drain instead of leaking the feeder), so without
+	// this gate a partially-covered probe would persist a cache claiming
+	// completeness at chainHeight and the skipped SCIDs would never be
+	// re-probed. Same hazard for RPC-failed batches (whole batches silently
+	// dropped). Decode errors are tolerated here — unlike the cross-DB seed,
+	// the local cache self-heals on version bumps and scvars sanity checks.
+	cacheSaveStart := time.Now()
+	localCacheClean := !idx.Closing.Load() && phase1RPCErrors.Load() == 0 && phase2RPCErrors.Load() == 0
+	if !allowEarlyExit && localCacheClean {
+		if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, otherClassSCIDs, chainHeight); err != nil {
+			logger.Errorf("Classify cache save: %v", err)
+		} else {
+			cacheSaveTime = time.Since(cacheSaveStart)
+			logger.Infof("Classify cache v%d saved: %d INDEX + %d DOC + %d other classes at height %d",
+				telaCacheVersion, len(telaIndexSCIDs), len(telaDocSCIDs), otherCount, chainHeight)
+		}
+		if cacheSaveTime > 0 {
+			logger.Infof("Classify cache save timing: cache_save=%s", cacheSaveTime.Round(time.Millisecond))
+		}
+	} else if !allowEarlyExit {
+		logger.Warnf("Classify cache save skipped: degraded probe (closing=%v rpc_errs=%d/%d)",
+			idx.Closing.Load(), phase1RPCErrors.Load(), phase2RPCErrors.Load())
+	} else {
+		logger.Info("Classify cache save skipped for delta probe")
 	}
+	saveSeed := seedCtx != nil && shouldSaveSeedCache(
+		idx.Closing.Load(),
+		phase1RPCErrors.Load(), phase2RPCErrors.Load(),
+		phase1DecodeErrors.Load(), phase2DecodeErrors.Load(),
+		allowEarlyExit, varFlushOK, seedCtx.RegistryHash,
+	)
+	if seedCtx != nil && !allowEarlyExit && !saveSeed {
+		logger.Warnf("Classify seed cache save skipped: degraded probe (closing=%v rpc_errs=%d/%d decode_errs=%d/%d var_flush_ok=%v registry_hash_set=%v)",
+			idx.Closing.Load(), phase1RPCErrors.Load(), phase2RPCErrors.Load(),
+			phase1DecodeErrors.Load(), phase2DecodeErrors.Load(), varFlushOK, seedCtx.RegistryHash != "")
+	}
+	if saveSeed {
+		seedCache := newClassifySeedCacheFromProbe(
+			seedCtx.Network,
+			seedCtx.GnomonSCID,
+			seedCtx.RegistryHash,
+			chainHeight,
+			telaIndexSCIDs,
+			telaDocSCIDs,
+			otherClassSCIDs,
+			codeBatch,
+			varBatch,
+		)
+		seedSaveStart := time.Now()
+		if err := saveClassifySeedCache(classifySeedCacheDir(idx), seedCache); err != nil {
+			logger.Errorf("Classify seed cache save: %v", err)
+		} else {
+			logger.Infof("Classify seed cache v%d saved: %d class records, %d var snapshots, %d code snapshots in %s",
+				classifySeedCacheVersion, len(seedCache.Classes), len(seedCache.Variables), len(seedCache.Codes),
+				time.Since(seedSaveStart).Round(time.Millisecond))
+		}
+	}
+	storage.PutWriteBatch(varBatch)
+	storage.PutWriteBatch(codeBatch)
+}
+
+// shouldSaveSeedCache is the probe-tail gate deciding whether a finished
+// classify probe is complete enough to persist as a cross-DB seed cache.
+// The seed's registry-hash match asserts COMPLETENESS for that registry
+// state: any machine that loads it will skip the full probe entirely. So a
+// partial/degraded probe must never be saved — it would permanently mask
+// the dropped SCIDs everywhere the seed is reused.
+//
+// Disqualifiers:
+//   - closing: shutdown mid-probe; workers drained without doing RPC work.
+//   - rpcErrs1/rpcErrs2: a phase-1/2 batch failed even after retry — every
+//     SCID in that batch was silently dropped from classification.
+//   - decodeErrs1/decodeErrs2: included deliberately. A failed
+//     UnmarshalResult drops that SCID just as surely as a failed batch RPC;
+//     the local TELA cache tolerates this (it self-heals on version bumps),
+//     but the seed cache's completeness claim cannot. Conservative > fast.
+//   - allowEarlyExit: delta probes stop scanning once finds dry up, so
+//     their coverage is intentionally partial.
+//   - !varFlushOK: the local DB never committed what the seed would claim.
+//   - registryHash == "": no completeness anchor to verify against on load.
+func shouldSaveSeedCache(closing bool, rpcErrs1, rpcErrs2, decodeErrs1, decodeErrs2 int64, allowEarlyExit, varFlushOK bool, registryHash string) bool {
+	if closing || allowEarlyExit || !varFlushOK || registryHash == "" {
+		return false
+	}
+	return rpcErrs1 == 0 && rpcErrs2 == 0 && decodeErrs1 == 0 && decodeErrs2 == 0
 }
 
 // telaCache stores discovered SCIDs for instant subsequent startups.

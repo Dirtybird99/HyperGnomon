@@ -198,7 +198,12 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 	if err := os.MkdirAll(segDir, 0700); err != nil {
 		return fmt.Errorf("mkdir segment dir: %w", err)
 	}
-	segStore, err := storage.NewBboltStore(segDir, strings.Join(ss.SearchFilter, ";;;"))
+	// No mmap reservation: segment temp DBs hold ~SegmentSize blocks each and
+	// ALL coexist until the final merge, so the main store's 256 MiB
+	// pre-extension would multiply into hundreds of GiB of temp disk on
+	// Windows for a long range. Bounded DBs never hit the re-mmap growth
+	// stalls the reservation targets.
+	segStore, err := storage.NewBboltStoreWithMmap(segDir, strings.Join(ss.SearchFilter, ";;;"), 0)
 	if err != nil {
 		return fmt.Errorf("open segment db: %w", err)
 	}
@@ -618,9 +623,11 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 
 	case "height":
 		return b.ForEach(func(k, v []byte) error {
-			scid := string(k)
-			var heights []int64
-			if err := msgpack.Unmarshal(v, &heights); err != nil {
+			// Segment stores are written by FlushBatch, so entries arrive in
+			// the composite <scid>:<BE8:h> layout; legacy whole-list blobs
+			// remain decodable for pre-composite segment DBs.
+			scid, heights, err := storage.DecodeHeightEntry(k, v)
+			if err != nil {
 				segLog.Warnf("merge heights: %s: %v", scid, err)
 				return nil
 			}
@@ -632,9 +639,8 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 
 	case "normaltxwithscid":
 		return b.ForEach(func(k, v []byte) error {
-			addr := string(k)
-			var txs []*structures.NormalTXWithSCIDParse
-			if err := msgpack.Unmarshal(v, &txs); err != nil {
+			addr, txs, err := storage.DecodeNormalTxEntry(k, v)
+			if err != nil {
 				segLog.Warnf("merge normaltx: %s: %v", addr, err)
 				return nil
 			}
@@ -678,9 +684,12 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 	default:
 		// Per-SCID invocation buckets: bucket name is the SCID itself
 		return b.ForEach(func(k, v []byte) error {
-			var detail structures.SCTXParse
-			if err := msgpack.Unmarshal(v, &detail); err != nil {
+			detail, err := storage.DecodeSCTXParse(v)
+			if err != nil {
 				segLog.Warnf("merge invoke %s/%s: %v", bucketName, string(k), err)
+				return nil
+			}
+			if detail == nil {
 				return nil
 			}
 			batch.AddInvocation(structures.InvokeRecord{
@@ -688,7 +697,7 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 				Sender:     detail.Sender,
 				Entrypoint: detail.Entrypoint,
 				Height:     detail.Height,
-				Details:    &detail,
+				Details:    detail,
 			})
 			return nil
 		})

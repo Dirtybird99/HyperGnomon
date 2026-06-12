@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/deroproject/derohe/block"
+	"github.com/deroproject/derohe/cryptography/crypto"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
 	"github.com/sirupsen/logrus"
@@ -45,6 +47,7 @@ type Indexer struct {
 	RecentBlocks           int64  // scan only last N blocks (0 = all)
 	FinalityDepth          int64  // blocks behind tip considered "safe" (default 10)
 	CodePolicy             string // sccode persistence policy: "none" | "tela" | "all"
+	ClassifySeedCacheDir   string // cross-DB classify seed cache directory (empty = OS user cache dir)
 	adaptiveBatchSize      atomic.Int64
 
 	// Backends
@@ -114,6 +117,10 @@ type Config struct {
 	//
 	// Empty-string defaults to "tela" inside Indexer.
 	CodePolicy string
+
+	// ClassifySeedCacheDir overrides the OS user cache directory used for the
+	// cross-DB classify seed cache. Empty uses the platform default.
+	ClassifySeedCacheDir string
 }
 
 // New creates a new Indexer with the given configuration.
@@ -166,6 +173,7 @@ func New(cfg Config) (*Indexer, error) {
 		RecentBlocks:           cfg.RecentBlocks,
 		FinalityDepth:          cfg.FinalityDepth,
 		CodePolicy:             normalizeCodePolicy(cfg.CodePolicy),
+		ClassifySeedCacheDir:   cfg.ClassifySeedCacheDir,
 		Store:                  store,
 		RPCPool:                pool,
 		Bus:                    cfg.Bus,
@@ -481,12 +489,13 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			}
 
 			for _, h := range bl.Tx_hashes {
-				hashStr := h.String()
-				hashBytes := h[:]
-				if len(hashBytes) >= 3 && hashBytes[0] == 0 && hashBytes[1] == 0 && hashBytes[2] == 0 {
+				// Check the registration prefix BEFORE hex-encoding: h.String()
+				// allocates and is pure waste for every registration TX (#9).
+				if isRegistrationTxHash(h) {
 					regCount++
 					continue
 				}
+				hashStr := h.String()
 				bi.txHashes = append(bi.txHashes, hashStr)
 				allTxHashes = append(allTxHashes, hashStr)
 			}
@@ -547,12 +556,13 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 
 	allTxHashes := make([]string, 0, len(bl.Tx_hashes))
 	for _, h := range bl.Tx_hashes {
-		hashStr := h.String()
-		hashBytes := h[:]
-		if len(hashBytes) >= 3 && hashBytes[0] == 0 && hashBytes[1] == 0 && hashBytes[2] == 0 {
+		// Same ordering as the batch fetcher: prefix check first, hex-encode
+		// only the hashes we keep (#9).
+		if isRegistrationTxHash(h) {
 			regCount++
 			continue
 		}
+		hashStr := h.String()
 		bi.txHashes = append(bi.txHashes, hashStr)
 		allTxHashes = append(allTxHashes, hashStr)
 	}
@@ -818,10 +828,8 @@ func (idx *Indexer) flusherLoop(in <-chan *processedBatch) {
 		if idx.AdaptBatchSize {
 			batchElapsed := time.Since(pb.batchStart)
 			batchSize := idx.currentBatchSize()
-			if batchElapsed < 1*time.Second && batchSize < 2000 {
-				idx.setCurrentBatchSize(min(batchSize*2, 2000))
-			} else if batchElapsed > 5*time.Second && batchSize > 10 {
-				idx.setCurrentBatchSize(max(batchSize/2, 10))
+			if next := nextAdaptiveBatchSize(batchElapsed, batchSize); next != batchSize {
+				idx.setCurrentBatchSize(next)
 			}
 		}
 	}
@@ -889,8 +897,8 @@ func (idx *Indexer) postScanVariableFetch() {
 func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Related_Info, txid string, height int64, batch *storage.WriteBatch) {
 	scArgs := tx.SCDATA
 	scFees := tx.Fees()
-	entrypoint := fmt.Sprintf("%v", scArgs.Value("entrypoint", "S"))
-	scAction := fmt.Sprintf("%v", scArgs.Value("SC_ACTION", "U"))
+	entrypoint := argString(scArgs, "entrypoint", rpc.DataString)
+	scAction := argString(scArgs, "SC_ACTION", rpc.DataUint64)
 
 	var method uint8
 	var scid string
@@ -900,7 +908,14 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 		scid = txid
 	} else {
 		method = structures.MethodInvokeSC
-		scid = fmt.Sprintf("%v", scArgs.Value("SC_ID", "H"))
+		scid = scidArgString(scArgs.Value("SC_ID", "H"))
+		if scid == "" {
+			// Malformed invoke with no SC_ID. The old fmt.Sprintf path
+			// rendered this as "<nil>" and stored junk harmlessly; an empty
+			// scid must not reach FlushBatch, where an empty bucket name
+			// would abort the whole atomic batch.
+			return
+		}
 	}
 
 	scid = hgpool.InternSCID(scid)
@@ -935,7 +950,7 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 				Owner: sender, Entrypoint: entrypoint, Fees: scFees,
 			})
 			// Classify from code only (turbo skips variable fetch).
-			code := fmt.Sprintf("%v", scArgs.Value("SC_CODE", "S"))
+			code := argString(scArgs, "SC_CODE", rpc.DataString)
 			sc := ClassifySC(scid, code, nil)
 			batch.AddClass(scid, &structures.ClassMeta{
 				Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
@@ -969,6 +984,31 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 	}
 }
 
+// isRegistrationTxHash reports whether a TX hash carries the registration
+// 3-zero-byte prefix. Callers check this BEFORE paying for h.String(): the
+// hex encoding allocates and registration TXs are skipped entirely (#9).
+func isRegistrationTxHash(h crypto.Hash) bool {
+	return h[0] == 0 && h[1] == 0 && h[2] == 0
+}
+
+// scidArgString renders an SC_ID argument value as its canonical string form
+// without fmt's reflection cost (#10). derohe delivers DataHash args as
+// crypto.Hash; missing SC_ID (nil) maps to "" rather than fmt's "<nil>".
+func scidArgString(v interface{}) string {
+	switch x := v.(type) {
+	case crypto.Hash:
+		return x.String()
+	case string:
+		return x
+	case fmt.Stringer:
+		return x.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
+
 // varsToMap converts parseSCVariables output to the string-keyed map
 // ClassifySC expects. Non-string keys are ignored.
 func varsToMap(vars []*structures.SCIDVariable) map[string]interface{} {
@@ -981,9 +1021,34 @@ func varsToMap(vars []*structures.SCIDVariable) map[string]interface{} {
 	return m
 }
 
+func argString(args rpc.Arguments, name string, dtype rpc.DataType) string {
+	for _, arg := range args {
+		if arg.Name != name || arg.DataType != dtype {
+			continue
+		}
+		switch v := arg.Value.(type) {
+		case string:
+			return v
+		case uint64:
+			return strconv.FormatUint(v, 10)
+		case int64:
+			return strconv.FormatInt(v, 10)
+		case int:
+			return strconv.Itoa(v)
+		case fmt.Stringer:
+			return v.String()
+		case nil:
+			return ""
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	}
+	return ""
+}
+
 // handleInstallSC processes a new SC deployment.
 func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, tx *transaction.Transaction, batch *storage.WriteBatch) {
-	code := fmt.Sprintf("%v", scArgs.Value("SC_CODE", "S"))
+	code := argString(scArgs, "SC_CODE", rpc.DataString)
 
 	// Check search filter
 	if !idx.matchesFilter(code) {
@@ -1036,7 +1101,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 	batch.AddInstall(scid, height, &structures.InstallRecord{
 		Owner: sender, Entrypoint: entrypoint, Fees: fees,
 	})
-	sc := ClassifySC(scid, code, varsToMap(scVars))
+	sc := ClassifySCVars(scid, code, scVars)
 	batch.AddClass(scid, &structures.ClassMeta{
 		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
 		DURL: sc.DURL, Version: sc.Version,
@@ -1093,6 +1158,8 @@ func normalizeCodePolicy(p string) string {
 }
 
 const maxClassifyProbeBatchSize = 1000
+const maxAdaptiveBatchSize = 1000
+const minAdaptiveBatchSize = 10
 
 func normalizeClassifyProbeBatchSize(n int) int {
 	if n <= 0 {
@@ -1102,6 +1169,16 @@ func normalizeClassifyProbeBatchSize(n int) int {
 		return maxClassifyProbeBatchSize
 	}
 	return n
+}
+
+func nextAdaptiveBatchSize(batchElapsed time.Duration, batchSize int) int {
+	if batchElapsed < time.Second && batchSize < maxAdaptiveBatchSize {
+		return min(batchSize*2, maxAdaptiveBatchSize)
+	}
+	if batchElapsed > 5*time.Second && batchSize > minAdaptiveBatchSize {
+		return max(batchSize/2, minAdaptiveBatchSize)
+	}
+	return batchSize
 }
 
 const (
@@ -1171,7 +1248,7 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 	// Route B: refresh class metadata (TELA apps bump version via STORE) and
 	// record addr→scid edge.
 	if len(scVars) > 0 {
-		sc := ClassifySC(scid, "", varsToMap(scVars))
+		sc := ClassifySCVars(scid, "", scVars)
 		// Preserve InstallHeight if we have prior meta; this is a refresh.
 		existingMeta, _ := idx.Store.GetSCIDClass(scid)
 		installH := height
@@ -1234,12 +1311,26 @@ func parseSCVariables(result *rpc.GetSC_Result) []*structures.SCIDVariable {
 	if result == nil {
 		return nil
 	}
-	vars := make([]*structures.SCIDVariable, 0, len(result.VariableStringKeys)+len(result.VariableUint64Keys))
+	n := len(result.VariableStringKeys) + len(result.VariableUint64Keys)
+	if n == 0 {
+		return nil
+	}
+	// Arena allocation (#11): one backing array for all variable structs
+	// instead of one heap object per variable (2 allocs total vs n+1).
+	// Callers never append to or reslice the returned slice, so the interior
+	// pointers stay valid for the arena's lifetime.
+	arena := make([]structures.SCIDVariable, n)
+	vars := make([]*structures.SCIDVariable, n)
+	i := 0
 	for k, v := range result.VariableStringKeys {
-		vars = append(vars, &structures.SCIDVariable{Key: k, Value: v})
+		arena[i] = structures.SCIDVariable{Key: k, Value: v}
+		vars[i] = &arena[i]
+		i++
 	}
 	for k, v := range result.VariableUint64Keys {
-		vars = append(vars, &structures.SCIDVariable{Key: k, Value: v})
+		arena[i] = structures.SCIDVariable{Key: k, Value: v}
+		vars[i] = &arena[i]
+		i++
 	}
 	return vars
 }
@@ -1281,7 +1372,7 @@ type IndexSingleSCIDResult struct {
 //  1. If skipfsrecheck && meta already in class bucket, return cached.
 //  2. GetSC(scid, -1, nil, nil, !varsonly) via the RPC pool. -1 means "tip".
 //  3. If vars empty, return ErrSCIDNotFound (SC doesn't exist on-chain).
-//  4. ClassifySC(scid, code, varsToMap(vars)) → class meta.
+//  4. ClassifySCVars(scid, code, vars) → class meta.
 //  5. Persist: owner (if extractable), variables at tip height, class, install.
 //  6. Publish an EventInstall via the bus so subscribers learn about it.
 //
@@ -1334,13 +1425,9 @@ func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (
 		height = idx.LastIndexedHeight.Load()
 	}
 
-	varsMap := varsToMap(scVars)
-
-	// Owner from variables if present. ClassifySC headers and the classifier
-	// both read from the same map so we only build it once.
 	owner := ""
-	if v, ok := varsMap["owner"]; ok {
-		owner = fmt.Sprintf("%v", v)
+	if v, ok := lookupVar(scVars, "owner"); ok {
+		owner = varString(v)
 	}
 
 	// Code is only present when !varsonly. ClassifySC handles "" gracefully.
@@ -1349,7 +1436,7 @@ func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (
 		code = result.Code
 	}
 
-	sc := ClassifySC(scid, code, varsMap)
+	sc := ClassifySCVars(scid, code, scVars)
 
 	// Preserve an earlier install height if one was previously recorded. This
 	// matters when addscid_toindex is called multiple times against the same

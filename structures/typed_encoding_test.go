@@ -75,9 +75,114 @@ func TestAddrSCIDEntry_AppendMatchesMarshal(t *testing.T) {
 	}
 }
 
+func TestInstallRecord_TypedRoundTrip(t *testing.T) {
+	cases := []InstallRecord{
+		{},
+		{Owner: "dero1qyjjxxaabbccddeeff0011223344556677889900aabbccddee00112233445566"},
+		{Owner: "owner", Entrypoint: "Initialize", Fees: 12345},
+	}
+	for _, c := range cases {
+		b := c.MarshalTyped()
+		if !IsInstallRecordTyped(b) {
+			t.Fatalf("typed install record not detected: %x", b)
+		}
+		var got InstallRecord
+		if err := got.UnmarshalTyped(b); err != nil {
+			t.Fatalf("UnmarshalTyped(%+v): %v", c, err)
+		}
+		if got != c {
+			t.Fatalf("round-trip drift: got %+v want %+v", got, c)
+		}
+	}
+}
+
+func TestInstallRecord_AppendMatchesMarshal(t *testing.T) {
+	r := InstallRecord{Owner: "owner", Entrypoint: "Initialize", Fees: 99}
+	a := r.MarshalTyped()
+	b := r.MarshalTypedAppend(nil)
+	if !bytes.Equal(a, b) {
+		t.Fatalf("MarshalTyped vs MarshalTypedAppend differ:\n  Marshal:       %x\n  AppendAppend:  %x", a, b)
+	}
+}
+
+func TestInstallRecord_TagRejectsMsgpack(t *testing.T) {
+	r := InstallRecord{Owner: "owner", Entrypoint: "Initialize", Fees: 99}
+	mp, err := msgpack.Marshal(&r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsInstallRecordTyped(mp) {
+		t.Fatalf("msgpack blob mis-identified as typed: first byte = 0x%02x", mp[0])
+	}
+	var decoded InstallRecord
+	if err := decoded.UnmarshalTyped(mp); err == nil {
+		t.Fatalf("UnmarshalTyped accepted msgpack bytes (first byte 0x%02x)", mp[0])
+	}
+}
+
+func TestSCTXParse_TurboTypedRoundTrip(t *testing.T) {
+	in := SCTXParse{
+		Txid:       "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		Scid:       "a05395bb0cf77adc850928b0db00eb5ca7a9ccbafd9a38d021c8d299ad5ce1a4",
+		Entrypoint: "InputStr",
+		Method:     MethodInvokeSC,
+		Sender:     "dero1qyjjxxaabbccddeeff0011223344556677889900aabbccddee00112233445566",
+		Fees:       12345,
+		Height:     6927400,
+	}
+	blob := in.MarshalTurboTyped()
+	if !IsSCTXParseTurboTyped(blob) {
+		t.Fatalf("typed SCTXParse not detected: %x", blob)
+	}
+	var got SCTXParse
+	if err := got.UnmarshalTurboTyped(blob); err != nil {
+		t.Fatalf("UnmarshalTurboTyped: %v", err)
+	}
+	if got.Txid != in.Txid || got.Scid != in.Scid || got.Entrypoint != in.Entrypoint ||
+		got.Method != in.Method || got.Sender != in.Sender || got.Fees != in.Fees ||
+		got.Height != in.Height {
+		t.Fatalf("round-trip drift:\n got=%+v\nwant=%+v", got, in)
+	}
+	if got.ScArgs != nil || got.Payloads != nil {
+		t.Fatalf("turbo decode populated non-turbo fields: %+v", got)
+	}
+}
+
+func TestSCTXParse_TurboAppendMatchesMarshal(t *testing.T) {
+	in := SCTXParse{Txid: "tx", Scid: "scid", Entrypoint: "E", Method: MethodInstallSC, Sender: "sender", Fees: 7, Height: 8}
+	a := in.MarshalTurboTyped()
+	b := in.MarshalTurboTypedAppend(nil)
+	if !bytes.Equal(a, b) {
+		t.Fatalf("MarshalTurboTyped vs append differ:\n  Marshal: %x\n  Append:  %x", a, b)
+	}
+}
+
+func TestSCTXParse_TurboTagRejectsMsgpack(t *testing.T) {
+	in := SCTXParse{Txid: "tx", Scid: "scid", Entrypoint: "E", Method: MethodInstallSC}
+	mp, err := msgpack.Marshal(&in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsSCTXParseTurboTyped(mp) {
+		t.Fatalf("msgpack blob mis-identified as typed: first byte = 0x%02x", mp[0])
+	}
+	var got SCTXParse
+	if err := got.UnmarshalTurboTyped(mp); err == nil {
+		t.Fatalf("UnmarshalTurboTyped accepted msgpack bytes (first byte 0x%02x)", mp[0])
+	}
+}
+
 // ---------- benchmarks ----------
 
 var benchEntry = AddrSCIDEntry{FirstHeight: 6927000, LastHeight: 6927500, Count: 3381}
+
+// Package-level sinks: the fixed-size typed codecs inline completely, so even
+// inside b.Loop a discarded result stack-allocates and the body folds to a
+// no-op (~0.1 ns/op). Storing to a global keeps the measured work real.
+var (
+	benchSinkBytes []byte
+	benchSinkEntry AddrSCIDEntry
+)
 
 // BenchmarkAddrSCIDEntry_Marshal_Msgpack is the current baseline.
 func BenchmarkAddrSCIDEntry_Marshal_Msgpack(b *testing.B) {
@@ -93,8 +198,8 @@ func BenchmarkAddrSCIDEntry_Marshal_Msgpack(b *testing.B) {
 // BenchmarkAddrSCIDEntry_Marshal_Typed is the candidate.
 func BenchmarkAddrSCIDEntry_Marshal_Typed(b *testing.B) {
 	b.ReportAllocs()
-	for range b.N {
-		_ = benchEntry.MarshalTyped()
+	for b.Loop() {
+		benchSinkBytes = benchEntry.MarshalTyped()
 	}
 }
 
@@ -103,11 +208,9 @@ func BenchmarkAddrSCIDEntry_Marshal_Typed(b *testing.B) {
 func BenchmarkAddrSCIDEntry_Marshal_TypedAppend(b *testing.B) {
 	buf := make([]byte, 0, EncodedAddrSCIDEntrySize)
 	b.ReportAllocs()
-	for range b.N {
-		buf = buf[:0]
-		buf = benchEntry.MarshalTypedAppend(buf)
+	for b.Loop() {
+		buf = benchEntry.MarshalTypedAppend(buf[:0])
 	}
-	_ = buf
 }
 
 func BenchmarkAddrSCIDEntry_Unmarshal_Msgpack(b *testing.B) {
@@ -124,12 +227,12 @@ func BenchmarkAddrSCIDEntry_Unmarshal_Msgpack(b *testing.B) {
 
 func BenchmarkAddrSCIDEntry_Unmarshal_Typed(b *testing.B) {
 	blob := benchEntry.MarshalTyped()
-	b.ResetTimer()
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		var e AddrSCIDEntry
 		if err := e.UnmarshalTyped(blob); err != nil {
 			b.Fatal(err)
 		}
+		benchSinkEntry = e
 	}
 }

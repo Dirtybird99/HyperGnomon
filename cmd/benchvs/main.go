@@ -51,6 +51,9 @@ func main() {
 	probeWorkers := flag.Int("probe-workers", 32, "concurrent probe workers")
 	probePaths := flag.String("probe-paths", "/api/getinfo,/api/getstats,/api/getscids", "comma-separated paths to probe")
 	outFile := flag.String("out", "bench_vs_civilware.md", "markdown output file (appended)")
+	jsonOutFile := flag.String("json-out", "", "optional JSONL output file (appended one object per run)")
+	targetRef := flag.String("target-ref", "", "source ref/build label for machine-readable reports")
+	trial := flag.Int("trial", 0, "trial number for machine-readable reports")
 	daemonFlag := flag.String("daemon-flag", "--daemon-rpc-address", "name of the daemon flag on the target binary")
 	dbDirFlag := flag.String("db-dir-flag", "--db-dir", "name of the db-dir flag on the target binary")
 	readyLogPattern := flag.String("ready-log-pattern", "", "optional comma-separated child-log markers to wait for before API probes")
@@ -90,6 +93,8 @@ func main() {
 
 	result := Result{
 		Name:          *name,
+		TargetRef:     *targetRef,
+		Trial:         *trial,
 		Binary:        filepath.Base(*binary),
 		Daemon:        *daemon,
 		GoVersion:     runtime.Version(),
@@ -108,6 +113,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer proc.Stop()
+	result.LogPath = proc.LogPath
 
 	// 2. Wait for it to reach tip. Time from process start to tip.
 	fmt.Printf("benchvs: waiting for tip (up to %s)...\n", *tipTimeout)
@@ -161,6 +167,13 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("benchvs: appended result to %s\n", *outFile)
+	if *jsonOutFile != "" {
+		if err := appendJSONReport(*jsonOutFile, result); err != nil {
+			fmt.Fprintf(os.Stderr, "benchvs: write json report: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("benchvs: appended json result to %s\n", *jsonOutFile)
+	}
 }
 
 func splitCSV(raw string) []string {

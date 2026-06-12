@@ -81,10 +81,31 @@ Then point benchvs at it on a different API port:
 
 The same `--out` file accumulates both sections.
 
+## Machine-readable output
+
+`benchvs` can also append JSONL for orchestration tools:
+
+```bash
+./benchvs \
+    --name=workspace \
+    --target-ref=workspace \
+    --trial=1 \
+    --binary=./hypergnomon \
+    --daemon=203.0.113.10:10102 \
+    --db-dir=/tmp/hg-bench \
+    --json-out=benchmatrix.jsonl
+```
+
+Each JSON row includes the target label/ref, trial number, timing values in
+milliseconds, DB bytes, API latency percentiles, classify timing line, and the
+child log path. Markdown output remains enabled through `--out`; JSONL is only
+written when `--json-out` is set.
+
 ## What benchvs does not measure (v1.0)
 
 - **RSS** at steady state. Cross-platform child-process memory sampling would require either a platform-specific shim (Linux: `/proc/<pid>/status`; macOS: `proc_pidinfo`; Windows: `GetProcessMemoryInfo`) or child-side cooperation (subprocess exposes its own `runtime.MemStats` on an HTTP endpoint). Both are tractable; neither is a v1.0 blocker. Track in a follow-up.
 - **Concurrent indexer runs.** The harness intentionally measures one at a time — see the rationale at the top.
+- **Data size vs file size.** The DB-size metric is the file's size on disk. On Windows, HyperGnomon builds with the 256 MiB mmap pre-extension (see DOCS/FLAGS.md `--db-dir`) report at least 256 MiB regardless of data volume — compare DB sizes only across targets that share the same mmap behavior, or run on Linux where the file stays at data size.
 
 ## Flags
 
@@ -102,6 +123,11 @@ Run `benchvs -h` for the full list. The knobs most operators will touch:
 | `--probe-workers` | `32` | Concurrent probe workers |
 | `--probe-duration` | `60s` | Probe window after reaching tip |
 | `--tip-timeout` | `15m` | Max wait for indexer to reach tip |
+| `--ready-log-pattern` | `""` | Optional comma-separated child-log markers to wait for (after tip) before probing; `cmd/benchmatrix` sets this to `Classify probe complete` |
+| `--ready-timeout` | `5m` | Max wait for `--ready-log-pattern` after reaching tip |
 | `--out` | `bench_vs_civilware.md` | Markdown file (appended) |
+| `--json-out` | `""` | Optional JSONL file (appended) |
+| `--target-ref` | `""` | Source ref/build label for JSONL reports |
+| `--trial` | `0` | Trial number for JSONL reports |
 | `--daemon-flag` | `--daemon-rpc-address` | Name of the daemon flag on the target binary |
 | `--db-dir-flag` | `--db-dir` | Name of the db-dir flag on the target binary |

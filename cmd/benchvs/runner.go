@@ -28,10 +28,7 @@ type Proc struct {
 // does NOT wait for readiness — that's the tip-detection loop's job.
 func startIndexer(bin string, args []string) (*Proc, error) {
 	cmd := exec.Command(bin, args...) // #nosec G204 -- benchvs intentionally launches an operator-selected benchmark binary.
-	logPath := filepath.Join(filepath.Dir(bin), "benchvs.log")
-	if dbDir := findDBDir(args); dbDir != "" {
-		logPath = filepath.Join(dbDir, "..", "benchvs.log")
-	}
+	logPath := logPathForRun(bin, args)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- log path is derived from operator-selected benchmark paths.
 	if err != nil {
 		return nil, fmt.Errorf("open log %s: %w", logPath, err)
@@ -43,6 +40,14 @@ func startIndexer(bin string, args []string) (*Proc, error) {
 		return nil, err
 	}
 	return &Proc{cmd: cmd, StartedAt: time.Now(), LogPath: logPath}, nil
+}
+
+func logPathForRun(bin string, args []string) string {
+	dbDir := findDBDir(args)
+	if dbDir == "" {
+		return filepath.Join(filepath.Dir(bin), "benchvs.log")
+	}
+	return filepath.Join(filepath.Dir(dbDir), filepath.Base(dbDir)+"-benchvs.log")
 }
 
 // Stop terminates the subprocess. Best-effort: sends interrupt first
