@@ -319,7 +319,7 @@ func UnmarshalSCIDVariablesTyped(b []byte) ([]*SCIDVariable, error) {
 	// occupies at least 4 wire bytes (2 fields × (kind byte + ≥1 payload
 	// byte)), so a count exceeding remaining/4 is corrupt and would only
 	// fail later — reject it before the arena make can balloon.
-	if uint64(n)*4 > uint64(len(b)-5) {
+	if uint64(n)*4 > uint64(len(b)-5) { // #nosec G115 -- len(b) >= 5 is guaranteed by the header check above, so the operand is non-negative.
 		return nil, ErrInvalidSCIDVariables
 	}
 	out := make([]*SCIDVariable, n)

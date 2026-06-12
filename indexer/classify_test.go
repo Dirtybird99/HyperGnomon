@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/deroproject/derohe/rpc"
+
 	"github.com/hypergnomon/hypergnomon/structures"
 )
 

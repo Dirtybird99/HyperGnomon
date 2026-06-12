@@ -779,11 +779,12 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			slices.Sort(heights)
 			for i := 0; i < len(heights); {
 				h := heights[i]
+				count := uint64(1)
 				j := i + 1
 				for j < len(heights) && heights[j] == h {
 					j++
+					count++
 				}
-				count := uint64(j - i)
 				i = j
 				keyBuf = appendHeightKey(keyBuf[:0], scid, h)
 				if existing := heightBucket.Get(keyBuf); len(existing) > 0 {
