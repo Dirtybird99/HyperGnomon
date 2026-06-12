@@ -406,7 +406,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 				continue
 			}
 			// Got a new block! Build a single-block fetchedBatch.
-			h := uint64(lastHeight + 1)
+			h := uint64(lastHeight + 1) // #nosec G115 -- chain heights are 0..2^62; lastHeight is never negative.
 			fb := idx.fetchSingleBlock(result, h)
 			if fb != nil {
 				caughtUp = false
@@ -426,7 +426,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		// === ROUND TRIP 1: Batch fetch all blocks ===
 		heights := make([]uint64, fetchCount)
 		for i := 0; i < fetchCount; i++ {
-			heights[i] = uint64(lastHeight) + uint64(i) + 1
+			heights[i] = uint64(lastHeight) + uint64(i) + 1 // #nosec G115 -- chain heights are 0..2^62; lastHeight is never negative.
 		}
 
 		var blockResults []*rpc.GetBlock_Result
@@ -483,7 +483,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			// M2 will truncate+replay.
 			if !firstBlockChecked && len(bl.Tips) > 0 {
 				firstBlockChecked = true
-				if ok, storedAt := idx.CheckReorgAt(int64(heights[i]), bl.Tips[0].String()); !ok {
+				if ok, storedAt := idx.CheckReorgAt(int64(heights[i]), bl.Tips[0].String()); !ok { // #nosec G115 -- heights derive from lastHeight+i, far below 2^62.
 					idx.onReorgDetected(storedAt, int64(heights[i]))
 				}
 			}
@@ -1346,7 +1346,9 @@ func (idx *Indexer) Close() {
 		idx.RPCPool.Close()
 	}
 	if idx.Store != nil {
-		idx.Store.Close()
+		if err := idx.Store.Close(); err != nil {
+			logger.Warnf("store close: %v", err)
+		}
 	}
 }
 

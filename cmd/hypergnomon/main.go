@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -86,11 +86,25 @@ func main() {
 	classifySeedCacheDir := flag.String("classify-seed-cache-dir", "", "Cross-DB classify seed cache directory (empty = OS user cache)")
 	flag.Parse()
 
-	// Start pprof server if requested
+	// Start pprof server if requested. Handlers are registered on a
+	// dedicated mux (not DefaultServeMux) so profiling is only ever exposed
+	// on the operator-chosen --pprof address, and the server sets a header
+	// timeout so a slow client can't hold connections open indefinitely.
 	if *pprofAddr != "" {
 		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			srv := &http.Server{
+				Addr:              *pprofAddr,
+				Handler:           mux,
+				ReadHeaderTimeout: 5 * time.Second,
+			}
 			structures.Logger.Infof("pprof listening on %s", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+			if err := srv.ListenAndServe(); err != nil {
 				structures.Logger.Errorf("pprof server exited: %v", err)
 			}
 		}()
