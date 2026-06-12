@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -193,7 +194,11 @@ func (ws *WSServer) Start() error {
 		return err
 	}
 	logger.Infof("WS JSON-RPC listening on %s/ws", ws.addr)
-	return http.Serve(ln, mux)
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	return srv.Serve(ln)
 }
 
 // ServeWS is the http.HandlerFunc for the /ws endpoint.

@@ -60,15 +60,7 @@ var (
 // encHeight BE-encodes a uint64 height into an 8-byte slice.
 func encHeight(h int64) []byte {
 	var b [8]byte
-	u := uint64(h) // #nosec G115 -- chain heights are 0..2^62 (doc above); negative heights never reach key encoding.
-	b[0] = byte(u >> 56)
-	b[1] = byte(u >> 48)
-	b[2] = byte(u >> 40)
-	b[3] = byte(u >> 32)
-	b[4] = byte(u >> 24)
-	b[5] = byte(u >> 16)
-	b[6] = byte(u >> 8)
-	b[7] = byte(u)
+	binary.BigEndian.PutUint64(b[:], uint64(h)) // #nosec G115 -- chain heights are 0..2^62 (doc above); negative heights never reach key encoding.
 	return b[:]
 }
 
@@ -77,8 +69,7 @@ func decHeight(b []byte) int64 {
 	if len(b) < 8 {
 		return 0
 	}
-	return int64(uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
-		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7]))
+	return int64(binary.BigEndian.Uint64(b)) // #nosec G115 -- see encHeight: heights are 0..2^62.
 }
 
 // installKey packs <BE8:h>|<scid> for prefix scans by height.
