@@ -398,7 +398,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			var result *rpc.GetBlock_Result
 			err := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
 				var e error
-				result, e = c.GetBlockByHeight(uint64(lastHeight + 1))
+				result, e = c.GetBlockByHeight(uint64(lastHeight + 1)) // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 				return e
 			})
 			if err != nil {
@@ -454,7 +454,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 			if result == nil {
 				continue
 			}
-			bi := blockInfo{height: int64(heights[i])}
+			bi := blockInfo{height: int64(heights[i])} // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 
 			var bl block.Block
 			// Binary path first (faster than JSON for the hot loop)
@@ -535,7 +535,7 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 
 // fetchSingleBlock builds a fetchedBatch from one speculative block result.
 func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64) *fetchedBatch {
-	bi := blockInfo{height: int64(height)}
+	bi := blockInfo{height: int64(height)} // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 	var regCount int64
 
 	var bl block.Block

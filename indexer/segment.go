@@ -235,7 +235,7 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 				wi := hgpool.GetWorkItem()
 				wi.Height = h
 
-				hash, err := client.GetBlockHash(uint64(h))
+				hash, err := client.GetBlockHash(uint64(h)) // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 				if err != nil {
 					wi.Err = fmt.Errorf("block hash %d: %w", h, err)
 					mu.Lock()
@@ -263,7 +263,7 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 				}
 
 				bt := hgpool.GetBlockTxns()
-				bt.Topoheight = int64(bl.Height)
+				bt.Topoheight = int64(bl.Height) // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 				for _, txHash := range bl.Tx_hashes {
 					bt.TxHashes = append(bt.TxHashes, txHash.String())
 				}

@@ -167,7 +167,7 @@ func (idx *Indexer) FastSync(testnet bool) error {
 			case int64:
 				entry.height = v
 			case uint64:
-				entry.height = int64(v)
+				entry.height = int64(v) // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
 			}
 		}
 	}
