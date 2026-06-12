@@ -178,17 +178,18 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 							if len(vars) == 0 {
 								continue
 							}
-							varMap := varsToMap(vars)
-							sc := ClassifySC(chunk[i], "", varMap)
-							durl, version := telaFieldsForClass(class, varMap)
+							// Single-pass: class comes from the class bucket we're
+							// refreshing, so seed it and let extractClassVars pull
+							// DURL/Version in the same walk (audit #8).
+							sc := ClassifySCVarsWithClass(chunk[i], class, vars)
 							meta := &structures.ClassMeta{
 								Class:         class,
 								Tags:          classTags,
 								Name:          sc.Name,
 								Desc:          sc.Desc,
 								IconURL:       sc.IconURL,
-								DURL:          durl,
-								Version:       version,
+								DURL:          sc.DURL,
+								Version:       sc.Version,
 								InstallHeight: chainHeight,
 								LastHeight:    chainHeight,
 							}

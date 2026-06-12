@@ -3,6 +3,7 @@ package indexer
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/hypergnomon/hypergnomon/structures"
@@ -156,6 +157,172 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 	return sc
 }
 
+// ClassifySCVars is the allocation-light variant for indexer hot paths that
+// already hold parsed SC variables as a slice. It mirrors ClassifySC without
+// first materializing a map.
+func ClassifySCVars(scid string, code string, vars []*structures.SCIDVariable) SCClass {
+	sc := SCClass{
+		Class: "UNKNOWN",
+		Tags:  []string{"all"},
+	}
+
+	switch scid {
+	case structures.NameServiceSCID:
+		sc.Class = "NAMESERVICE"
+		sc.Tags = append(sc.Tags, "nameservice")
+		extractClassVars(&sc, vars)
+		return sc
+	case structures.GnomonSCID_Mainnet, structures.GnomonSCID_Testnet:
+		sc.Class = "GNOMONSC"
+		sc.Tags = append(sc.Tags, "gnomon")
+		extractClassVars(&sc, vars)
+		return sc
+	}
+
+	for _, r := range rules {
+		if strings.Contains(code, r.pattern) {
+			sc.Class = r.class
+			sc.Tags = append(sc.Tags, r.tag)
+			break
+		}
+	}
+	if sc.Class == "UNKNOWN" && code != "" && classifyDEROAsset(code) {
+		sc.Class = "DERO-ASSET"
+		sc.Tags = append(sc.Tags, "asset")
+	}
+	extractClassVars(&sc, vars)
+	return sc
+}
+
+// ClassifySCVarsWithClass classifies the variables of a SCID whose class was
+// already proven by a code probe (fastsync phase 1) or the class bucket
+// (RefreshClassVars). Seeding sc.Class/Tags up front lets extractClassVars
+// apply the class-gated fields — Version, Mods, DocType, DURL, DocShard, and
+// the G45 metadata blob — in its single pass, replacing the pre-fix pattern
+// of ClassifySCVars + telaFieldsForClassVars that walked the variable slice
+// three times per SCID (audit #8).
+//
+// An empty class falls back to ClassifySCVars' code-less path (UNKNOWN).
+func ClassifySCVarsWithClass(scid, class string, vars []*structures.SCIDVariable) SCClass {
+	if class == "" {
+		return ClassifySCVars(scid, "", vars)
+	}
+	sc := SCClass{
+		Class: class,
+		Tags:  tagsForClass(class),
+	}
+	extractClassVars(&sc, vars)
+	return sc
+}
+
+func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
+	if vars == nil {
+		return
+	}
+	var headerName, legacyName, freeName string
+	var headerDesc, legacyDesc, freeDesc string
+	var headerIcon, legacyIcon string
+	var durl, telaVersion, docVersion, docType, mods, metadata string
+
+	// Stringify ONLY inside matched cases: a live TELA INDEX carries dozens
+	// of non-matching vars (rating-address keys with uint64 values, DOC
+	// pointers, counters), and paying varString's formatting cost for every
+	// one of them dominated this loop pre-fix (audit #7).
+	for _, v := range vars {
+		k, ok := v.Key.(string)
+		if !ok {
+			continue
+		}
+		switch k {
+		case "var_header_name":
+			headerName = decodeHexIfPrintable(varString(v.Value))
+		case "var_header_description":
+			headerDesc = decodeHexIfPrintable(varString(v.Value))
+		case "var_header_icon":
+			headerIcon = decodeHexIfPrintable(varString(v.Value))
+		case "nameHdr":
+			legacyName = decodeHexIfPrintable(varString(v.Value))
+		case "descrHdr":
+			legacyDesc = decodeHexIfPrintable(varString(v.Value))
+		case "iconURLHdr":
+			legacyIcon = decodeHexIfPrintable(varString(v.Value))
+		case "name":
+			freeName = decodeHexIfPrintable(varString(v.Value))
+		case "description":
+			freeDesc = decodeHexIfPrintable(varString(v.Value))
+		case "dURL":
+			durl = decodeHexIfPrintable(varString(v.Value))
+		case "telaVersion":
+			telaVersion = decodeHexIfPrintable(varString(v.Value))
+		case "docVersion":
+			docVersion = decodeHexIfPrintable(varString(v.Value))
+		case "docType":
+			docType = decodeHexIfPrintable(varString(v.Value))
+		case "mods":
+			mods = decodeHexIfPrintable(varString(v.Value))
+		case "metadata":
+			metadata = varString(v.Value)
+		}
+	}
+
+	switch {
+	case headerName != "":
+		sc.Name = headerName
+	case legacyName != "":
+		sc.Name = legacyName
+	case freeName != "":
+		sc.Name = freeName
+	}
+	switch {
+	case headerDesc != "":
+		sc.Desc = headerDesc
+	case legacyDesc != "":
+		sc.Desc = legacyDesc
+	case freeDesc != "":
+		sc.Desc = freeDesc
+	}
+	switch {
+	case headerIcon != "":
+		sc.IconURL = headerIcon
+	case legacyIcon != "":
+		sc.IconURL = legacyIcon
+	}
+
+	if len(sc.Tags) > 1 && sc.Tags[1] == "g45" && metadata != "" {
+		extractG45MetadataString(sc, metadata)
+	}
+
+	if durl != "" {
+		sc.DURL = durl
+	}
+	switch sc.Class {
+	case "TELA-INDEX-1":
+		if telaVersion != "" {
+			sc.Version = telaVersion
+		}
+		if mods != "" {
+			for _, m := range strings.Split(mods, ",") {
+				m = strings.TrimSpace(m)
+				if m != "" {
+					sc.Mods = append(sc.Mods, m)
+				}
+			}
+		}
+	case "TELA-DOC-1":
+		if docVersion != "" {
+			sc.Version = docVersion
+		}
+		if docType != "" {
+			sc.DocType = docType
+		}
+	}
+	if sc.DURL != "" {
+		if strings.HasSuffix(sc.DURL, ".shard") || strings.HasSuffix(sc.DURL, ".shards") {
+			sc.DocShard = true
+		}
+	}
+}
+
 // extractTELAFields pulls dURL, the legacy version key, docType (DOC-1),
 // mods (INDEX-1), and the DocShard flag (via dURL suffix) from vars.
 // No-op unless the class is a TELA family member.
@@ -219,6 +386,27 @@ func telaFieldsForClass(class string, vars map[string]interface{}) (string, stri
 	case "TELA-DOC-1":
 		if v, ok := vars["docVersion"]; ok {
 			version = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	return durl, version
+}
+
+func telaFieldsForClassVars(class string, vars []*structures.SCIDVariable) (string, string) {
+	if vars == nil {
+		return "", ""
+	}
+	var durl, version string
+	if v, ok := lookupVar(vars, "dURL"); ok {
+		durl = decodeHexIfPrintable(varString(v))
+	}
+	switch class {
+	case "TELA-INDEX-1":
+		if v, ok := lookupVar(vars, "telaVersion"); ok {
+			version = decodeHexIfPrintable(varString(v))
+		}
+	case "TELA-DOC-1":
+		if v, ok := lookupVar(vars, "docVersion"); ok {
+			version = decodeHexIfPrintable(varString(v))
 		}
 	}
 	return durl, version
@@ -375,6 +563,10 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 	if !ok {
 		return
 	}
+	extractG45MetadataString(sc, str)
+}
+
+func extractG45MetadataString(sc *SCClass, str string) {
 	var meta map[string]interface{}
 	if err := json.Unmarshal([]byte(str), &meta); err != nil {
 		return
@@ -393,5 +585,32 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 		if v, ok := meta["icon"]; ok {
 			sc.IconURL = fmt.Sprintf("%v", v)
 		}
+	}
+}
+
+func lookupVar(vars []*structures.SCIDVariable, key string) (interface{}, bool) {
+	for _, v := range vars {
+		if k, ok := v.Key.(string); ok && k == key {
+			return v.Value, true
+		}
+	}
+	return nil, false
+}
+
+func varString(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case uint64:
+		return strconv.FormatUint(x, 10)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int:
+		return strconv.Itoa(x)
+	case float64:
+		// 'g'/-1/64 is exactly what fmt's %v produces for float64.
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	default:
+		return fmt.Sprintf("%v", v)
 	}
 }

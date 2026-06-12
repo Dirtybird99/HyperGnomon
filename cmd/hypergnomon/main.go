@@ -63,12 +63,12 @@ func main() {
 	// forward-populate entirely (lazy-fill on each read). "all" matches
 	// the pre-class-aware behavior (grows mainnet DB by ~134 MB).
 	//
-	// Legacy --skip-tela-doc-code still accepted and forces policy "none"
-	// for TELA-DOC-1 — equivalent behavior is now "none" applied broadly.
+	// The legacy --skip-tela-doc-code flag was removed in favor of this
+	// policy flag; its old behavior maps to "none".
 	codePolicy := flag.String("persist-install-code", "tela", "sccode persistence: none|tela|all (default tela — only TELA-{INDEX,DOC,MOD}-1 codes persisted)")
 	fastsync := flag.Bool("fastsync", false, "Enable fastsync from GnomonSC")
 	testnet := flag.Bool("testnet", false, "Use testnet GnomonSC SCID")
-	memLimit := flag.Int64("mem-limit", 0, "GOMEMLIMIT in bytes (0 = auto)")
+	memLimit := flag.Int64("mem-limit", 0, "GOMEMLIMIT in bytes (0 = unset)")
 	pprofAddr := flag.String("pprof-address", "", "pprof HTTP address (e.g. 127.0.0.1:6060, empty=disabled)")
 	debugMode := flag.Bool("debug", false, "Enable debug logging")
 	// --turbo defaults to true. Non-turbo is now a diagnostic / replay mode:
@@ -83,6 +83,7 @@ func main() {
 	telaOnly := flag.Bool("tela-only", false, "Only discover TELA apps, then exit (no chain scanning)")
 	timing := flag.Bool("timing", false, "Emit per-stage timing summaries (grouped fetcher/processor/flusher)")
 	timingEvery := flag.Int("timing-every", 10, "How many batches between timing summaries")
+	classifySeedCacheDir := flag.String("classify-seed-cache-dir", "", "Cross-DB classify seed cache directory (empty = OS user cache)")
 	flag.Parse()
 
 	// Start pprof server if requested
@@ -182,6 +183,7 @@ func main() {
 			TimingEvery:            *timingEvery,
 			Bus:                    bus,
 			CodePolicy:             *codePolicy,
+			ClassifySeedCacheDir:   *classifySeedCacheDir,
 		})
 		if err == nil {
 			connectedEndpoint = node
@@ -225,6 +227,7 @@ func main() {
 			TimingEvery:            *timingEvery,
 			Bus:                    bus,
 			CodePolicy:             *codePolicy,
+			ClassifySeedCacheDir:   *classifySeedCacheDir,
 		})
 		if err == nil {
 			connectedEndpoint = input
