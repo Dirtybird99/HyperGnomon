@@ -84,6 +84,7 @@ Differences:
 - No pre-opened store arguments — HyperGnomon opens its own bbolt store at the given `dbDir`.
 - Error return — civilware's shape panics on misconfiguration; HyperGnomon returns an error you can handle.
 - Recommended `parallelBlocks` is 8 (default). Civilware's 5 works; 16+ trips rate limits on remote daemons.
+- `fastSyncConfig` is accepted for signature compatibility but **not applied in v1.0** — the constructor ignores it. To fastsync, run the `hypergnomon` binary with `--fastsync`, or call the native indexer's `Indexer.FastSync` method (`github.com/hypergnomon/hypergnomon/indexer`).
 
 If you need to share a pre-opened store with another process (civilware callers sometimes do this), file an issue — external-store injection is tracked for v1.1.
 
@@ -127,7 +128,7 @@ bug, not an enhancement request.
 | `storage.BboltStore.GetSCIDValuesByKey` | ✓ | `any=true` walks all interaction heights |
 | `storage.BboltStore.GetSCIDKeysByValue` | ✓ | |
 | `storage.BboltStore.GetSCIDInteractionHeight` | ✓ | |
-| `structures.FastSyncConfig` | ✓ (same struct shape) | |
+| `structures.FastSyncConfig` | ✓ (same struct shape) | accepted by constructors for signature compatibility; not applied in v1.0 — use `--fastsync` / native `Indexer.FastSync` |
 | `structures.SCIDVariable` | ✓ (type alias) | |
 
 Anything not in this matrix hasn't been needed by a known consumer. If your code imports something missing, open an issue with the import path + call site.

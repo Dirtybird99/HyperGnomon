@@ -16,13 +16,24 @@ Number of concurrent WebSocket connections to the daemon. Higher values increase
 
 Rationale: v0.8 shipped `4`; measured probe-phase stalls on mainnet pushed this to `8` in v0.9. Values above `16` have shown rate-limit rejections from public nodes.
 
+Do not raise this expecting a faster classify probe: a `cmd/benchmatrix` sweep
+against the LAN mainnet daemon (June 2026, 2 matched trials per size) measured
+time-to-ready medians of 21.3 s / 22.0 s / 24.0 s for pool sizes 8 / 12 / 16 —
+cumulative phase-1 RPC wait grew proportionally with the connection count
+(48 s → 74 s → 97 s), i.e. the daemon serializes the work server-side and
+extra connections only add queueing.
+
+### `--rpc-compression` (default `true`)
+
+Enable WebSocket compression on new daemon RPC connections. Applies to every connection in the pool. Set `--rpc-compression=false` to disable, e.g. when diagnosing daemon-side framing issues or benchmarking raw transport cost.
+
 ### `--num-parallel-blocks` (default `8`)
 
 Block fetchers in the 3-stage pipeline. Higher values increase memory pressure and RPC concurrency. `8` pairs with the default `--rpc-pool-size=8` for one fetcher per connection.
 
 ### `--batch-size` (default `100`)
 
-Blocks per atomic bbolt flush. Bigger batches amortize the commit cost but increase RAM during the flush cycle. With `--adapt-batch=true` (default), HyperGnomon auto-tunes up to `2000` when flushes stay fast.
+Blocks per atomic bbolt flush. Bigger batches amortize the commit cost but increase RAM during the flush cycle. With `--adapt-batch=true` (default), HyperGnomon auto-tunes up to `1000` when flushes stay fast.
 
 ### `--recent-blocks` (default `0`)
 
@@ -34,13 +45,17 @@ MapReduce parallel initial sync. Splits the chain into segments processed by par
 
 ### `--mem-limit` (default `0`)
 
-`GOMEMLIMIT` in bytes. `0` means auto-detect (60% of system RAM). Set this if you're running HyperGnomon in a container with a hard memory cap.
+`GOMEMLIMIT` in bytes. `0` means no explicit limit (Go runtime default) — `debug.SetMemoryLimit` is only called when the value is above `0`. Set this if you're running HyperGnomon in a container with a hard memory cap.
 
 ## Sync + probe
 
 ### `--fastsync` (default `false`)
 
 Bootstrap from the GnomonSC on-chain registry instead of scanning every block from genesis. Highly recommended for TELA-focused workflows — skips ~6.8M blocks of chain scan.
+
+### `--classify-probe-batch-size` (default `400`)
+
+SCIDs packed into each phase-1 classify `GetSC(code=true)` JSON-RPC batch during FastSync. Values `<= 0` reset to the default `400`; values above `1000` are capped at `1000`. LAN benchmarking showed `400` keeps startup close to the 1000-SCID-ceiling throughput without making each response frame as large.
 
 ### `--turbo` (default `true`)
 
@@ -52,6 +67,18 @@ Turbo follow-up variable policy after the indexer reaches tip:
 
 - `lazy` — skip the historical all-SCID variable sweep. TELA variables still come from the classify/TELA probe and refresher; broad metadata is filled by targeted/on-demand paths.
 - `all` — fetch variables for every indexed SCID after startup. This preserves the old cold-start behavior but adds roughly a minute on current mainnet against the LAN benchmark daemon.
+
+### `--classify-seed-cache-dir` (default `""`)
+
+Directory for the cross-DB classify seed cache. Empty uses the OS user cache
+directory. The seed cache is keyed by network, GnomonSC SCID, schema version,
+registry hash, and height; a clean FastSync can seed class metadata, TELA
+variables, and persisted TELA install code from a verified prior run instead
+of repeating the full `GetSC(code=true)` classify probe.
+
+Set this only when you want benchmark isolation or an operator-controlled cache
+location. If the cache is missing, stale, corrupt, or registry-mismatched,
+HyperGnomon falls back to the normal live classify probe.
 
 ### `--tela-only` (default `false`)
 
@@ -79,7 +106,7 @@ Policy for the `sccode` bucket (install-time SC code persistence):
 - `tela` (**default**) — persists only `TELA-INDEX-1`, `TELA-DOC-1`, `TELA-MOD-1`. These are the classes whose content server + `GetInitialSCIDCode` consumers actually read. Adds ~15 MB to mainnet DB.
 - `all` — persists every SC's install code. Matches the pre-class-aware behavior; adds ~134 MB to mainnet DB.
 
-Legacy `--skip-tela-doc-code` is still accepted and coerces the policy toward `none` for `TELA-DOC-1`.
+The legacy `--skip-tela-doc-code` flag has been removed in favor of `--persist-install-code` (passing it now makes the binary exit at flag parsing). Its old behavior maps to `--persist-install-code=none`.
 
 ### `--tela-verify-sigs` (default `false`)
 
@@ -127,3 +154,13 @@ Emit per-stage (fetcher, processor, flusher) timing summaries every N batches. O
 ### `--db-dir` (default `gnomondb`)
 
 bbolt database directory. Created if missing.
+
+On Windows the database file is pre-extended to **256 MiB** at open (64-bit
+builds): bbolt's memory map is reserved up front so the file never re-maps as
+it grows. Re-mapping on Windows tears down and recreates the file mapping
+with transactions quiesced, which measurably stalled large write bursts — the
+classify-probe variable flush took 4.1–4.3 s against a growing DB vs
+0.41–0.44 s with the reservation (live mainnet daemon, June 2026). On
+Linux/macOS only virtual address space is reserved and the file stays at its
+data size. Once the data outgrows 256 MiB the reservation has no further
+effect.
