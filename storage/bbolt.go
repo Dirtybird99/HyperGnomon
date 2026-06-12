@@ -37,9 +37,10 @@ var (
 	// bucketScVarsLatest stores scid -> BE8 latest snapshot height. It avoids
 	// prefix-scanning every scvars snapshot for latest-rating reads.
 	bucketScVarsLatest = []byte("scvars_latest")
-	// bucketNormTx: "<addr>:<BE8:h>:<txid>" -> msgpack NormalTXWithSCIDParse
-	// (single record, append-only). Legacy layout "<addr>" -> msgpack list
-	// stays readable; readers merge legacy-then-composite.
+	// bucketNormTx: "<addr>:<BE8:h>:<txid>:<scid>" -> msgpack
+	// NormalTXWithSCIDParse (single record, append-only). Legacy layout
+	// "<addr>" -> msgpack list stays readable; readers merge
+	// legacy-then-composite.
 	bucketNormTx  = []byte("normaltxwithscid")
 	bucketInvalid = []byte("invalidscidinvokes")
 
@@ -108,14 +109,21 @@ func appendHeightKey(dst []byte, scid string, h int64) []byte {
 	return append(dst, encHeight(h)...)
 }
 
-// appendNormTxKey packs <addr>:<BE8:h>:<txid> into dst. ':' never occurs in
-// a DERO address or a hex txid.
-func appendNormTxKey(dst []byte, addr string, h int64, txid string) []byte {
+// appendNormTxKey packs <addr>:<BE8:h>:<txid>:<scid> into dst. ':' never
+// occurs in a DERO address, a hex txid, or a hex scid. The SCID is part of
+// the key because one multi-asset TX emits one record per (payload SCID,
+// ring member) sharing the same (addr, height, txid) — omitting it made the
+// later Put silently overwrite the earlier record's SCID association.
+// Exact-duplicate records (same addr/height/txid/scid, e.g. two payloads of
+// one asset) intentionally coalesce: they are byte-identical.
+func appendNormTxKey(dst []byte, addr string, h int64, txid, scid string) []byte {
 	dst = append(dst, addr...)
 	dst = append(dst, ':')
 	dst = append(dst, encHeight(h)...)
 	dst = append(dst, ':')
-	return append(dst, txid...)
+	dst = append(dst, txid...)
+	dst = append(dst, ':')
+	return append(dst, scid...)
 }
 
 // sortedBatchKeys returns a map's keys in ascending order. Go map iteration
@@ -147,6 +155,14 @@ func DecodeHeightEntry(k, v []byte) (string, []int64, error) {
 				n = cnt
 			}
 		}
+		// The store runs NoSync during initial sync, so a torn value after a
+		// crash is in-model; bound the count before allocating so one corrupt
+		// byte hits the callers' warn-and-skip handling instead of an
+		// out-of-memory panic. Same pattern as UnmarshalSCIDVariablesTyped.
+		const maxHeightCount = 1 << 20
+		if n > maxHeightCount {
+			return string(k[:sep]), nil, fmt.Errorf("height count %d exceeds sanity bound %d", n, maxHeightCount)
+		}
 		heights := make([]int64, n)
 		for i := range heights {
 			heights[i] = h
@@ -162,7 +178,10 @@ func DecodeHeightEntry(k, v []byte) (string, []int64, error) {
 
 // DecodeNormalTxEntry interprets one KV pair from the "normaltxwithscid"
 // bucket in either layout and returns the address plus its records.
-// Exposed for the segment-merge path.
+// Exposed for the segment-merge path. Composite detection only needs the
+// first two separators — the full record lives in the value — so the
+// <addr>:<BE8:h>:<txid>:<scid> form and the briefly-used scid-less form
+// decode identically.
 func DecodeNormalTxEntry(k, v []byte) (string, []*structures.NormalTXWithSCIDParse, error) {
 	if sep := bytes.IndexByte(k, ':'); sep >= 0 && len(k) > sep+1+8 && k[sep+1+8] == ':' {
 		var rec structures.NormalTXWithSCIDParse
@@ -188,8 +207,29 @@ type BboltStore struct {
 	Path string
 }
 
-// NewBboltStore opens or creates a BoltDB database.
+// NewBboltStore opens or creates a BoltDB database with the 256 MiB mmap
+// reservation appropriate for the long-lived main store.
 func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
+	return NewBboltStoreWithMmap(dbDir, searchFilter, mainStoreMmapSize)
+}
+
+// mainStoreMmapSize reserves the main store's mmap up front. Without it,
+// bbolt re-mmaps each time the file doubles — on Windows that tears down and
+// recreates the file mapping with transactions quiesced, which stalled write
+// bursts: the classify-probe variable flush measured 4.1-4.3 s against a
+// growing DB vs 0.41-0.44 s with the reservation (live mainnet daemon, June
+// 2026). 256 MiB covers today's ~131 MiB mainnet DB with headroom; bbolt
+// ignores the option once the file is larger. Trade-off: on Windows the file
+// mapping requires the file itself to be extended, so the DB occupies
+// 256 MiB on disk from the start (documented in DOCS/FLAGS.md). On Unix only
+// address space is reserved.
+const mainStoreMmapSize = 256 << 20
+
+// NewBboltStoreWithMmap opens or creates a BoltDB database with an explicit
+// initial mmap reservation. Short-lived bounded stores — the per-segment
+// temp DBs hold ~10k blocks each and many coexist before the merge — pass 0
+// so they don't each pre-extend their file on Windows.
+func NewBboltStoreWithMmap(dbDir string, searchFilter string, initialMmapSize int) (*BboltStore, error) {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir %s: %w", dbDir, err)
 	}
@@ -205,19 +245,8 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 		NoFreelistSync: true,
 		FreelistType:   bolt.FreelistMapType,
 	}
-	if strconv.IntSize == 64 {
-		// Reserve the mmap up front. Without it, bbolt re-mmaps each time the
-		// file doubles — on Windows that tears down and recreates the file
-		// mapping with transactions quiesced, which stalled write bursts:
-		// the classify-probe variable flush measured 4.1-4.3 s against a
-		// growing DB vs 0.41-0.44 s with the reservation (live mainnet
-		// daemon, June 2026). 256 MiB covers today's ~131 MiB mainnet DB
-		// with headroom; bbolt ignores the option once the file is larger.
-		// Trade-off: on Windows the file mapping requires the file itself to
-		// be extended, so the DB occupies 256 MiB on disk from the start
-		// (documented in DOCS/FLAGS.md). On Unix only address space is
-		// reserved.
-		opts.InitialMmapSize = 256 << 20
+	if strconv.IntSize == 64 && initialMmapSize > 0 {
+		opts.InitialMmapSize = initialMmapSize
 	}
 	db, err := bolt.Open(dbPath, 0600, opts)
 	if err != nil {
@@ -508,7 +537,7 @@ func (s *BboltStore) GetSCIDInteractionHeights(scid string) ([]int64, error) {
 func (s *BboltStore) StoreNormalTxWithSCIDByAddr(addr string, ntx *structures.NormalTXWithSCIDParse) error {
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNormTx)
-		key := appendNormTxKey(make([]byte, 0, len(addr)+1+8+1+len(ntx.Txid)), addr, ntx.Height, ntx.Txid)
+		key := appendNormTxKey(make([]byte, 0, len(addr)+1+8+1+len(ntx.Txid)+1+len(ntx.Scid)), addr, ntx.Height, ntx.Txid, ntx.Scid)
 		val, err := msgpack.Marshal(ntx)
 		if err != nil {
 			return err
@@ -663,6 +692,13 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		var lastInvScid string
 		var lastInvBucket *bolt.Bucket
 		for _, inv := range batch.Invocations {
+			if inv.Scid == "" {
+				// Defense in depth: an empty bucket name makes bbolt error
+				// and FlushBatch is all-or-nothing — one malformed record
+				// must not drop the whole batch.
+				logger.Warnf("batch invoke with empty scid skipped (txid=%s height=%d)", inv.Details.Txid, inv.Height)
+				continue
+			}
 			b := lastInvBucket
 			if b == nil || inv.Scid != lastInvScid {
 				var err error
@@ -772,7 +808,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				if ntx == nil {
 					continue
 				}
-				keyBuf = appendNormTxKey(keyBuf[:0], addr, ntx.Height, ntx.Txid)
+				keyBuf = appendNormTxKey(keyBuf[:0], addr, ntx.Height, ntx.Txid, ntx.Scid)
 				val, err := msgpack.Marshal(ntx)
 				if err != nil {
 					return fmt.Errorf("batch normaltx marshal: %w", err)

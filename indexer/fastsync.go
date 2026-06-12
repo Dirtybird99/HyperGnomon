@@ -832,9 +832,18 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 		structures.TELACount.Store(int64(telaCount))
 	}
 
-	// Save cache for instant subsequent startups (Jofito: never repeat work)
+	// Save cache for instant subsequent startups (Jofito: never repeat work).
+	//
+	// Gated on a clean probe: the drain-on-shutdown rework means the tail now
+	// RUNS on Ctrl-C (workers drain instead of leaking the feeder), so without
+	// this gate a partially-covered probe would persist a cache claiming
+	// completeness at chainHeight and the skipped SCIDs would never be
+	// re-probed. Same hazard for RPC-failed batches (whole batches silently
+	// dropped). Decode errors are tolerated here — unlike the cross-DB seed,
+	// the local cache self-heals on version bumps and scvars sanity checks.
 	cacheSaveStart := time.Now()
-	if !allowEarlyExit {
+	localCacheClean := !idx.Closing.Load() && phase1RPCErrors.Load() == 0 && phase2RPCErrors.Load() == 0
+	if !allowEarlyExit && localCacheClean {
 		if err := saveTELACache(idx.DBDir, telaIndexSCIDs, telaDocSCIDs, otherClassSCIDs, chainHeight); err != nil {
 			logger.Errorf("Classify cache save: %v", err)
 		} else {
@@ -845,6 +854,9 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 		if cacheSaveTime > 0 {
 			logger.Infof("Classify cache save timing: cache_save=%s", cacheSaveTime.Round(time.Millisecond))
 		}
+	} else if !allowEarlyExit {
+		logger.Warnf("Classify cache save skipped: degraded probe (closing=%v rpc_errs=%d/%d)",
+			idx.Closing.Load(), phase1RPCErrors.Load(), phase2RPCErrors.Load())
 	} else {
 		logger.Info("Classify cache save skipped for delta probe")
 	}

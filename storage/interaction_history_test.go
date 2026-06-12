@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -287,6 +288,79 @@ func TestNormalTx_CompositeRoundTripAndLegacyMerge(t *testing.T) {
 	other, err := store.GetNormalTxWithSCIDByAddr("dero1qzzzz")
 	if err != nil || len(other) != 0 {
 		t.Fatalf("unrelated addr: txs=%v err=%v", other, err)
+	}
+}
+
+// TestNormalTx_MultiPayloadDistinctSCIDs is the merge-gate regression: one
+// DERO tx with two asset payloads emits two records sharing (addr, height,
+// txid) but with different SCIDs. The first composite-key layout omitted the
+// SCID from the key, so the second Put silently destroyed the first record's
+// SCID association — data main preserved.
+func TestNormalTx_MultiPayloadDistinctSCIDs(t *testing.T) {
+	store := newTestStore(t)
+	addr := "dero1qyjjxxaabbccddeeff0011223344556677889900aabbccddee00112233445566"
+	txid := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	scidA := "1111111111111111111111111111111111111111111111111111111111111111"
+	scidB := "2222222222222222222222222222222222222222222222222222222222222222"
+
+	batch := NewWriteBatch()
+	batch.NormalTxs[addr] = append(batch.NormalTxs[addr],
+		&structures.NormalTXWithSCIDParse{Txid: txid, Scid: scidA, Fees: 1, Height: 42},
+		&structures.NormalTXWithSCIDParse{Txid: txid, Scid: scidB, Fees: 1, Height: 42},
+	)
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	PutWriteBatch(batch)
+
+	txs, err := store.GetNormalTxWithSCIDByAddr(addr)
+	if err != nil {
+		t.Fatalf("GetNormalTxWithSCIDByAddr: %v", err)
+	}
+	if len(txs) != 2 {
+		t.Fatalf("multi-payload records collapsed: got %d, want 2: %+v", len(txs), txs)
+	}
+	scids := map[string]bool{}
+	for _, rec := range txs {
+		scids[rec.Scid] = true
+	}
+	if !scids[scidA] || !scids[scidB] {
+		t.Fatalf("SCID association lost: %+v", txs)
+	}
+}
+
+// One malformed empty-scid invocation must not abort the whole atomic batch.
+func TestFlushBatch_EmptyScidInvocationSkipped(t *testing.T) {
+	store := newTestStore(t)
+
+	batch := NewWriteBatch()
+	batch.AddInvocation(structures.InvokeRecord{
+		Scid: "", Sender: "dero1qbad", Entrypoint: "X", Height: 5,
+		Details: &structures.SCTXParse{Txid: "junk", Height: 5},
+	})
+	batch.AddInvocation(structures.InvokeRecord{
+		Scid: benchHistScid, Sender: "dero1qgood", Entrypoint: "InputStr", Height: 5,
+		Details: &structures.SCTXParse{Txid: "goodtx", Scid: benchHistScid, Height: 5},
+	})
+	batch.AddInteractionHeight(benchHistScid, 5)
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("flush with empty-scid invocation must not fail: %v", err)
+	}
+	PutWriteBatch(batch)
+
+	got, err := store.GetInvokeDetailsBySCID(benchHistScid)
+	if err != nil || len(got) != 1 || got[0].Txid != "goodtx" {
+		t.Fatalf("good record lost alongside skipped junk: %+v err=%v", got, err)
+	}
+}
+
+func TestDecodeHeightEntry_CorruptCountBounded(t *testing.T) {
+	key := appendHeightKey(nil, benchHistScid, 42)
+	corrupt := make([]byte, binary.MaxVarintLen64)
+	binary.PutUvarint(corrupt, 1<<60)
+	_, _, err := DecodeHeightEntry(key, corrupt)
+	if err == nil {
+		t.Fatal("corrupt huge count must error, not allocate")
 	}
 }
 

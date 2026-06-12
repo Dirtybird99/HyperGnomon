@@ -198,7 +198,12 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 	if err := os.MkdirAll(segDir, 0700); err != nil {
 		return fmt.Errorf("mkdir segment dir: %w", err)
 	}
-	segStore, err := storage.NewBboltStore(segDir, strings.Join(ss.SearchFilter, ";;;"))
+	// No mmap reservation: segment temp DBs hold ~SegmentSize blocks each and
+	// ALL coexist until the final merge, so the main store's 256 MiB
+	// pre-extension would multiply into hundreds of GiB of temp disk on
+	// Windows for a long range. Bounded DBs never hit the re-mmap growth
+	// stalls the reservation targets.
+	segStore, err := storage.NewBboltStoreWithMmap(segDir, strings.Join(ss.SearchFilter, ";;;"), 0)
 	if err != nil {
 		return fmt.Errorf("open segment db: %w", err)
 	}

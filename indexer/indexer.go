@@ -909,6 +909,13 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 	} else {
 		method = structures.MethodInvokeSC
 		scid = scidArgString(scArgs.Value("SC_ID", "H"))
+		if scid == "" {
+			// Malformed invoke with no SC_ID. The old fmt.Sprintf path
+			// rendered this as "<nil>" and stored junk harmlessly; an empty
+			// scid must not reach FlushBatch, where an empty bucket name
+			// would abort the whole atomic batch.
+			return
+		}
 	}
 
 	scid = hgpool.InternSCID(scid)
