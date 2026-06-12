@@ -298,7 +298,7 @@ func (ws *WSServer) handleConn(conn *websocket.Conn) {
 	}
 	defer func() {
 		cctx.cancelAllSubs()
-		conn.Close()
+		_ = conn.Close() // best-effort teardown; read loop already exited
 	}()
 
 	for {

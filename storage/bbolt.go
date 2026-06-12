@@ -60,7 +60,7 @@ var (
 // encHeight BE-encodes a uint64 height into an 8-byte slice.
 func encHeight(h int64) []byte {
 	var b [8]byte
-	u := uint64(h)
+	u := uint64(h) // #nosec G115 -- chain heights are 0..2^62 (doc above); negative heights never reach key encoding.
 	b[0] = byte(u >> 56)
 	b[1] = byte(u >> 48)
 	b[2] = byte(u >> 40)
@@ -274,7 +274,7 @@ func NewBboltStoreWithMmap(dbDir string, searchFilter string, initialMmapSize in
 		return nil
 	})
 	if err != nil {
-		db.Close()
+		_ = db.Close() // best-effort: the open error is the one worth surfacing
 		return nil, fmt.Errorf("bbolt init buckets: %w", err)
 	}
 
