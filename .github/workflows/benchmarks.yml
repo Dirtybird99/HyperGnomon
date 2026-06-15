@@ -11,6 +11,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege token: write needed for github-action-benchmark alert comments
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   benchmark:
     name: Run Benchmarks
@@ -30,9 +35,9 @@ jobs:
       - name: Run benchmarks
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            go test ./... -run='^$' -bench=. -benchmem -count=1 | tee benchmark-results.txt
+            go test ./... -run='^$' -bench=. -benchmem -benchtime=500ms -count=1 | tee benchmark-results.txt
           else
-            go test ./... -run='^$' -bench=. -benchmem -count=5 | tee benchmark-results.txt
+            go test ./... -run='^$' -bench=. -benchmem -benchtime=500ms -count=5 | tee benchmark-results.txt
           fi
 
       - name: Upload benchmark results
