@@ -18,18 +18,18 @@ jobs:
     timeout-minutes: 10  # MUST-HAVE #3: Job timeout
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # MUST-HAVE #1: Caching via setup-go
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           cache: true
 
       # Additional cache for golangci-lint
       - name: Cache golangci-lint
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/golangci-lint
           key: ${{ runner.os }}-golangci-${{ hashFiles('.golangci.yml') }}
@@ -75,10 +75,10 @@ jobs:
     timeout-minutes: 15  # MUST-HAVE #3: Job timeout
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           cache: true
@@ -102,10 +102,10 @@ jobs:
     needs: [lint, test]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           cache: true
@@ -128,7 +128,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
