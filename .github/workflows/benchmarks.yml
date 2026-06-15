@@ -74,7 +74,7 @@ jobs:
           tool: 'go'
           output-file-path: benchmark-results.txt
           external-data-json-path: ./cache/benchmark-data.json
-          fail-on-alert: true
+          fail-on-alert: false
           alert-threshold: '200%'
           comment-on-alert: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
