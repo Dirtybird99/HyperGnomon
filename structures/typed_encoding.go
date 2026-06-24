@@ -3,6 +3,7 @@ package structures
 import (
 	"encoding/binary"
 	"errors"
+	"unsafe"
 )
 
 // Typed binary encoding for hot-path structs (DESIGN notes: msgpack
@@ -121,15 +122,26 @@ func (r *InstallRecord) UnmarshalTyped(b []byte) error {
 		return ErrInvalidInstallRecord
 	}
 	r.Fees = binary.BigEndian.Uint64(b[1:9])
-	pos := 9
-	var err error
-	if r.Owner, pos, err = readLenString(b, pos); err != nil {
+	// Locate Owner + Entrypoint ranges without allocating, then copy both into
+	// ONE owned backing buffer — 1 alloc instead of two separate string(b[...])
+	// copies. The strings view owned, never-mutated memory, never the bbolt
+	// buffer b (freed after the read). See TestLoop_NoAlias_InstallRecord.
+	os, oe, pos, err := locLenString(b, 9)
+	if err != nil {
 		return ErrInvalidInstallRecord
 	}
-	if r.Entrypoint, pos, err = readLenString(b, pos); err != nil {
+	es, ee, _, err := locLenString(b, pos)
+	if err != nil {
 		return ErrInvalidInstallRecord
 	}
-	_ = pos
+	total := (oe - os) + (ee - es)
+	var sbuf []byte
+	if total > 0 {
+		sbuf = make([]byte, total)
+	}
+	off := 0
+	r.Owner = ownedCut(sbuf, &off, b, os, oe)
+	r.Entrypoint = ownedCut(sbuf, &off, b, es, ee)
 	return nil
 }
 
@@ -158,9 +170,20 @@ func (s *SCTXParse) CanMarshalTurboTyped() bool {
 }
 
 func (s *SCTXParse) MarshalTurboTyped() []byte {
-	buf := make([]byte, 0, sctxParseTurboMinHeaderSize+
-		len(s.Txid)+len(s.Scid)+len(s.Entrypoint)+len(s.Sender)+4)
-	return s.MarshalTurboTypedAppend(buf)
+	return s.MarshalTurboTypedAppend(make([]byte, 0, s.SizeTurboTyped()))
+}
+
+// SizeTurboTyped returns the exact byte length MarshalTurboTyped produces for
+// s. Exported so a caller batching many turbo records (e.g. a FlushBatch value
+// arena) can pre-size one shared buffer. Stays in lockstep with
+// MarshalTurboTypedAppend (handles ≥128-byte fields via uvarintLen, unlike the
+// old +4 lower-bound estimate).
+func (s *SCTXParse) SizeTurboTyped() int {
+	return sctxParseTurboMinHeaderSize +
+		uvarintLen(uint64(len(s.Txid))) + len(s.Txid) +
+		uvarintLen(uint64(len(s.Scid))) + len(s.Scid) +
+		uvarintLen(uint64(len(s.Entrypoint))) + len(s.Entrypoint) +
+		uvarintLen(uint64(len(s.Sender))) + len(s.Sender)
 }
 
 func (s *SCTXParse) MarshalTurboTypedAppend(dst []byte) []byte {
@@ -182,24 +205,74 @@ func (s *SCTXParse) UnmarshalTurboTyped(b []byte) error {
 	s.Method = b[1]
 	s.Fees = binary.BigEndian.Uint64(b[2:10])
 	s.Height = int64FromBits(binary.BigEndian.Uint64(b[10:18]))
+
+	// Locate the four length-prefixed string ranges without allocating, then
+	// copy them all into ONE owned backing buffer. The previous code did four
+	// separate string(b[...]) copies (4 allocs); this is a single alloc. The
+	// returned strings view sbuf — freshly allocated, never mutated after the
+	// copies, and outliving both b and the strings themselves — so they do NOT
+	// alias the caller's b (which a bbolt View frees after the read returns).
+	// Guarded by TestLoop_NoAlias_SCTXParseTurbo.
 	pos := 18
-	var err error
-	if s.Txid, pos, err = readLenString(b, pos); err != nil {
-		return ErrInvalidSCTXParseTurbo
+	var rs, re [4]int
+	for i := 0; i < 4; i++ {
+		st, en, nx, err := locLenString(b, pos)
+		if err != nil {
+			return ErrInvalidSCTXParseTurbo
+		}
+		rs[i], re[i] = st, en
+		pos = nx
 	}
-	if s.Scid, pos, err = readLenString(b, pos); err != nil {
-		return ErrInvalidSCTXParseTurbo
+	total := (re[0] - rs[0]) + (re[1] - rs[1]) + (re[2] - rs[2]) + (re[3] - rs[3])
+	var sbuf []byte
+	if total > 0 {
+		sbuf = make([]byte, total)
 	}
-	if s.Entrypoint, pos, err = readLenString(b, pos); err != nil {
-		return ErrInvalidSCTXParseTurbo
-	}
-	if s.Sender, pos, err = readLenString(b, pos); err != nil {
-		return ErrInvalidSCTXParseTurbo
-	}
+	off := 0
+	s.Txid = ownedCut(sbuf, &off, b, rs[0], re[0])
+	s.Scid = ownedCut(sbuf, &off, b, rs[1], re[1])
+	s.Entrypoint = ownedCut(sbuf, &off, b, rs[2], re[2])
+	s.Sender = ownedCut(sbuf, &off, b, rs[3], re[3])
 	s.ScArgs = nil
 	s.Payloads = nil
-	_ = pos
 	return nil
+}
+
+// ownedCut copies b[start:end] into sbuf at *off (advancing it) and returns a
+// string viewing that owned region. Empty ranges return "" without touching
+// sbuf. The caller guarantees sbuf has room for every cut and never mutates it
+// afterward, so the returned strings are safe, non-aliasing views into memory
+// the decoder owns. Shared by the turbo/typed decoders that coalesce their
+// string fields into a single backing allocation.
+func ownedCut(sbuf []byte, off *int, b []byte, start, end int) string {
+	n := end - start
+	if n == 0 {
+		return ""
+	}
+	copy(sbuf[*off:*off+n], b[start:end])
+	out := unsafe.String(&sbuf[*off], n)
+	*off += n
+	return out
+}
+
+// locLenString returns the [start,end) byte range of a uvarint-length-prefixed
+// string at pos, plus the next read position, WITHOUT allocating the string.
+// Companion to readLenString for decoders that coalesce their string fields.
+func locLenString(b []byte, pos int) (start, end, next int, err error) {
+	if pos >= len(b) {
+		return 0, 0, pos, ErrInvalidClassMeta
+	}
+	n, nLen := binary.Uvarint(b[pos:])
+	if nLen <= 0 {
+		return 0, 0, pos, ErrInvalidClassMeta
+	}
+	pos += nLen
+	if uint64(len(b)-pos) < n { // #nosec G115 -- pos is bounded by prior slice and varint checks.
+		return 0, 0, pos, ErrInvalidClassMeta
+	}
+	start = pos
+	end = pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
+	return start, end, end, nil
 }
 
 func IsSCTXParseTurboTyped(b []byte) bool {
@@ -266,11 +339,19 @@ func MarshalSCIDVariablesTypedAppend(dst []byte, vars []*SCIDVariable) []byte {
 // log2(size) grow+copy cycles per snapshot. Wire bytes are identical to
 // MarshalSCIDVariablesTypedAppend (it delegates to it).
 func MarshalSCIDVariablesTyped(vars []*SCIDVariable) []byte {
+	return MarshalSCIDVariablesTypedAppend(make([]byte, 0, SizeSCIDVariablesTyped(vars)), vars)
+}
+
+// SizeSCIDVariablesTyped returns the exact byte length MarshalSCIDVariablesTyped
+// produces for vars. Exported so a caller batching many snapshots (e.g. a
+// FlushBatch value arena) can pre-size one shared buffer instead of allocating
+// per snapshot. Stays in lockstep with appendVarField via sizeVarField.
+func SizeSCIDVariablesTyped(vars []*SCIDVariable) int {
 	size := 1 + 4 // tag + count (BE uint32)
 	for _, v := range vars {
 		size += sizeVarField(v.Key) + sizeVarField(v.Value)
 	}
-	return MarshalSCIDVariablesTypedAppend(make([]byte, 0, size), vars)
+	return size
 }
 
 // sizeVarField returns the exact number of bytes appendVarField will
@@ -314,7 +395,6 @@ func UnmarshalSCIDVariablesTyped(b []byte) ([]*SCIDVariable, error) {
 		return nil, ErrInvalidSCIDVariables
 	}
 	n := binary.BigEndian.Uint32(b[1:5])
-	pos := 5
 	// Sanity-bound the declared count before allocating: each variable
 	// occupies at least 4 wire bytes (2 fields × (kind byte + ≥1 payload
 	// byte)), so a count exceeding remaining/4 is corrupt and would only
@@ -322,19 +402,61 @@ func UnmarshalSCIDVariablesTyped(b []byte) ([]*SCIDVariable, error) {
 	if uint64(n)*4 > uint64(len(b)-5) { // #nosec G115 -- len(b) >= 5 is guaranteed by the header check above, so the operand is non-negative.
 		return nil, ErrInvalidSCIDVariables
 	}
+
+	// Pass 1: validate every field and sum the string-field byte lengths so all
+	// string payloads share ONE owned backing buffer (one alloc) instead of one
+	// string([]byte) copy per string field — the prior hot path cost 11 such
+	// copies on the benchmark snapshot. uint64 fields carry no payload bytes.
+	// (The interface{} boxing of each Key/Value is structural to SCIDVariable
+	// and unavoidable here.) b is immutable between passes. See
+	// TestLoop_NoAlias_SCIDVariables.
+	total := 0
+	p := 5
+	for i := uint32(0); i < n; i++ {
+		for f := 0; f < 2; f++ {
+			kind, st, en, _, nx, err := locVarField(b, p)
+			if err != nil {
+				return nil, err
+			}
+			if kind == varKindString {
+				total += en - st
+			}
+			p = nx
+		}
+	}
+
+	// Pass 2: out + arena (2 allocs) + one backing buffer (1 alloc, if any
+	// string bytes), then fill. Strings view the owned buffer; uint64s decode
+	// in place.
 	out := make([]*SCIDVariable, n)
 	arena := make([]SCIDVariable, n)
+	var sbuf []byte
+	if total > 0 {
+		sbuf = make([]byte, total)
+	}
+	off, pos := 0, 5
 	for i := uint32(0); i < n; i++ {
 		v := &arena[i]
-		var err error
-		v.Key, pos, err = readVarField(b, pos)
+		kind, st, en, u, nx, err := locVarField(b, pos)
 		if err != nil {
 			return nil, err
 		}
-		v.Value, pos, err = readVarField(b, pos)
+		if kind == varKindString {
+			v.Key = ownedCut(sbuf, &off, b, st, en)
+		} else {
+			v.Key = u
+		}
+		pos = nx
+		kind, st, en, u, nx, err = locVarField(b, pos)
 		if err != nil {
 			return nil, err
 		}
+		if kind == varKindString {
+			v.Value = ownedCut(sbuf, &off, b, st, en)
+		} else {
+			v.Value = u
+		}
+		pos = nx
 		out[i] = v
 	}
 	return out, nil
@@ -400,6 +522,40 @@ func readVarField(b []byte, pos int) (interface{}, int, error) {
 	}
 }
 
+// locVarField parses one typed SCIDVariable field at pos WITHOUT allocating.
+// For a string field it returns kind=varKindString and the [start,end) byte
+// range; for a uint64 field it returns kind=varKindUint64 and the value u.
+// next is the position after the field. Wire parsing mirrors readVarField so
+// the coalescing decoder stays in lockstep with the per-field decoder.
+func locVarField(b []byte, pos int) (kind byte, start, end int, u uint64, next int, err error) {
+	if pos >= len(b) {
+		return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables
+	}
+	kind = b[pos]
+	pos++
+	switch kind {
+	case varKindString:
+		n, nLen := binary.Uvarint(b[pos:])
+		if nLen <= 0 {
+			return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables
+		}
+		pos += nLen
+		if n > uint64(len(b)-pos) { // #nosec G115 -- pos is bounded by prior slice and varint checks.
+			return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables
+		}
+		start = pos
+		end = pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
+		return varKindString, start, end, 0, end, nil
+	case varKindUint64:
+		if pos+8 > len(b) {
+			return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables
+		}
+		return varKindUint64, 0, 0, binary.BigEndian.Uint64(b[pos : pos+8]), pos + 8, nil
+	default:
+		return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables
+	}
+}
+
 // toStringBest converts common numeric types to string. Only used for
 // unknown-type fallback.
 func toStringBest(v interface{}) string {
@@ -453,10 +609,23 @@ var ErrInvalidClassMeta = errors.New("invalid ClassMeta encoding")
 // MarshalTyped encodes m into a fresh byte slice. Hand the result to
 // bbolt.Put (which must hold the slice until commit — we never reuse).
 func (m *ClassMeta) MarshalTyped() []byte {
-	// Rough lower bound: header + 6 zero-length strings (1 byte each) +
-	// 1 byte tagCount. Growing amortizes into a single alloc in practice.
-	buf := make([]byte, 0, classMetaMinHeaderSize+8+len(m.Class)+len(m.Name)+len(m.Desc)+len(m.IconURL)+len(m.DURL)+len(m.Version))
-	return m.MarshalTypedAppend(buf)
+	// Exact sizing pass so the append chain allocates exactly once — the
+	// previous lower-bound estimate omitted the Tags bytes (count varint +
+	// each tag's len varint + bytes), so any tagged ClassMeta re-grew the
+	// buffer (a second allocation). Mirrors MarshalSCIDVariablesTyped's
+	// size-then-fill approach. Stays in lockstep with MarshalTypedAppend.
+	size := classMetaMinHeaderSize // tag + InstallHeight + LastHeight
+	size += uvarintLen(uint64(len(m.Tags)))
+	for _, t := range m.Tags {
+		size += uvarintLen(uint64(len(t))) + len(t)
+	}
+	size += uvarintLen(uint64(len(m.Class))) + len(m.Class)
+	size += uvarintLen(uint64(len(m.Name))) + len(m.Name)
+	size += uvarintLen(uint64(len(m.Desc))) + len(m.Desc)
+	size += uvarintLen(uint64(len(m.IconURL))) + len(m.IconURL)
+	size += uvarintLen(uint64(len(m.DURL))) + len(m.DURL)
+	size += uvarintLen(uint64(len(m.Version))) + len(m.Version)
+	return m.MarshalTypedAppend(make([]byte, 0, size))
 }
 
 // MarshalTypedAppend writes into dst and returns the grown slice.
@@ -489,49 +658,83 @@ func (m *ClassMeta) UnmarshalTyped(b []byte) error {
 	}
 	m.InstallHeight = int64FromBits(binary.BigEndian.Uint64(b[1:9]))
 	m.LastHeight = int64FromBits(binary.BigEndian.Uint64(b[9:17]))
-	pos := 17
 
-	tagCount, nLen := binary.Uvarint(b[pos:])
+	// Pass 1: validate structure and sum the total string bytes (tags + the
+	// six string fields) WITHOUT allocating, so pass 2 can copy them all into a
+	// single owned backing buffer rather than one string([]byte) alloc per
+	// field. b is immutable between passes, so locLenString yields identical
+	// ranges both times. See ownedCut / TestLoop_NoAlias_ClassMeta.
+	tagCount, nLen := binary.Uvarint(b[17:])
 	if nLen <= 0 {
 		return ErrInvalidClassMeta
 	}
-	pos += nLen
-	if tagCount > 0 {
-		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by the fixed header and varint checks.
-		if tagCount > remaining {
-			return ErrInvalidClassMeta
+	pos := 17 + nLen
+	if tagCount > uint64(len(b)-pos) { // #nosec G115 -- pos is bounded by the fixed header and varint checks.
+		return ErrInvalidClassMeta
+	}
+	total, p := 0, pos
+	for i := uint64(0); i < tagCount; i++ {
+		st, en, nx, err := locLenString(b, p)
+		if err != nil {
+			return err
 		}
-		m.Tags = make([]string, int(tagCount)) // #nosec G115 -- bounded by remaining bytes above.
+		total += en - st
+		p = nx
+	}
+	for i := 0; i < 6; i++ { // Class, Name, Desc, IconURL, DURL, Version
+		st, en, nx, err := locLenString(b, p)
+		if err != nil {
+			return err
+		}
+		total += en - st
+		p = nx
+	}
+
+	// Pass 2: at most one tags-slice alloc + one backing-buffer alloc.
+	var sbuf []byte
+	if total > 0 {
+		sbuf = make([]byte, total)
+	}
+	off := 0
+	if tagCount > 0 {
+		m.Tags = make([]string, int(tagCount)) // #nosec G115 -- bounded by len(b)-pos above.
 		for i := range m.Tags {
-			s, next, err := readLenString(b, pos)
+			st, en, nx, err := locLenString(b, pos)
 			if err != nil {
 				return err
 			}
-			m.Tags[i] = s
-			pos = next
+			m.Tags[i] = ownedCut(sbuf, &off, b, st, en)
+			pos = nx
 		}
 	} else {
 		m.Tags = nil
 	}
+	var st, en, nx int
 	var err error
-	if m.Class, pos, err = readLenString(b, pos); err != nil {
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
-	if m.Name, pos, err = readLenString(b, pos); err != nil {
+	m.Class, pos = ownedCut(sbuf, &off, b, st, en), nx
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
-	if m.Desc, pos, err = readLenString(b, pos); err != nil {
+	m.Name, pos = ownedCut(sbuf, &off, b, st, en), nx
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
-	if m.IconURL, pos, err = readLenString(b, pos); err != nil {
+	m.Desc, pos = ownedCut(sbuf, &off, b, st, en), nx
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
-	if m.DURL, pos, err = readLenString(b, pos); err != nil {
+	m.IconURL, pos = ownedCut(sbuf, &off, b, st, en), nx
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
-	if m.Version, pos, err = readLenString(b, pos); err != nil {
+	m.DURL, pos = ownedCut(sbuf, &off, b, st, en), nx
+	if st, en, nx, err = locLenString(b, pos); err != nil {
 		return err
 	}
+	m.Version, pos = ownedCut(sbuf, &off, b, st, en), nx
 	_ = pos // trailing bytes (forward-compat slack) are ignored
 	return nil
 }
