@@ -395,8 +395,8 @@ func (ss *SegmentSync) processBlockTxns(client *hgrpc.Client, wi *structures.Wor
 func (ss *SegmentSync) processSCTx(client *hgrpc.Client, tx *transaction.Transaction, txInfo rpc.Tx_Related_Info, txid string, height int64, batch *storage.WriteBatch, validatedSCs map[string]struct{}) {
 	scArgs := tx.SCDATA
 	scFees := tx.Fees()
-	entrypoint := fmt.Sprintf("%v", scArgs.Value("entrypoint", "S"))
-	scAction := fmt.Sprintf("%v", scArgs.Value("SC_ACTION", "U"))
+	entrypoint := argString(scArgs, "entrypoint", rpc.DataString)
+	scAction := argString(scArgs, "SC_ACTION", rpc.DataUint64)
 
 	var method uint8
 	var scid string
@@ -406,7 +406,14 @@ func (ss *SegmentSync) processSCTx(client *hgrpc.Client, tx *transaction.Transac
 		scid = txid
 	} else {
 		method = structures.MethodInvokeSC
-		scid = fmt.Sprintf("%v", scArgs.Value("SC_ID", "H"))
+		scid = scidArgString(scArgs.Value("SC_ID", "H"))
+		if scid == "" {
+			// Malformed invoke with no SC_ID. The old fmt.Sprintf path rendered
+			// this as "<nil>" and stored junk harmlessly; an empty scid must not
+			// reach FlushBatch, where an empty bucket name would abort the whole
+			// atomic batch. (Mirrors the always-on indexer.go guard.)
+			return
+		}
 	}
 
 	scid = hgpool.InternSCID(scid)
@@ -430,7 +437,7 @@ func (ss *SegmentSync) processSCTx(client *hgrpc.Client, tx *transaction.Transac
 
 // handleInstallSC processes a new SC deployment within a segment.
 func (ss *SegmentSync) handleInstallSC(client *hgrpc.Client, scid, sender, entrypoint string, height int64, scArgs rpc.Arguments, fees uint64, batch *storage.WriteBatch, validatedSCs map[string]struct{}) {
-	code := fmt.Sprintf("%v", scArgs.Value("SC_CODE", "S"))
+	code := argString(scArgs, "SC_CODE", rpc.DataString)
 
 	// Check search filter
 	if !ss.matchesFilter(code) {

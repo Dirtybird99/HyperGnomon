@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +39,7 @@ type Server struct {
 
 	// telaVerifySigs enables the X-TELA-Verify response header on /tela/…
 	// responses. v1.0 surfaces signature presence without running the
-	// bn256 Schnorr verification (that lands in v1.1). Default false so
+	// bn256 Schnorr verification (that lands in v1.2). Default false so
 	// existing deployments don't see unexpected header changes.
 	telaVerifySigs bool
 
@@ -472,9 +473,9 @@ func isAssetMeta(meta *structures.ClassMeta) bool {
 	return false
 }
 
-func parseHTTPPageParams(r *http.Request) (int, int, string) {
+func parseHTTPPageParams(vals url.Values) (int, int, string) {
 	offset := 0
-	if raw := r.URL.Query().Get("offset"); raw != "" {
+	if raw := vals.Get("offset"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed < 0 {
 			return 0, 0, "offset must be >= 0"
@@ -483,7 +484,7 @@ func parseHTTPPageParams(r *http.Request) (int, int, string) {
 	}
 
 	limit := listSCDefaultLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if raw := vals.Get("limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil {
 			return 0, 0, "limit must be an integer"
@@ -623,17 +624,19 @@ func (s *Server) assetEntriesForWindow(installs []structures.ClassInstall, owner
 // handleGetAssets returns recognized asset/NFT contracts from the class index.
 // It is an asset catalog, not a private wallet-balance view.
 func (s *Server) handleGetAssets(w http.ResponseWriter, r *http.Request) {
-	offset, limit, msg := parseHTTPPageParams(r)
+	vals := r.URL.Query() // parse once; net/http does not cache r.URL.Query()
+	offset, limit, msg := parseHTTPPageParams(vals)
 	if msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
-	classes, ok := assetClassesForParam(r.URL.Query().Get("class"))
+	class := vals.Get("class")
+	classes, ok := assetClassesForParam(class)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "class is not an asset class")
 		return
 	}
-	cacheKey := assetCatalogCacheKey(r.URL.Query().Get("class"))
+	cacheKey := assetCatalogCacheKey(class)
 
 	assets, err := s.getAssetCatalog(cacheKey, classes)
 	if err != nil {
@@ -688,7 +691,7 @@ func (s *Server) handleGetAddressCreatedAssets(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "missing required path parameter: address")
 		return
 	}
-	offset, limit, msg := parseHTTPPageParams(r)
+	offset, limit, msg := parseHTTPPageParams(r.URL.Query())
 	if msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
@@ -745,7 +748,7 @@ func (s *Server) handleGetAddressTouchedAssets(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "missing required path parameter: address")
 		return
 	}
-	offset, limit, msg := parseHTTPPageParams(r)
+	offset, limit, msg := parseHTTPPageParams(r.URL.Query())
 	if msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
@@ -903,6 +906,16 @@ func (s *Server) handleGetTELARatings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// initialSCIDCodeResponse is the typed response for handleGetInitialSCIDCode.
+// A struct (vs a map[string]interface{}) avoids the map allocation, the int64
+// boxing, and json's key-sort pass. Fields are declared in alphabetical
+// json-tag order so the encoded bytes match the previous sorted-map output.
+type initialSCIDCodeResponse struct {
+	Code          string `json:"code"`
+	InstallHeight int64  `json:"install_height"`
+	SCID          string `json:"scid"`
+}
+
 // handleGetInitialSCIDCode returns the install-time DVM code for scid.
 // Drop-in compat with simple-gnomon's WS method of the same name. Reads
 // from the sccode bucket; on miss, lazily backfills via idx.GetSCCode
@@ -930,10 +943,10 @@ func (s *Server) handleGetInitialSCIDCode(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, "scid not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"scid":           scid,
-		"code":           entry.Code,
-		"install_height": entry.InstallHeight,
+	writeJSON(w, http.StatusOK, initialSCIDCodeResponse{
+		Code:          entry.Code,
+		InstallHeight: entry.InstallHeight,
+		SCID:          scid,
 	})
 }
 

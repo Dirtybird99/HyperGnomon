@@ -115,7 +115,7 @@ Emit an `X-TELA-Verify` response header on `/tela/…` responses. In v1.0 the he
 - `disabled` — flag is off
 - `unsigned` — contract has no `fileCheckC` / `fileCheckS` fields
 - `signed-unverified` — fields present but cryptographic check not yet implemented (v1.0)
-- `passed` / `failed` — reserved for v1.1+ when bn256 Schnorr verification ships
+- `passed` / `failed` — reserved for v1.2+ when bn256 Schnorr verification ships
 
 The header surface is stable. Operators can already use `signed-unverified` vs `unsigned` to distinguish TELA v1.0.0 (no fileCheck fields) from v1.1.0 contracts.
 
@@ -151,6 +151,23 @@ Auto-tune `--batch-size` based on flush latency.
 
 Emit per-stage (fetcher, processor, flusher) timing summaries every N batches. Operator visibility for pipeline contention.
 
+### `--storage-backend` (default `bbolt`)
+
+Selects the storage engine via the `storage.Open` factory. `bbolt` is the
+default and only shipped backend — the arena/batch-flush design the rest of
+these docs describe. `sqlite` is **deferred** (not promised): the selector and a
+backend conformance suite already exist, but `--storage-backend=sqlite` exits with
+"not implemented yet". Implementing it is gated on (a) a named consumer with a
+concrete SQL/operability need and (b) a full-schema prototype that passes a
+hardened conformance suite and re-benchmarks the real `FlushBatch` at or below
+bbolt — see `storage/dbbench/RESULTS.md` for why the engine benchmark does not
+settle this. `graviton` is **unsupported**
+and exits with a clear error — graviton iterates in hash byte-sorted order with
+no prefix/range queries, which cannot serve HyperGnomon's key-ordered Route B
+scans (class / install / owner / interaction-height prefix scans built on
+big-endian height keys); see civilware/Gnomon issue #24. Unknown values exit at
+startup with the list of valid backends.
+
 ### `--db-dir` (default `gnomondb`)
 
 bbolt database directory. Created if missing.
@@ -164,3 +181,20 @@ classify-probe variable flush took 4.1–4.3 s against a growing DB vs
 Linux/macOS only virtual address space is reserved and the file stays at its
 data size. Once the data outgrows 256 MiB the reservation has no further
 effect.
+
+### Maintenance subcommands
+
+Run these with the indexer stopped — each takes the bbolt lock and fails fast if
+the store is in use:
+
+- `hypergnomon resync [--db-dir=…]` — drop every index bucket so the next start
+  rescans from height 0. Block-hash history is kept for reorg-detection replay.
+- `hypergnomon clean <mainnet|testnet|simulator> [--db-dir=…] [--force]` — remove
+  the db dir entirely. `mainnet` requires `--force`.
+- `hypergnomon compact [--db-dir=…]` — rewrite the bbolt store via `bbolt.Compact`,
+  dropping free/fragmented pages to reclaim disk and improve page locality
+  (measured ~94% reclaim on a heavily-churned DB). The original is kept as
+  `HYPERGNOMON.db.bak` for rollback — delete it once the compacted DB starts
+  cleanly. On Windows the next start re-applies the 256 MiB mmap reservation, so
+  the on-disk win is largest for stores that grew well past 256 MiB; on
+  Linux/macOS the file stays at its compacted size.

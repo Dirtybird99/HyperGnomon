@@ -155,3 +155,33 @@ func TestRatings_InvalidScoreDropped(t *testing.T) {
 		t.Fatalf("got %d ratings, want 0 (out-of-range score should be dropped)", len(got))
 	}
 }
+
+// TestRatings_NoUnderscoreDropped locks the no-"_" reject branch — the one
+// parseTELARatingValue edge the SplitN→IndexByte change touches. A
+// DERO-address-keyed value lacking the "_" separator must be dropped, not
+// parsed as a rating (baseline: SplitN len!=2; after: IndexByte i<0).
+func TestRatings_NoUnderscoreDropped(t *testing.T) {
+	store := openTestStore(t)
+	scid := fakeSCID()
+
+	rater := "dero1qyjjxxaabbccddeeffaa00001122334455667788990000112233445566778890aa"
+	vars := []*structures.SCIDVariable{
+		// hex of "75" — a DERO-address rating value with NO "_" separator.
+		{Key: rater, Value: hex.EncodeToString([]byte("75"))},
+	}
+	batch := NewWriteBatch()
+	batch.AddVariables(scid, 100, vars)
+	batch.LastHeight = 100
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("FlushBatch: %v", err)
+	}
+	PutWriteBatch(batch)
+
+	got, err := store.GetRatingsForSCID(scid, 100)
+	if err != nil {
+		t.Fatalf("GetRatingsForSCID: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d ratings, want 0 (no-underscore value must be dropped)", len(got))
+	}
+}

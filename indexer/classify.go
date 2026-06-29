@@ -61,6 +61,14 @@ var rules = []classRule{
 	{pattern: "G45-AT", class: "G45-AT", tag: "g45"},
 	{pattern: "G45-C", class: "G45-C", tag: "g45"},
 	{pattern: "T345", class: "T345", tag: "g45"},
+	// Swap / DEX family — entrypoint-name heuristic. A StartSwap entrypoint
+	// marks an atomic-swap / DEX contract (parity with siteraiser/simple-gnomon's
+	// `swaps` default filter). This sits in the rules table so it matches in
+	// ClassifySC step 2, ahead of the step-3 DERO-ASSET fallback: a swap
+	// contract that also disburses assets (InitializePrivate +
+	// SEND_ASSET_TO_ADDRESS) classifies as SWAP, not DERO-ASSET. No substring
+	// collision with the branded tokens above or the TELA tokens below.
+	{pattern: "StartSwap", class: "SWAP", tag: "swap"},
 	// TELA family — match canonical standard-name tokens. The MOD token
 	// comes before INDEX because a MOD contract may also contain the
 	// string "TELA-INDEX-1" in commented helpers.
@@ -72,6 +80,13 @@ var rules = []classRule{
 	// identifiers without the standard-name token.
 	{pattern: "telaVersion", class: "TELA-INDEX-1", tag: "tela"},
 	{pattern: "docVersion", class: "TELA-DOC-1", tag: "tela"},
+	// EPOCH fair-mining family (civilware/epoch) — LAST so it never overrides a
+	// primary standard (TELA/G45/NFA/swap): epoch is an add-on a dApp can enable,
+	// so only a contract with no other branded token classifies as EPOCH. Two
+	// distinctive markers (parity with HOLOGRAM gnomon_tags.go's epoch filter);
+	// bare "EPOCH" is avoided as it risks comment false-positives.
+	{pattern: "epochEnabled", class: "EPOCH", tag: "epoch"},
+	{pattern: "crowd_mining", class: "EPOCH", tag: "epoch"},
 }
 
 // tagsForClass returns the ClassMeta.Tags slice for a given class name.
@@ -108,10 +123,13 @@ func classifyDEROAsset(code string) bool {
 // SCID, code, and stored variables. Every returned SCClass includes the "all"
 // tag so callers can use it as a universal filter.
 func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
-	sc := SCClass{
-		Class: "UNKNOWN",
-		Tags:  []string{"all"},
-	}
+	// Tags presized to cap 2 so the single tag append on every matched /
+	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
+	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
+	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
+	sc := SCClass{Class: "UNKNOWN"}
+	sc.Tags = make([]string, 1, 2)
+	sc.Tags[0] = "all"
 
 	// 1. Well-known SCIDs take priority over code inspection.
 	switch scid {
@@ -161,10 +179,13 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 // already hold parsed SC variables as a slice. It mirrors ClassifySC without
 // first materializing a map.
 func ClassifySCVars(scid string, code string, vars []*structures.SCIDVariable) SCClass {
-	sc := SCClass{
-		Class: "UNKNOWN",
-		Tags:  []string{"all"},
-	}
+	// Tags presized to cap 2 so the single tag append on every matched /
+	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
+	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
+	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
+	sc := SCClass{Class: "UNKNOWN"}
+	sc.Tags = make([]string, 1, 2)
+	sc.Tags[0] = "all"
 
 	switch scid {
 	case structures.NameServiceSCID:

@@ -4,7 +4,7 @@ Arena-accelerated DERO blockchain indexer. Byte-correct TELA content server, Web
 
 Built for **TELA dApp operators**, **HOLOGRAM** backend, and the **dReams / Engram / TELA-CLI** Go-library embedders who import `civilware/Gnomon` today. Drop-in source compatibility via `pkg/gnomes` — migration is a three-sed search-and-replace plus one constructor swap.
 
-Status: v1.0.0. All numeric claims below are reproducible — see [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md) for methodology, hardware, and dates.
+Status: v1.1.0. All numeric claims below are reproducible — see [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md) for methodology, hardware, and dates.
 
 ## Table of contents
 
@@ -74,12 +74,12 @@ Double-clicking the binary auto-detects local / LAN / public daemons with intera
 
 | | **HyperGnomon** | civilware/Gnomon | simple-gnomon |
 |---|---|---|---|
-| Backends | bbolt | bbolt, graviton | bbolt, sqlite |
+| Backends | bbolt (selectable; sqlite deferred) | bbolt, graviton | bbolt _(secretnamebasis)_ / sqlite _(siteraiser fork)_ |
 | TELA content server | yes, canonical-spec | no | no |
 | TELA `.gz` (base64+gunzip) | yes | n/a | n/a |
 | TELA DocShard `.shard`/`.shards` | yes | n/a | n/a |
 | `fileCheckC/S` header reporting | yes (v1.0) | no | no |
-| Cryptographic signature verification | v1.1 (stub in v1.0) | no | no |
+| Cryptographic signature verification | v1.2 (stub through v1.1) | no | no |
 | Typed binary encoding hot-path | yes | msgpack everywhere | msgpack |
 | WebSocket push (subscribe/event) | yes | partial | no |
 | Reorg detection (STABLE_LIMIT=8 DAG) | yes, `SafeHeight` exposed | no | no |
@@ -107,7 +107,7 @@ The flags below are the ones worth knowing. For the full list with rationale for
 | `--rpc-pool-size` | `8` | WebSocket connection pool size |
 | `--batch-size` | `100` | Blocks per atomic bbolt flush. Adaptive up to 1000 when `--adapt-batch` is on |
 | `--persist-install-code` | `tela` | sccode bucket policy: `none`, `tela` (TELA-INDEX/DOC/MOD only), or `all` |
-| `--tela-verify-sigs` | `false` | Report `X-TELA-Verify` header on `/tela/…` responses (v1.0: presence only, v1.1: cryptographic check) |
+| `--tela-verify-sigs` | `false` | Report `X-TELA-Verify` header on `/tela/…` responses (v1.0/v1.1: presence only, v1.2: cryptographic check) |
 | `--search-filter` | `""` | Substring filter on SC code, separated by literal `;;;` |
 | `--recent-blocks` | `0` | Scan only last N blocks from tip (0 = all) |
 | `--segment-sync` | `false` | MapReduce parallel initial sync |
@@ -196,7 +196,7 @@ See [`pkg/gnomes/example/main.go`](pkg/gnomes/example/main.go) for a complete 30
 
 Note: `NewIndexerWithDBDir` accepts the `FastSyncConfig` argument for signature compatibility with civilware's shape, but does not apply it in v1.0 — to fastsync, run the `hypergnomon` binary with `--fastsync`, or call the native indexer's `Indexer.FastSync` method (`github.com/hypergnomon/hypergnomon/indexer`).
 
-Compat scope: bbolt backend, `daemon` runmode, civilware-shape `Indexer` fields (`LastIndexedHeight`, `ChainHeight`, `DBType`, `GravDBBackend`, `BBSBackend`) and store methods (`GetLastIndexHeight`, `GetAllOwnersAndSCIDs`, `GetAllSCIDVariableDetails`, `GetSCIDValuesByKey`, `GetSCIDKeysByValue`, `GetSCIDInteractionHeight`). Graviton and non-daemon runmodes return a dead indexer — see §10.
+Compat scope: bbolt backend, `daemon` runmode, civilware-shape `Indexer` fields (`LastIndexedHeight`, `ChainHeight`, `DBType`, `GravDBBackend`, `BBSBackend`) and store methods (`GetLastIndexHeight`, `GetAllOwnersAndSCIDs`, `GetAllSCIDVariableDetails`, `GetSCIDValuesByKey`, `GetSCIDKeysByValue`, `GetSCIDInteractionHeight`). `dbType="gravdb"` is accepted but maps to bbolt with a warning (so a gravdb-defaulting consumer like HOLOGRAM runs unchanged); `NewIndexer(gravDB, boltDB, …)` injects your pre-opened bbolt store. Non-daemon runmodes return a dead indexer — see §10.
 
 ## 9. Benchmarks
 
@@ -247,11 +247,12 @@ Numbers reported as "228×", "96×", "3,240×", "1,786×", "8,571×" in earlier 
 
 ## 10. Known limitations
 
-- **Graviton backend**: not supported. `storage.NewGravDB` returns `ErrGravDBNotSupported`. Rationale: civilware/Gnomon issue #24 (graviton bloat) has been open 2+ years; both simple-gnomon forks dropped it; bbolt with our batch-flush pattern outperforms graviton in our measurements.
+- **Storage backend**: selectable via `--storage-backend` (`storage.Open` factory). `bbolt` is the default and only shipped engine; `sqlite` is deferred — the selector + a backend conformance suite exist, but it returns "not implemented yet", and implementing it is gated on a named consumer need plus a full-schema prototype (the engine benchmark does not settle it — see `storage/dbbench/RESULTS.md`); `graviton` is unsupported.
+- **Graviton backend**: not a real backend, by design. The **CLI** `--storage-backend=graviton` errors (an operator who typed it should know). The **library** `storage.NewGravDB` and `pkg/gnomes` `dbType="gravdb"` instead **warn and fall back to bbolt** (so a civilware consumer that defaults to gravdb — e.g. HOLOGRAM — drops in unchanged and runs on bbolt). Rationale: graviton iterates in hash byte-sorted order with no prefix/range queries, so it cannot serve the key-ordered Route B scans (class / install / owner / interaction-height) HyperGnomon is built on; emulating them needs per-SCID index trees — the path behind civilware/Gnomon issue #24 (graviton bloat, open 2+ years; both simple-gnomon forks dropped it). bbolt's batch-flush also outperforms it in our measurements.
 - **Runmodes**: only `daemon` is implemented. `wallet` and `asset` return a dead indexer. No consumer has needed them yet.
-- **External-store injection** in the civilware-shape `NewIndexer(gravDB, boltDB, …)`: caller-pre-opened stores are not wired end-to-end. Use `NewIndexerWithDBDir(path, …)` for v1.0; full injection lands in v1.1.
+- **External-store injection**: supported. `NewIndexer(gravDB, boltDB, …)` injects a pre-opened bbolt store (via `indexer.Config.Store`) and **borrows** it — the caller keeps ownership; the facade's `Close()` releases it. `NewIndexerWithDBDir(path, …)` remains for callers who prefer to pass a path and let HyperGnomon open its own store.
 - **Reorg truncate-replay (M2)**: detection is implemented (`SafeHeight` atomic, `CheckReorgAt` stub); automatic rewind is not. Rationale: DERO's `STABLE_LIMIT=8` consensus bound plus DAG side-block absorption means real reorgs are rare and shallow. civilware/Gnomon has no reorg handling at all; operators recover via `pop <N>` CLI. Our `resync` subcommand serves the same operator path. Full truncate-replay is tracked for v1.x.
-- **Signature verification** (`fileCheckC/S` Schnorr on bn256): v1.0 reports presence only via `X-TELA-Verify`. Cryptographic verification ships in v1.1; the header surface is stable.
+- **Signature verification** (`fileCheckC/S` Schnorr on bn256): v1.0 and v1.1 report presence only via `X-TELA-Verify`. Cryptographic verification ships in v1.2; the header surface is stable.
 - **Mempool speculative path (M6)**: designed, not yet implemented.
 
 ## References

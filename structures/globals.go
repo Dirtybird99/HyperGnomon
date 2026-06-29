@@ -8,7 +8,7 @@ import (
 
 // Version is set via -ldflags -X at release build time (goreleaser).
 // Default value below is what source builds report without release ldflags.
-var Version = "1.0.0"
+var Version = "1.1.0"
 
 const (
 	AppName = "HyperGnomon"

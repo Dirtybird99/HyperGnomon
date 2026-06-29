@@ -21,7 +21,7 @@ In-scope:
 
 - Anything in `cmd/hypergnomon`, `api/`, `indexer/`, `storage/`, `structures/`, `pool/`, `eventbus/`, `rpc/`, `pkg/gnomes/`
 - TELA content-server byte-correctness bugs that cause HyperGnomon to serve content that does not match the on-chain SC code
-- `fileCheckC/S` signature-verification bugs (v1.1+) that accept invalid signatures or reject valid ones
+- `fileCheckC/S` signature-verification bugs (v1.2+) that accept invalid signatures or reject valid ones
 - Go memory-safety issues, DoS vectors against the indexer from a malicious daemon, cache-poisoning attacks
 
 Out-of-scope:
@@ -42,7 +42,7 @@ Out-of-scope:
 |---|---|
 | `main` | yes |
 | v1.x | yes |
-| v0.9.x | security fixes only until v1.1 ships |
+| v0.9.x | security fixes only until v1.2 ships |
 | < v0.9 | no |
 
 ## Disclosure

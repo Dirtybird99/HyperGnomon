@@ -4,6 +4,37 @@ All notable changes to HyperGnomon. Dates in UTC.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to [SemVer](https://semver.org/) from v1.0 onward.
 
+## [1.1.0] — 2026-06-29
+
+Pluggable storage backends + a large allocation-reduction pass, with a true civilware/Gnomon drop-in for HOLOGRAM.
+
+### Added
+
+- Pluggable storage-backend factory (`storage/factory.go`): `storage.Open(backend, dbDir, searchFilter)` selects a backend by name (`bbolt` default + `bolt`/`boltdb`/`bbs` aliases; `sqlite` → `ErrBackendNotImplemented`; `graviton` → `ErrGravitonUnsupported`), plus `ValidateBackend`/`SupportedBackends`. New `--storage-backend` CLI flag, validated up front.
+- `hypergnomon compact` subcommand (`storage/compact.go`): offline `bbolt.Compact` rewrite with atomic swap, `.bak` rollback, and a reclaimed-space report; opens the source read-only and fails fast if the indexer holds the lock.
+- External store injection (`indexer.Config.Store`): the indexer borrows a caller-provided open store instead of opening its own — the seam the `pkg/gnomes` compat shim uses.
+- `pkg/gnomes` is now a real civilware/Gnomon drop-in for DHEBP/HOLOGRAM: 12-arg `NewIndexer`, `AddSCIDToIndex`, `FastSyncImport`, `GetOwner`, and a `GravDBBackend` that delegates to bbolt.
+- SWAP (`StartSwap`) and EPOCH (`epochEnabled`/`crowd_mining`) classification tags.
+- Typed binary encoders for `NormalTXWithSCIDParse` (tag 0x08) and `TELAContentEntry` (tag 0x07) with byte[0] tag-dispatch and backward-compatible legacy-msgpack reads.
+- `DOCS/ECOSYSTEM_GNOMON.md` — Gnomon storage-ecosystem study backing the bbolt-only / defer-sqlite / reject-graviton decisions.
+
+### Changed
+
+- `go.mod`: `modernc.org/sqlite v1.53.0` (pure-Go) added as a direct dep used only by the isolated `storage/dbbench` harness — never linked into `cmd/hypergnomon`; graviton promoted indirect→direct; `golang.org/x/sync` 0.1.0→0.20.0.
+- Updated `README.md`, `DOCS/FLAGS.md`, `DOCS/MIGRATION_FROM_GNOMON.md`; pushed the cryptographic-signature-verification milestone from v1.1 to v1.2.
+
+### Performance
+
+All gated and measured (allocs/op):
+- `storage`: `GetOwnersForSCIDs` 510→114; `parseTELARatingValue` SplitN→IndexByte + `hexDecodeIfHex` unsafe.String scratch 4035→2037@1000; `FlushBatch` class-key `keyBuf` reuse; `AddrSCIDEntry` arena 10940→9939; typed normaltx/telacontent encode.
+- `api`: assets single query-parse 42→27; sccode typed-struct response 101→91; `gzip.Reader` `sync.Pool` 17→2; ws `safeWrite` reused encoder + `forwardEvents` notif hoist.
+- `indexer`: classify Tags cap-2; `processorLoop` txMap→counter; `segment` argString port.
+
+### Fixed
+
+- Borrowed-store lifecycle: `indexer.New` no longer closes a store it does not own when construction fails after accepting an injected `Config.Store`.
+- Typed-decoder use-after-free safety: hot-path decoders return strings backed by a decoder-owned buffer, never aliasing the bbolt page the View txn frees — locked by an anti-aliasing gate.
+
 ## [1.0.0] — 2026-04-25
 
 Migration-driving release: canonical TELA spec compliance, civilware/Gnomon drop-in Go-library surface, reproducible benchmarks, honest README.

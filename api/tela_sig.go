@@ -26,8 +26,8 @@ import (
 //   disabled           — operator did not enable verification
 //   unsigned           — DOC has no fileCheckC or fileCheckS
 //   signed-unverified  — DOC has signature but we didn't verify (v1.0)
-//   passed             — (v1.1+) cryptographic verification succeeded
-//   failed             — (v1.1+) cryptographic verification failed
+//   passed             — (v1.2+) cryptographic verification succeeded
+//   failed             — (v1.2+) cryptographic verification failed
 
 const (
 	telaVerifyDisabled         = "disabled"
@@ -123,7 +123,7 @@ func nibbleByte(c byte) byte {
 
 // verifyTELASignature is the pluggable verifier. v1.0 returns
 // (matched=false, err=nil) meaning "not implemented, caller surfaces as
-// signed-unverified". v1.1+ will replace this with the actual bn256
+// signed-unverified". v1.2+ will replace this with the actual bn256
 // Schnorr math described in civilware/tela/parse.go::ParseSignature.
 //
 // Kept as a package variable so tests (and a future drop-in verifier

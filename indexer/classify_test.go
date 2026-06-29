@@ -141,6 +141,126 @@ func TestClassifySC_DEROAsset_Fallback(t *testing.T) {
 	}
 }
 
+// TestClassifySC_Swap detects DEX / atomic-swap contracts via the StartSwap
+// entrypoint-name marker (parity with siteraiser/simple-gnomon's `swaps`
+// filter; HyperGnomon had no swap detection before).
+func TestClassifySC_Swap(t *testing.T) {
+	code := `Function StartSwap(amount Uint64) Uint64
+		10 RETURN 0
+	End Function`
+	sc := ClassifySC("scid-swap", code, nil)
+	if sc.Class != "SWAP" {
+		t.Fatalf("class = %q, want SWAP", sc.Class)
+	}
+	if len(sc.Tags) != 2 || sc.Tags[0] != "all" || sc.Tags[1] != "swap" {
+		t.Fatalf("Tags = %v, want [all swap]", sc.Tags)
+	}
+
+	// Class-seeded path (fastsync phase 2 / RefreshClassVars) tags SWAP via
+	// tagsForClass, which reads the rules table — no separate switch case.
+	seeded := ClassifySCVarsWithClass("scid-swap", "SWAP", nil)
+	if len(seeded.Tags) != 2 || seeded.Tags[0] != "all" || seeded.Tags[1] != "swap" {
+		t.Fatalf("ClassifySCVarsWithClass Tags = %v, want [all swap]", seeded.Tags)
+	}
+}
+
+// TestClassifySC_Swap_BeatsAssetFallback proves the StartSwap rule (a step-2
+// code-pattern rule) takes precedence over the step-3 DERO-ASSET fallback for
+// a swap contract that also disburses assets — StartSwap contracts commonly
+// contain InitializePrivate + SEND_ASSET_TO_ADDRESS, so before this rule they
+// were classified DERO-ASSET. The reclassification is the intended behavior.
+func TestClassifySC_Swap_BeatsAssetFallback(t *testing.T) {
+	code := `Function InitializePrivate() Uint64
+		10 RETURN 0
+	End Function
+	Function StartSwap(amount Uint64) Uint64
+		10 SEND_ASSET_TO_ADDRESS(SIGNER(), 100, SCID())
+		20 RETURN 0
+	End Function`
+	sc := ClassifySC("scid-swap-asset", code, nil)
+	if sc.Class != "SWAP" {
+		t.Fatalf("class = %q, want SWAP (StartSwap rule must precede the DERO-ASSET fallback)", sc.Class)
+	}
+	if len(sc.Tags) < 2 || sc.Tags[1] != "swap" {
+		t.Fatalf("Tags = %v, want [all swap]", sc.Tags)
+	}
+}
+
+// TestClassifySCVars_Swap is the differential check: the slice-based classifier
+// must agree with the map-based one on the swap case (both share the rules table).
+func TestClassifySCVars_Swap(t *testing.T) {
+	code := `Function StartSwap(amount Uint64) Uint64
+		10 RETURN 0
+	End Function`
+	got := ClassifySCVars("scid-swap", code, nil)
+	want := ClassifySC("scid-swap", code, nil)
+	if got.Class != want.Class || got.Class != "SWAP" {
+		t.Fatalf("differential mismatch: ClassifySCVars=%q ClassifySC=%q, want both SWAP", got.Class, want.Class)
+	}
+	if len(got.Tags) != 2 || got.Tags[1] != "swap" {
+		t.Fatalf("Tags = %v, want [all swap]", got.Tags)
+	}
+}
+
+// TestClassifySC_Epoch detects EPOCH fair-mining contracts (civilware/epoch)
+// via the crowd_mining / epochEnabled markers — the one tag HOLOGRAM's
+// gnomon_tags.go has that HyperGnomon lacked.
+func TestClassifySC_Epoch(t *testing.T) {
+	for _, marker := range []string{"crowd_mining", "epochEnabled"} {
+		code := "Function Initialize() Uint64\n10 STORE(\"" + marker + "\", 1)\n20 RETURN 0\nEnd Function"
+		sc := ClassifySC("scid-epoch", code, nil)
+		if sc.Class != "EPOCH" {
+			t.Fatalf("marker %q: class = %q, want EPOCH", marker, sc.Class)
+		}
+		if len(sc.Tags) != 2 || sc.Tags[0] != "all" || sc.Tags[1] != "epoch" {
+			t.Fatalf("marker %q: Tags = %v, want [all epoch]", marker, sc.Tags)
+		}
+	}
+	// Class-seeded path tags EPOCH via tagsForClass (reads the rules table).
+	seeded := ClassifySCVarsWithClass("scid-epoch", "EPOCH", nil)
+	if len(seeded.Tags) != 2 || seeded.Tags[1] != "epoch" {
+		t.Fatalf("ClassifySCVarsWithClass Tags = %v, want [all epoch]", seeded.Tags)
+	}
+}
+
+// TestClassifySC_Epoch_BeatsAssetFallback: a standalone epoch contract that
+// also disburses assets classifies EPOCH (rule), not the DERO-ASSET fallback.
+func TestClassifySC_Epoch_BeatsAssetFallback(t *testing.T) {
+	code := `Function InitializePrivate() Uint64
+		10 STORE("crowd_mining", 1)
+		20 SEND_ASSET_TO_ADDRESS(SIGNER(), 100, SCID())
+		30 RETURN 0
+	End Function`
+	sc := ClassifySC("scid-epoch-asset", code, nil)
+	if sc.Class != "EPOCH" {
+		t.Fatalf("class = %q, want EPOCH (epoch rule must precede the DERO-ASSET fallback)", sc.Class)
+	}
+}
+
+// TestClassifySC_Epoch_DoesNotStealTELA: epoch is a lower-priority add-on, so a
+// TELA app that also enables epoch mining stays a TELA class (epoch rules sit at
+// the end of the table, after the TELA family). Documents the single-class model.
+func TestClassifySC_Epoch_DoesNotStealTELA(t *testing.T) {
+	code := "Function Initialize() ... TELA-INDEX-1 ... epochEnabled ..."
+	sc := ClassifySC("scid-tela-epoch", code, map[string]interface{}{"dURL": "x.tela"})
+	if sc.Class != "TELA-INDEX-1" {
+		t.Fatalf("class = %q, want TELA-INDEX-1 (TELA must win over epoch)", sc.Class)
+	}
+}
+
+// TestClassifySCVars_Epoch is the differential check for the epoch case.
+func TestClassifySCVars_Epoch(t *testing.T) {
+	code := "Function Initialize() ... crowd_mining ..."
+	got := ClassifySCVars("scid-epoch", code, nil)
+	want := ClassifySC("scid-epoch", code, nil)
+	if got.Class != want.Class || got.Class != "EPOCH" {
+		t.Fatalf("differential mismatch: ClassifySCVars=%q ClassifySC=%q, want both EPOCH", got.Class, want.Class)
+	}
+	if len(got.Tags) != 2 || got.Tags[1] != "epoch" {
+		t.Fatalf("Tags = %v, want [all epoch]", got.Tags)
+	}
+}
+
 // TestClassifySC_DocShard covers the .shard / .shards dURL suffix detection.
 func TestClassifySC_DocShard(t *testing.T) {
 	sc := ClassifySC("scid-shard-doc", "code with TELA-DOC-1", map[string]interface{}{
@@ -218,6 +338,20 @@ func TestClassifySCVarsMatchesMapClassifier(t *testing.T) {
 		if got.Mods[i] != want.Mods[i] {
 			t.Fatalf("Mods[%d] = %q, want %q", i, got.Mods[i], want.Mods[i])
 		}
+	}
+
+	// Tags must match between classifiers AND equal the absolute expected value
+	// — pins Tags after the cap-2 presize (current tests don't assert Tags[0]).
+	if len(got.Tags) != len(want.Tags) {
+		t.Fatalf("Tags len: got %d (%v) want %d (%v)", len(got.Tags), got.Tags, len(want.Tags), want.Tags)
+	}
+	for i := range got.Tags {
+		if got.Tags[i] != want.Tags[i] {
+			t.Fatalf("Tags[%d]: got %q want %q", i, got.Tags[i], want.Tags[i])
+		}
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "all" || got.Tags[1] != "tela" {
+		t.Fatalf("Tags = %v, want [all tela]", got.Tags)
 	}
 
 	// Absolute anchors: differential equality alone would let a common-mode

@@ -47,3 +47,5 @@ bench-*.txt
 # Local agent/temp artifacts
 .claude/
 .tmp_*
+loop*.yaml
+bench_hg.*

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -238,6 +239,16 @@ type connContext struct {
 	// done is closed when the connection is torn down. Forwarder goroutines
 	// select on it so they exit promptly during shutdown.
 	done chan struct{}
+
+	// encBuf + enc are a per-connection reused JSON encoder. safeWrite resets
+	// encBuf, encodes v into it (preserving json.Encoder's trailing newline and
+	// default HTML escaping), then ships the bytes via WriteMessage — which hits
+	// gorilla's alloc-free server fast path when no per-message compression is
+	// negotiated (the Upgrader sets none). Both are touched only under writeMu.
+	// Because the encoder writes into a bytes.Buffer (whose Write never errors),
+	// json.Encoder's sticky error never latches, so lifetime reuse is safe.
+	encBuf *bytes.Buffer
+	enc    *json.Encoder
 }
 
 // safeWrite serializes writes through writeMu. Returns the write error,
@@ -245,7 +256,11 @@ type connContext struct {
 func (c *connContext) safeWrite(v interface{}) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.conn.WriteJSON(v)
+	c.encBuf.Reset()
+	if err := c.enc.Encode(v); err != nil {
+		return err
+	}
+	return c.conn.WriteMessage(websocket.TextMessage, c.encBuf.Bytes())
 }
 
 // addSub registers a cancel func under id. Returns false if the cap is hit.
@@ -292,15 +307,25 @@ func (c *connContext) cancelAllSubs() {
 	})
 }
 
+// newConnContext builds a per-connection context with an initialized reused
+// JSON encoder. handleConn and the write-path tests both use it so the encoder
+// is constructed identically in production and under test.
+func newConnContext(conn *websocket.Conn) *connContext {
+	buf := new(bytes.Buffer)
+	return &connContext{
+		conn:   conn,
+		subs:   make(map[string]func()),
+		done:   make(chan struct{}),
+		encBuf: buf,
+		enc:    json.NewEncoder(buf),
+	}
+}
+
 // handleConn reads JSON-RPC requests from a single WebSocket connection
 // until it closes or errors. Each request is dispatched and answered
 // sequentially per connection — no head-of-line blocking across connections.
 func (ws *WSServer) handleConn(conn *websocket.Conn) {
-	cctx := &connContext{
-		conn: conn,
-		subs: make(map[string]func()),
-		done: make(chan struct{}),
-	}
+	cctx := newConnContext(conn)
 	defer func() {
 		cctx.cancelAllSubs()
 		_ = conn.Close() // best-effort teardown; read loop already exited
@@ -578,6 +603,14 @@ func stringField(m map[string]interface{}, key string) (string, bool) {
 //   - the connection's done channel closes (shutdown), or
 //   - safeWrite errors (peer is gone — tear down the whole connection).
 func (ws *WSServer) forwardEvents(cctx *connContext, id string, ch <-chan eventbus.Event) {
+	// Hoist the notification struct above the loop: safeWrite serializes it
+	// synchronously (encodes fully before returning) and this forwarder
+	// goroutine is the only writer of notif, so a single per-sub instance is
+	// reused. Passing the POINTER avoids boxing the ~190B value into interface{}
+	// every event (json of *T == T). ALL Params event fields are reassigned each
+	// iteration so no value from a prior event leaks through an omitempty field.
+	notif := &eventNotification{JSONRPC: "2.0", Method: "event"}
+	notif.Params.SubscriptionID = id
 	for {
 		select {
 		case <-cctx.done:
@@ -586,24 +619,17 @@ func (ws *WSServer) forwardEvents(cctx *connContext, id string, ch <-chan eventb
 			if !ok {
 				return
 			}
-			notif := eventNotification{
-				JSONRPC: "2.0",
-				Method:  "event",
-				Params: eventNotificationParam{
-					SubscriptionID: id,
-					Type:           e.Type.String(),
-					Height:         e.Height,
-					SafeHeight:     e.SafeHeight,
-					SCID:           e.SCID,
-					Class:          e.Class,
-					Tags:           e.Tags,
-					Owner:          e.Owner,
-					Sender:         e.Sender,
-					Entrypoint:     e.Entrypoint,
-					Speculative:    e.Speculative,
-					Payload:        e.Payload,
-				},
-			}
+			notif.Params.Type = e.Type.String()
+			notif.Params.Height = e.Height
+			notif.Params.SafeHeight = e.SafeHeight
+			notif.Params.SCID = e.SCID
+			notif.Params.Class = e.Class
+			notif.Params.Tags = e.Tags
+			notif.Params.Owner = e.Owner
+			notif.Params.Sender = e.Sender
+			notif.Params.Entrypoint = e.Entrypoint
+			notif.Params.Speculative = e.Speculative
+			notif.Params.Payload = e.Payload
 			if err := cctx.safeWrite(notif); err != nil {
 				logger.Debugf("ws event write (sub=%s): %v", id, err)
 				// Peer is gone — cancel all subs on this connection so the

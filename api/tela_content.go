@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"path"
@@ -614,25 +613,61 @@ func mimeForDocType(docType string) string {
 func decompressTELAGzip(b []byte) ([]byte, error) {
 	// Trim any whitespace inside the comment that survived the outer trim.
 	s := bytes.TrimSpace(b)
-	decoded, err := base64.StdEncoding.DecodeString(string(s))
+	// Decode straight from the []byte. The old DecodeString(string(s)) allocated
+	// a string from s AND converted it back to []byte internally; Decode(dst, s)
+	// does neither — just the one dst buffer.
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(s)))
+	n, err := base64.StdEncoding.Decode(decoded, s)
 	if err != nil {
 		// Fall back to raw gzip — some fixtures or non-standard deploys
 		// may skip the base64 layer. The caller then gets a real gzip
 		// error if that fails too.
 		return gunzipBytes(b)
 	}
-	return gunzipBytes(decoded)
+	return gunzipBytes(decoded[:n])
+}
+
+// gzipReaderPool recycles gzip.Readers across decompress calls. A fresh
+// gzip.NewReader allocates the ~32KB flate sliding window + decompressor state
+// on first read; Reset reuses them. Served per-request, so the pool is
+// concurrency-safe by construction (sync.Pool).
+var gzipReaderPool = sync.Pool{
+	New: func() any { return new(gzip.Reader) },
+}
+
+// bytesReaderPool recycles the *bytes.Reader that feeds gr.Reset — saves the
+// per-call bytes.NewReader allocation. *bytes.Reader implements flate.Reader
+// (Read + ReadByte), so gr.Reset uses it directly without a bufio wrap.
+var bytesReaderPool = sync.Pool{
+	New: func() any { return new(bytes.Reader) },
 }
 
 // gunzipBytes decompresses a raw gzip stream. Used by decompressTELAGzip
 // after the base64 layer is peeled, and directly in tests.
 func gunzipBytes(b []byte) ([]byte, error) {
-	gr, err := gzip.NewReader(bytes.NewReader(b))
+	gr := gzipReaderPool.Get().(*gzip.Reader)
+	br := bytesReaderPool.Get().(*bytes.Reader)
+	br.Reset(b)
+	if err := gr.Reset(br); err != nil {
+		gzipReaderPool.Put(gr)
+		bytesReaderPool.Put(br)
+		return nil, err
+	}
+	// Decompress into a buffer pre-sized for a typical TELA asset (a few KB of
+	// HTML/CSS/JS) so io.ReadAll's 512→…→N growth doublings collapse to one
+	// allocation for the common case. The 8 KiB is a fixed, bounded hint (NOT
+	// the untrusted gzip ISIZE — that would be an amplification-DoS); larger
+	// payloads simply grow from here. The returned buffer is freshly made per
+	// call, so handing back buf.Bytes() never aliases a reused buffer.
+	buf := bytes.NewBuffer(make([]byte, 0, 8192))
+	_, err := buf.ReadFrom(gr)
+	_ = gr.Close()
+	gzipReaderPool.Put(gr)
+	bytesReaderPool.Put(br)
 	if err != nil {
 		return nil, err
 	}
-	defer gr.Close()
-	return io.ReadAll(gr)
+	return buf.Bytes(), nil
 }
 
 // extractDOCBody is retained only so external callers don't see a renamed
@@ -690,7 +725,7 @@ func writeTELAEntry(w http.ResponseWriter, entry *structures.TELAContentEntry, r
 //	disabled           — operator didn't enable verification
 //	unsigned           — DOC has no fileCheckC/S on-chain
 //	signed-unverified  — DOC is signed, our v1.0 stub verifier didn't run
-//	passed / failed    — (v1.1+) real cryptographic verification outcome
+//	passed / failed    — (v1.2+) real cryptographic verification outcome
 //
 // v1.0 never emits passed/failed because verifyTELASignature is a stub.
 // The stub returns (false, nil) which we map to signed-unverified, not

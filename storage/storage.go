@@ -146,6 +146,15 @@ type WriteBatch struct {
 	// Populated at install time and read by listsc_byowner /
 	// getscidlist_byaddr. The nested map is a set — value is struct{}.
 	OwnerSCIDs map[string]map[string]struct{}
+
+	// addrSCIDArena backs the *AddrSCIDEntry values stored in AddrSCIDs. New
+	// entries are carved from this slice (append + take-address) instead of a
+	// per-pair heap alloc. The canonical pointer always lives in the AddrSCIDs
+	// map; the arena is never re-indexed after an entry is published, so a
+	// mid-batch append-driven realloc cannot invalidate a live entry — the old
+	// backing array stays alive via the map pointer, and all mutations go
+	// through inner[scid]. Reset truncates to [:0] (keeping capacity).
+	addrSCIDArena []structures.AddrSCIDEntry
 }
 
 // batchPool recycles WriteBatch instances. At steady state, a batch is pulled,
@@ -160,18 +169,19 @@ var batchPool = sync.Pool{
 
 func newEmptyBatch() *WriteBatch {
 	return &WriteBatch{
-		Owners:       make(map[string]string, 32),
-		Invocations:  make([]structures.InvokeRecord, 0, 128),
-		Variables:    make(map[string]map[int64][]*structures.SCIDVariable, 32),
-		Heights:      make(map[string][]int64, 32),
-		NormalTxs:    make(map[string][]*structures.NormalTXWithSCIDParse, 16),
-		InvalidSCIDs: make(map[string]uint64, 4),
-		BlockHashes:  make(map[int64]string, 100),
-		Installs:     make(map[string]*structures.InstallRecord, 4),
-		Classes:      make(map[string]*structures.ClassMeta, 8),
-		AddrSCIDs:    make(map[string]map[string]*structures.AddrSCIDEntry, 16),
-		SCCodes:      make(map[string]*structures.SCCodeEntry, 4),
-		OwnerSCIDs:   make(map[string]map[string]struct{}, 16),
+		Owners:        make(map[string]string, 32),
+		Invocations:   make([]structures.InvokeRecord, 0, 128),
+		Variables:     make(map[string]map[int64][]*structures.SCIDVariable, 32),
+		Heights:       make(map[string][]int64, 32),
+		NormalTxs:     make(map[string][]*structures.NormalTXWithSCIDParse, 16),
+		InvalidSCIDs:  make(map[string]uint64, 4),
+		BlockHashes:   make(map[int64]string, 100),
+		Installs:      make(map[string]*structures.InstallRecord, 4),
+		Classes:       make(map[string]*structures.ClassMeta, 8),
+		AddrSCIDs:     make(map[string]map[string]*structures.AddrSCIDEntry, 16),
+		SCCodes:       make(map[string]*structures.SCCodeEntry, 4),
+		OwnerSCIDs:    make(map[string]map[string]struct{}, 16),
+		addrSCIDArena: make([]structures.AddrSCIDEntry, 0, 1024),
 	}
 }
 
@@ -284,11 +294,18 @@ func (b *WriteBatch) AddAddrSCID(addr, scid string, height int64) {
 	}
 	e, ok := inner[scid]
 	if !ok {
-		inner[scid] = &structures.AddrSCIDEntry{
+		// Carve a new entry from the batch-owned arena instead of a per-pair
+		// heap alloc. The pointer published into the map is the canonical
+		// handle; the arena is never re-indexed after this point, so a later
+		// append-driven realloc cannot invalidate it (the old backing array is
+		// kept alive by this very pointer, and every mutation below goes through
+		// inner[scid]).
+		b.addrSCIDArena = append(b.addrSCIDArena, structures.AddrSCIDEntry{
 			FirstHeight: height,
 			LastHeight:  height,
 			Count:       1,
-		}
+		})
+		inner[scid] = &b.addrSCIDArena[len(b.addrSCIDArena)-1]
 		return
 	}
 	if height < e.FirstHeight {
@@ -343,6 +360,7 @@ func (b *WriteBatch) Reset() {
 	clear(b.Installs)
 	clear(b.Classes)
 	clear(b.AddrSCIDs)
+	b.addrSCIDArena = b.addrSCIDArena[:0]
 	clear(b.SCCodes)
 	clear(b.OwnerSCIDs)
 	b.RegTxCount = 0

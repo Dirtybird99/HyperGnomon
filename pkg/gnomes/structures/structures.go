@@ -58,3 +58,15 @@ type FastSyncConfig struct {
 	// runmodes use this to avoid the probe cost.
 	NoCode bool
 }
+
+// FastSyncImport is one entry handed to (*indexer.Indexer).AddSCIDToIndex to
+// inject a specific SCID into the index (civilware's manual-add path, used by
+// HOLOGRAM to index a SCID fastsync missed). Mirrors civilware's
+// structures.FastSyncImport byte-for-byte so a consumer can build the
+// map[string]*FastSyncImport unchanged. HyperGnomon's IndexSingleSCID
+// re-extracts the owner itself, so Owner/Height/Headers are advisory here.
+type FastSyncImport struct {
+	Owner   string
+	Height  uint64
+	Headers string
+}
