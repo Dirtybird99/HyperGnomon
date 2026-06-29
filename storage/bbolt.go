@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/vmihailenco/msgpack/v5"
 
@@ -175,11 +176,19 @@ func DecodeHeightEntry(k, v []byte) (string, []int64, error) {
 // decode identically.
 func DecodeNormalTxEntry(k, v []byte) (string, []*structures.NormalTXWithSCIDParse, error) {
 	if sep := bytes.IndexByte(k, ':'); sep >= 0 && len(k) > sep+1+8 && k[sep+1+8] == ':' {
-		var rec structures.NormalTXWithSCIDParse
-		if err := msgpack.Unmarshal(v, &rec); err != nil {
+		rec := &structures.NormalTXWithSCIDParse{}
+		if structures.IsNormalTxTyped(v) {
+			// Typed v1 record (current FlushBatch writer).
+			if err := rec.UnmarshalTyped(v); err != nil {
+				return string(k[:sep]), nil, err
+			}
+		} else if err := msgpack.Unmarshal(v, rec); err != nil {
+			// Legacy single-record msgpack: on-disk records written by the
+			// pre-typed FlushBatch and by StoreNormalTxWithSCIDByAddr (which
+			// intentionally still emits msgpack). Kept for backward-compat.
 			return string(k[:sep]), nil, err
 		}
-		return string(k[:sep]), []*structures.NormalTXWithSCIDParse{&rec}, nil
+		return string(k[:sep]), []*structures.NormalTXWithSCIDParse{rec}, nil
 	}
 	var txs []*structures.NormalTXWithSCIDParse
 	if err := msgpack.Unmarshal(v, &txs); err != nil {
@@ -216,6 +225,10 @@ func NewBboltStore(dbDir string, searchFilter string) (*BboltStore, error) {
 // address space is reserved.
 const mainStoreMmapSize = 256 << 20
 
+// mainStoreFile is the bbolt filename inside the db dir. Kept as a const so the
+// open path and the compact subcommand (CompactBbolt) cannot drift apart.
+const mainStoreFile = "HYPERGNOMON.db"
+
 // NewBboltStoreWithMmap opens or creates a BoltDB database with an explicit
 // initial mmap reservation. Short-lived bounded stores — the per-segment
 // temp DBs hold ~10k blocks each and many coexist before the merge — pass 0
@@ -224,7 +237,7 @@ func NewBboltStoreWithMmap(dbDir string, searchFilter string, initialMmapSize in
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir %s: %w", dbDir, err)
 	}
-	dbPath := filepath.Join(dbDir, "HYPERGNOMON.db")
+	dbPath := filepath.Join(dbDir, mainStoreFile)
 
 	opts := &bolt.Options{
 		Timeout:    0,    // 0 = wait indefinitely for lock
@@ -637,11 +650,24 @@ func (s *BboltStore) GetOwnersForSCIDs(scids []string) (map[string]string, error
 	}
 	err := s.DB.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketOwners)
+		// Hoist one cursor and reuse it for every lookup: bbolt's Bucket.Get
+		// creates a fresh Cursor (and grows its descent stack) on each call, so
+		// N lookups cost N cursor allocs. One reused cursor resets its stack
+		// (stack[:0]) per Seek and keeps the backing array, cutting ~3
+		// allocs/lookup. bucketOwners is Put-only (never CreateBucket), so
+		// Seek + bytes.Equal reproduces Get's exact-match semantics exactly.
+		c := b.Cursor()
+		// Reuse one key-scratch buffer across lookups: Seek/bytes.Equal only
+		// read the key (bbolt never retains the slice past the call), so
+		// append(keyScratch[:0], scid...) avoids the per-lookup []byte(scid)
+		// allocation. Only the result string(v) copy remains per hit.
+		var keyScratch []byte
 		for _, scid := range scids {
 			if scid == "" {
 				continue
 			}
-			if v := b.Get([]byte(scid)); v != nil {
+			keyScratch = append(keyScratch[:0], scid...)
+			if k, v := c.Seek(keyScratch); k != nil && bytes.Equal(k, keyScratch) {
 				out[scid] = string(v)
 			}
 		}
@@ -801,10 +827,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 					continue
 				}
 				keyBuf = appendNormTxKey(keyBuf[:0], addr, ntx.Height, ntx.Txid, ntx.Scid)
-				val, err := msgpack.Marshal(ntx)
-				if err != nil {
-					return fmt.Errorf("batch normaltx marshal: %w", err)
-				}
+				// Typed v1 (tag 0x08): 1 alloc for the buffer vs msgpack's ~5.
+				// DecodeNormalTxEntry dispatches typed-vs-legacy by byte[0].
+				val := ntx.MarshalTyped()
 				if err := normBucket.Put(keyBuf, val); err != nil {
 					return err
 				}
@@ -895,10 +920,23 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				// so each SCID appears exactly once in a class scan.
 				// decodeClassMeta transparently handles both typed v1 and
 				// legacy msgpack records during the transition window.
-				if prev := classIdx.Get([]byte(scid)); prev != nil {
+				// All class keys reuse the shared FlushBatch keyBuf scratch.
+				// bbolt clones keys on Put and never retains the key handed to
+				// Get/Delete, so a single backing slice is safe — provided we
+				// rebuild keyBuf[:0] before EACH use, issue the stale Delete
+				// (built from oldMeta) BEFORE the two Puts, and keep the value on
+				// its own MarshalTyped buffer (never keyBuf). The inline
+				// class-key build matches classKey()/encHeight byte-for-byte.
+				keyBuf = append(keyBuf[:0], scid...)
+				if prev := classIdx.Get(keyBuf); prev != nil {
 					if oldMeta, err := decodeClassMeta(prev); err == nil && oldMeta != nil {
 						if oldMeta.Class != meta.Class || oldMeta.InstallHeight != meta.InstallHeight {
-							_ = classPrefix.Delete(classKey(oldMeta.Class, oldMeta.InstallHeight, scid))
+							keyBuf = append(keyBuf[:0], oldMeta.Class...)
+							keyBuf = append(keyBuf, '|')
+							keyBuf = binary.BigEndian.AppendUint64(keyBuf, uint64(oldMeta.InstallHeight)) // #nosec G115 -- chain heights 0..2^62; matches classKey/encHeight.
+							keyBuf = append(keyBuf, '|')
+							keyBuf = append(keyBuf, scid...)
+							_ = classPrefix.Delete(keyBuf)
 						}
 					}
 				}
@@ -906,10 +944,16 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				// reflection. Same slice serves both Puts (bbolt needs the
 				// bytes valid until commit, not unique per Put).
 				val := meta.MarshalTyped()
-				if err := classIdx.Put([]byte(scid), val); err != nil {
+				keyBuf = append(keyBuf[:0], scid...)
+				if err := classIdx.Put(keyBuf, val); err != nil {
 					return err
 				}
-				if err := classPrefix.Put(classKey(meta.Class, meta.InstallHeight, scid), val); err != nil {
+				keyBuf = append(keyBuf[:0], meta.Class...)
+				keyBuf = append(keyBuf, '|')
+				keyBuf = binary.BigEndian.AppendUint64(keyBuf, uint64(meta.InstallHeight)) // #nosec G115 -- see above.
+				keyBuf = append(keyBuf, '|')
+				keyBuf = append(keyBuf, scid...)
+				if err := classPrefix.Put(keyBuf, val); err != nil {
 					return err
 				}
 			}
@@ -1349,6 +1393,11 @@ func ratingsFromVars(vars []*structures.SCIDVariable, height int64, sum *structu
 		return nil
 	}
 	out := make([]structures.Rating, 0, 4)
+	// hexScratch backs the per-rater hex decode, reused across the loop so the
+	// decode costs ~0 allocs/rater instead of make([]byte)+string(out). The
+	// decoded value is transient (parseTELARatingValue feeds it straight to
+	// ParseFloat/ParseInt and never retains it), so reuse across raters is safe.
+	var hexScratch []byte
 	for _, v := range vars {
 		keyStr, ok := v.Key.(string)
 		if !ok {
@@ -1369,7 +1418,7 @@ func ratingsFromVars(vars []*structures.SCIDVariable, height int64, sum *structu
 		if !looksLikeDEROAddress(keyStr) {
 			continue
 		}
-		score, h, ok := parseTELARatingValue(v.Value)
+		score, h, ok := parseTELARatingValue(v.Value, &hexScratch)
 		if !ok {
 			continue
 		}
@@ -1406,38 +1455,49 @@ func looksLikeDEROAddress(s string) bool {
 // parseTELARatingValue decodes the TELA rating value format: the stored
 // value is hex-encoded `"<score>_<height>"`. Returns (score, height, ok).
 // ok=false means the value doesn't match the rating format at all.
-func parseTELARatingValue(raw interface{}) (float64, int64, bool) {
+func parseTELARatingValue(raw interface{}, scratch *[]byte) (float64, int64, bool) {
 	s, ok := raw.(string)
 	if !ok {
 		return 0, 0, false
 	}
-	// Best-effort hex decode; TELA stores the value as hex bytes of the
-	// ASCII "<score>_<height>" string. Legacy records may already be raw
-	// ASCII, so fall through if hex-decode fails.
-	decoded := hexDecodeIfHex(s)
-	parts := strings.SplitN(decoded, "_", 2)
-	if len(parts) != 2 {
+	// Best-effort hex decode into the caller's reused scratch (viewed via
+	// unsafe.String); TELA stores the value as hex bytes of the ASCII
+	// "<score>_<height>" string. Legacy records may already be raw ASCII, so
+	// fall through if hex-decode fails. `decoded` is consumed by the
+	// ParseFloat/ParseInt below and never retained, so scratch reuse is safe.
+	decoded := hexDecodeIfHex(s, scratch)
+	// IndexByte + slicing instead of SplitN: the two substrings are zero-copy
+	// slices into decoded either way, but SplitN also allocates a 2-element
+	// []string header per call — dropped here (−1 alloc/rater). Same semantics:
+	// no "_" → reject; split on the first "_" only.
+	i := strings.IndexByte(decoded, '_')
+	if i < 0 {
 		return 0, 0, false
 	}
-	scoreF, err := strconv.ParseFloat(parts[0], 64)
+	scoreF, err := strconv.ParseFloat(decoded[:i], 64)
 	if err != nil {
 		return 0, 0, false
 	}
 	if scoreF < 0 || scoreF >= 100 {
 		return 0, 0, false
 	}
-	height, err := strconv.ParseInt(parts[1], 10, 64)
+	height, err := strconv.ParseInt(decoded[i+1:], 10, 64)
 	if err != nil {
 		return 0, 0, false
 	}
 	return scoreF, height, true
 }
 
-// hexDecodeIfHex returns the hex-decoded bytes of s if s is a valid hex
-// string, otherwise s unchanged. The TELA Rate() entrypoint stores rating
-// values as hex-encoded ASCII, so real on-chain data will always hex-decode;
-// this fallback is defensive for test fixtures that pre-decode.
-func hexDecodeIfHex(s string) string {
+// hexDecodeIfHex returns the hex-decoded form of s when s is valid even-length
+// hex, otherwise s unchanged. The decode is written into the caller-owned
+// *scratch buffer (grown once, then reused across the rater loop) and returned
+// as an unsafe.String VIEW of that buffer — so after the first sizing there is
+// no per-rater allocation. The returned string is TRANSIENT: the sole caller
+// (parseTELARatingValue) feeds it straight to ParseFloat/ParseInt and never
+// retains it, so the next rater may safely overwrite the scratch. The TELA
+// Rate() entrypoint stores rating values as hex-encoded ASCII; the fallback is
+// defensive for fixtures that pre-decode.
+func hexDecodeIfHex(s string, scratch *[]byte) string {
 	if len(s)%2 != 0 {
 		return s
 	}
@@ -1447,13 +1507,20 @@ func hexDecodeIfHex(s string) string {
 			return s
 		}
 	}
-	out := make([]byte, len(s)/2)
-	for i := 0; i < len(out); i++ {
-		hi := hexNibble(s[i*2])
-		lo := hexNibble(s[i*2+1])
-		out[i] = hi<<4 | lo
+	n := len(s) / 2
+	if n == 0 {
+		return ""
 	}
-	return string(out)
+	if cap(*scratch) < n {
+		*scratch = make([]byte, n) // grow once; subsequent raters reuse the backing array
+	}
+	buf := (*scratch)[:n]
+	for i := 0; i < n; i++ {
+		buf[i] = hexNibble(s[i*2])<<4 | hexNibble(s[i*2+1])
+	}
+	// View the owned scratch — never aliases s. Safe because the result is
+	// consumed before the next hexDecodeIfHex call overwrites buf.
+	return unsafe.String(&buf[0], n)
 }
 
 func hexNibble(c byte) byte {
@@ -1592,7 +1659,11 @@ func (s *BboltStore) GetTELAContent(scid, path string) (*structures.TELAContentE
 			return nil
 		}
 		var e structures.TELAContentEntry
-		if err := msgpack.Unmarshal(v, &e); err != nil {
+		if structures.IsTELAContentTyped(v) {
+			if err := e.UnmarshalTyped(v); err != nil {
+				return err
+			}
+		} else if err := msgpack.Unmarshal(v, &e); err != nil {
 			return err
 		}
 		out = &e
@@ -1607,10 +1678,7 @@ func (s *BboltStore) PutTELAContent(scid, path string, entry *structures.TELACon
 	if scid == "" || entry == nil {
 		return nil
 	}
-	val, err := msgpack.Marshal(entry)
-	if err != nil {
-		return err
-	}
+	val := entry.MarshalTyped()
 	return s.DB.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTELAContent).Put(telaContentKey(scid, path), val)
 	})
