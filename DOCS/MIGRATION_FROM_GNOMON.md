@@ -18,11 +18,14 @@ Target audiences (Go-library embedders who import `civilware/Gnomon/structures` 
 - **Same TELA variable-key semantics** — canonical spec compliance (`var_header_*` + legacy `nameHdr` fallback, hex-decode of stored strings, correct `fileCheckC/S` parsing).
 - **Faster**: typed-encoded ClassMeta (3.2× marshal), O(1) TELA cache invalidation, turbo-mode scan default.
 
+## What HyperGnomon does differently (but still drop-in)
+
+- `dbType="gravdb"` — **accepted, but maps to bbolt** with a one-time warning. HyperGnomon is bbolt-only (graviton iterates in hash byte-sorted order with no prefix/range queries, so it can't serve the key-ordered Route B scans; civilware/Gnomon #24). A consumer that defaults to `gravdb` (e.g. HOLOGRAM) therefore runs unchanged, on bbolt. `storage.NewGravDB` no longer errors — it warns and returns a vestigial store so the caller's own error check passes; `storage.ErrGravDBNotSupported` is kept (deprecated) for source compatibility.
+- **External-store injection now works.** `NewIndexer(gravDB, boltDB, …)` is wired end-to-end: the bbolt store you pre-open with `storage.NewBBoltDB(path, name)` is injected into the indexer, which **borrows** it — you keep ownership, and the facade's `Close()` releases it. `NewIndexerWithDBDir(path, …)` remains for callers who'd rather pass a path and let HyperGnomon open its own store.
+
 ## What HyperGnomon does NOT give you (yet)
 
-- `dbType="gravdb"` — the graviton backend is bbolt-only here. Calls return `storage.ErrGravDBNotSupported` rather than crashing; see civilware/Gnomon issue #24 for why.
 - `runmode="wallet"` / `runmode="asset"` — only `"daemon"` is implemented. Other runmodes return a dead-indexer with `DBType==""`.
-- External-store injection — civilware's `NewIndexer(gravDB, boltDB, …)` expects the caller to pre-open the store. HyperGnomon's internal indexer opens its own; for v1.0 use `NewIndexerWithDBDir(…)` which takes a path. A v1.1 release will wire `NewIndexer(…)` end-to-end.
 
 ## The port in three sed commands
 
@@ -56,19 +59,42 @@ go get github.com/hypergnomon/hypergnomon@latest
 go mod tidy
 ```
 
-## The one constructor change
+## The constructor
 
-Civilware consumers construct the indexer like this:
+Which path you take depends on **which civilware/Gnomon `NewIndexer` your code targets** — its
+signature changed between the frozen `main` line and the current feature line, and Go can't overload,
+so one facade signature can't serve both. `NewIndexerWithDBDir` is the universal one-line swap that
+works regardless.
+
+### Already on the current 12-arg `NewIndexer` (e.g. HOLOGRAM) — import rewrite only
+
+The compat `NewIndexer` mirrors civilware's **current** 12-arg signature exactly (`searchFilter []string`,
+`mbllookup`, `fsc *FastSyncConfig`, `storeIntegrators`), so this call compiles and runs after only the
+import rewrite — no constructor swap:
 
 ```go
 gravDB, _ := storage.NewGravDB(path+"/gravdb", "25ms")
 boltDB, _ := storage.NewBBoltDB(path+"/bolt", "name")
 idx := indexer.NewIndexer(gravDB, boltDB, "gravdb",
-    filter, 0, endpoint, "daemon", false, false, fastSyncConfig, exclusions)
+    searchFilter /* []string */, 0, endpoint, "daemon",
+    false /*mbllookup*/, false /*closeOnDisconnect*/, fastSyncConfig, exclusions, false /*storeIntegrators*/)
 go idx.StartDaemonMode(5)
 ```
 
-Under the compat layer that code still compiles — but `NewIndexer` detects `dbType="gravdb"` and returns a dead indexer. Switch to the HyperGnomon-native path:
+HyperGnomon has no graviton engine, so `dbType="gravdb"` is accepted **with a warning and runs on the
+bbolt store you passed** as `boltDB` (it *borrows* it — you keep ownership; the facade's `Close()`
+releases it). `idx.DBType` then reports `"boltdb"`, and `idx.GravDBBackend` is wired as a delegating
+handle over that same bbolt store — so a consumer that reads through *either* `BBSBackend` or
+`GravDBBackend` (HOLOGRAM does both, and hardcodes `GravDBBackend.GetSCIDInteractionHeight`) gets real
+data. `AddSCIDToIndex(map[string]*FastSyncImport, …)` and `GetOwner` are present. The only hard
+requirement: pass a pre-opened `boltDB` — a nil store, or a non-`"daemon"` runmode, yields a dead
+indexer signalled by `DBType==""`.
+
+### On civilware `main`'s 11-arg `NewIndexer` (dReams / Engram / TELA-CLI) — one-line swap
+
+`main`'s `NewIndexer` has **11** args with `fastsync bool` at position 10 (no `*FastSyncConfig`, no
+`storeIntegrators`). That signature is incompatible with the 12-arg form above, so do the documented
+one-line swap to the native constructor (which also opens the store for you):
 
 ```go
 idx, err := indexer.NewIndexerWithDBDir(path, filter, endpoint, "daemon", fastSyncConfig, exclusions)
@@ -79,14 +105,10 @@ idx.StartDaemonMode(8)
 defer idx.Close()
 ```
 
-Differences:
+Notes:
 
-- No pre-opened store arguments — HyperGnomon opens its own bbolt store at the given `dbDir`.
-- Error return — civilware's shape panics on misconfiguration; HyperGnomon returns an error you can handle.
 - Recommended `parallelBlocks` is 8 (default). Civilware's 5 works; 16+ trips rate limits on remote daemons.
 - `fastSyncConfig` is accepted for signature compatibility but **not applied in v1.0** — the constructor ignores it. To fastsync, run the `hypergnomon` binary with `--fastsync`, or call the native indexer's `Indexer.FastSync` method (`github.com/hypergnomon/hypergnomon/indexer`).
-
-If you need to share a pre-opened store with another process (civilware callers sometimes do this), file an issue — external-store injection is tracked for v1.1.
 
 ## Verifying the port
 
@@ -112,7 +134,7 @@ bug, not an enhancement request.
 
 | civilware/Gnomon symbol | HyperGnomon compat | Notes |
 |---|---|---|
-| `indexer.NewIndexer(…)` | present but dead-stubs `gravdb` and non-daemon runmodes | use `NewIndexerWithDBDir` for v1.0 |
+| `indexer.NewIndexer(…)` | ✓ fully wired to civilware's **current 12-arg** shape; `gravdb` accepted → runs on bbolt; non-`daemon` runmodes → dead indexer | import-only drop-in for current-API callers (HOLOGRAM); `main`'s 11-arg callers use `NewIndexerWithDBDir` |
 | `indexer.NewIndexerWithDBDir(…)` | — | HyperGnomon-native entry |
 | `indexer.InitLog(…)` | no-op accept | HyperGnomon uses logrus internally; inject via future Config.Logger |
 | `indexer.Indexer.LastIndexedHeight` | present | atomic refresh at ~10 Hz |

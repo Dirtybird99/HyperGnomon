@@ -315,7 +315,7 @@ Each milestone is shippable on its own. Rough estimates assume one developer.
 | M2 | Reorg detection + truncate-replay, `reorg` events, fake-daemon test harness | **partial / deferred** | Detection (`SafeHeight` atomic, `CheckReorgAt` stub) shipped in v0.9; truncate-replay deferred to v1.x. Rationale: DERO `STABLE_LIMIT=8` + DAG side-block absorption means reorgs are rare and shallow; civilware/Gnomon ships zero reorg handling, operators use manual `pop`. Our `resync` subcommand covers the operator path. |
 | M3 | civilware ports (addscid_toindex, listsc_*, multi-prefix daemon) | **partial** | core list methods + multi-prefix in v0.9; HOLOGRAM extras (SCIDTagStore, `resolvedurl`, `gettelaapps`) tracked for v1.x |
 | M4 | Query cost estimator, token bucket, `explain` method | pending | public-facing viability |
-| M5 | TELA content server + 2-tier cache | **done** (v1.0) | canonical-spec compliant: base64+gunzip `.gz`, DocShard dispatch, `X-TELA-Verify` header (signature presence in v1.0; crypto check in v1.1) |
+| M5 | TELA content server + 2-tier cache | **done** (v1.0) | canonical-spec compliant: base64+gunzip `.gz`, DocShard dispatch, `X-TELA-Verify` header (signature presence in v1.0/v1.1; crypto check in v1.2) |
 | M6 | Mempool speculative path + reconcile loop | pending | sub-10 s new-SC visibility |
 | M7 | Embedded mode: logger injection, ctx cancel, snapshot export/import | **partial** (v1.0) | `pkg/gnomes` civilware-shape drop-in shipped; external-store injection + snapshot import/export in v1.1 |
 | M8 | Ops polish: metrics, health, config file, grafana dash | pending | production polish |
