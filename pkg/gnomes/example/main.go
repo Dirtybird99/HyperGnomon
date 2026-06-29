@@ -46,9 +46,11 @@ func main() {
 	}
 
 	// Construct the indexer via the HyperGnomon-native entry point.
-	// The civilware-shape NewIndexer(gravDB, boltDB, …) exists for
-	// type compatibility but needs external-store injection that
-	// lands in v1.1; for v1.0, use NewIndexerWithDBDir.
+	// (The civilware-shape NewIndexer(gravDB, boltDB, …) is also fully
+	// wired — it injects the caller's pre-opened bbolt store and matches
+	// civilware's *current* 12-arg signature, so a consumer on that API —
+	// e.g. HOLOGRAM — migrates by import-rewrite alone. Callers on civilware
+	// main's 11-arg NewIndexer use this NewIndexerWithDBDir swap instead.)
 	idx, err := compatindexer.NewIndexerWithDBDir(
 		*dbDir,
 		"telaVersion;;;docVersion;;;ART-NFA-MS1;;;G45",

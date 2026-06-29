@@ -5,6 +5,8 @@
 package storage
 
 import (
+	"fmt"
+
 	hgstorage "github.com/hypergnomon/hypergnomon/storage"
 
 	compatstructures "github.com/hypergnomon/hypergnomon/pkg/gnomes/structures"
@@ -84,14 +86,56 @@ func (b *BboltStore) GetAllSCIDVariableDetails(scid string) []*compatstructures.
 // search ALL stored heights and return every distinct value; `any=false`
 // means just the snapshot at `height`. Returns (values, heights) so
 // callers can correlate each value to the height it was recorded at.
-func (b *BboltStore) GetSCIDValuesByKey(scid, key string, height int64, matchAny bool) ([]string, []int64) {
-	return b.findVars(scid, "", key, height, matchAny, true /*byKey*/)
+func (b *BboltStore) GetSCIDValuesByKey(scid string, key interface{}, height int64, matchAny bool) ([]string, []uint64) {
+	vals, hs := b.findVars(scid, "", civilwareStr(key), height, matchAny, true /*byKey*/)
+	return vals, heightsToUint64(hs)
 }
 
 // GetSCIDKeysByValue is the reverse of GetSCIDValuesByKey: given a
 // value, return every key that currently holds it on `scid`.
-func (b *BboltStore) GetSCIDKeysByValue(scid, value string, height int64, matchAny bool) ([]string, []int64) {
-	return b.findVars(scid, value, "", height, matchAny, false /*byKey*/)
+func (b *BboltStore) GetSCIDKeysByValue(scid string, value interface{}, height int64, matchAny bool) ([]string, []uint64) {
+	keys, hs := b.findVars(scid, civilwareStr(value), "", height, matchAny, false /*byKey*/)
+	return keys, heightsToUint64(hs)
+}
+
+// GetOwner returns the install-time owner address of scid, or "" if the SCID
+// isn't indexed. Civilware-shape (no error return) — wraps the internal store's
+// (string, error) form. HOLOGRAM calls this before AddSCIDToIndex to preserve an
+// existing owner across a manual re-index.
+func (b *BboltStore) GetOwner(scid string) string {
+	owner, err := b.inner.GetOwner(scid)
+	if err != nil {
+		return ""
+	}
+	return owner
+}
+
+// civilwareStr renders a civilware interface{} key/value as the string the
+// internal store compares against. DVM STORE keys/values are String or Uint64;
+// this mirrors civilware's stringification so a caller passing either compiles
+// and matches.
+func civilwareStr(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
+
+// heightsToUint64 converts the internal int64 heights to civilware's []uint64
+// return shape. Indexed heights are non-negative.
+func heightsToUint64(in []int64) []uint64 {
+	if in == nil {
+		return nil
+	}
+	out := make([]uint64, len(in))
+	for i, h := range in {
+		out[i] = uint64(h)
+	}
+	return out
 }
 
 // GetSCIDInteractionHeight returns every height at which `scid`'s

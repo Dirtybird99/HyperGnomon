@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	hgindexer "github.com/hypergnomon/hypergnomon/indexer"
+	"github.com/hypergnomon/hypergnomon/structures"
 
 	compatstorage "github.com/hypergnomon/hypergnomon/pkg/gnomes/storage"
 	compatstructures "github.com/hypergnomon/hypergnomon/pkg/gnomes/structures"
@@ -63,67 +64,93 @@ type Indexer struct {
 	closed atomic.Bool
 }
 
-// NewIndexer constructs an Indexer using the civilware shape.
-// HOLOGRAM's exact call site (gnomon.go:Start):
+// NewIndexer constructs an Indexer using the civilware shape. The parameter
+// list mirrors civilware/Gnomon's current indexer.NewIndexer EXACTLY (commit
+// 0280ea286474, the feat-addscidtoindex-wsserver line HOLOGRAM v1.0.7 pins), so
+// a consumer's call site compiles unchanged after the import rewrite:
 //
-//	indexer.NewIndexer(gravDB, boltDB, "gravdb"|"boltdb", filter, height,
-//	                   endpoint, "daemon", false, false, config, exclusions)
+//	indexer.NewIndexer(gravDB, boltDB, dbType, searchFilter, height, endpoint,
+//	    "daemon", mbllookup, closeOnDisconnect, fsc, exclusions, storeIntegrators)
 //
-// We ignore gravDB (errors if non-nil) and route everything through
-// the bbolt backend. `runmode` values other than "daemon" are
-// rejected — civilware also has "wallet" and "asset" which we don't
-// yet implement; they're out of scope for v1.0.
+// HyperGnomon runs on bbolt regardless of dbType: bbolt is the default, and a
+// non-bbolt dbType ("gravdb"/"sqlite"/…) is accepted but logged and falls back
+// to the bbolt store the caller passes as bolt. The pre-opened bolt store is
+// injected into the internal indexer (re-opening its path would lock-conflict).
+// grav is vestigial; mbllookup/storeIntegrators/closeOnDisconnect/height are
+// accepted for signature parity but not modeled. `runmode` other than "daemon"
+// is rejected.
 func NewIndexer(
-	gravDB interface{}, // civilware: *storage.GravitonStore
-	boltDB interface{}, // civilware: *storage.BboltStore
+	grav *compatstorage.GravitonStore, // civilware: *storage.GravitonStore (vestigial here)
+	bolt *compatstorage.BboltStore, // civilware: *storage.BboltStore (the real backend)
 	dbType string,
-	filter string,
+	searchFilter []string,
 	height int64,
 	endpoint string,
 	runmode string,
+	mbllookup bool,
 	closeOnDisconnect bool,
-	runtime bool,
 	config *compatstructures.FastSyncConfig,
 	exclusions []string,
+	storeIntegrators bool,
 ) *Indexer {
-	if dbType == "gravdb" {
-		// Signal via panic-on-start: civilware's shape returns
-		// *Indexer with no error return. Wrap the "unsupported"
-		// signal in a sentinel Indexer that errors on every method.
-		return newDeadIndexer(fmt.Errorf("gravdb unsupported in HyperGnomon — use dbType=\"boltdb\""))
-	}
 	if runmode != "" && runmode != "daemon" {
 		return newDeadIndexer(fmt.Errorf("runmode %q unsupported in HyperGnomon — only \"daemon\" is implemented", runmode))
 	}
-	// Coerce the civilware bolt store argument into our compat
-	// wrapper. Civilware passes a *storage.BboltStore from its own
-	// package; consumers using our compat layer pass our wrapper.
-	var bolt *compatstorage.BboltStore
-	switch v := boltDB.(type) {
-	case *compatstorage.BboltStore:
-		bolt = v
-	case nil:
-		// Caller didn't pre-open — we construct one below.
-	default:
-		return newDeadIndexer(fmt.Errorf("boltDB arg is %T, expected *storage.BboltStore", boltDB))
+	// bbolt is the only real backend; a non-bbolt dbType warns and falls back.
+	switch strings.ToLower(strings.TrimSpace(dbType)) {
+	case "", "bolt", "boltdb", "bbs":
+		// default bbolt — no warning
+	default: // gravdb, graviton, sqlite, anything else
+		structures.Logger.Warnf("[gnomes] dbType=%q not available in HyperGnomon; using bbolt", dbType)
+	}
+	// The caller's pre-opened bbolt store is the real backend.
+	if bolt == nil {
+		return newDeadIndexer(fmt.Errorf("boltDB is nil — pre-open one with storage.NewBBoltDB(path, name) and pass it in"))
+	}
+	if bolt.Inner() == nil {
+		return newDeadIndexer(fmt.Errorf("boltDB has no open store"))
+	}
+	_ = grav              // vestigial — HyperGnomon always runs on bbolt
+	_ = height            // civilware resume hint; HyperGnomon resumes from the store
+	_ = mbllookup         // civilware miniblock-lookup knob; not modeled
+	_ = closeOnDisconnect // civilware reconnect knob; not modeled
+	_ = storeIntegrators  // civilware integrator-store knob; not modeled
+	if config != nil {
+		_ = config.Enabled // civilware FastSyncConfig isn't a HyperGnomon concept
 	}
 
-	if config != nil {
-		// Civilware's FastSyncConfig isn't a HyperGnomon concept —
-		// we drop most of it and only honor Enabled as a hint.
-		_ = config.Enabled
+	inner, err := hgindexer.New(hgindexer.Config{
+		Endpoint:       strings.TrimPrefix(strings.TrimPrefix(endpoint, "http://"), "https://"),
+		Store:          bolt.Inner(), // external-store injection: borrow the caller's store
+		SearchFilter:   searchFilter, // civilware ships []string; pass through unchanged
+		SCIDExclusions: exclusions,
+		TurboMode:      true,
+	})
+	if err != nil {
+		return newDeadIndexer(fmt.Errorf("hypergnomon indexer init: %w", err))
 	}
-	if bolt == nil {
-		// Nobody pre-opened a store; we need a path. Civilware
-		// callers typically pre-open. For resilience, err out
-		// clearly rather than guess a path.
-		return newDeadIndexer(fmt.Errorf("boltDB arg is nil — open one with storage.NewBBoltDB(path, name) first"))
+	return wrapIndexerWithStore(inner, bolt)
+}
+
+// AddSCIDToIndex injects specific SCIDs into the index immediately — civilware's
+// manual-add path (used by HOLOGRAM to index a SCID that fastsync missed, e.g.
+// one deployed before the indexer started). Mirrors civilware's signature; each
+// entry is indexed via the internal IndexSingleSCID (the same path the native WS
+// API's "addscidtoindex" method uses). varstoreonly re-reads only variables;
+// skipfsrecheck reuses existing class metadata when present. The internal
+// indexer re-extracts the owner, so FastSyncImport.Owner is advisory. Returns
+// the first error encountered (others are attempted regardless).
+func (idx *Indexer) AddSCIDToIndex(scids map[string]*compatstructures.FastSyncImport, skipfsrecheck, varstoreonly bool) error {
+	if idx == nil || idx.inner == nil {
+		return fmt.Errorf("indexer not initialized")
 	}
-	// HyperGnomon's current New() opens its own store from cfg.DBDir.
-	// That's a v1.0 limitation — the compat shim can't inject a
-	// pre-opened store yet. Tell the caller to pass a path via
-	// SetDBDir and use NewIndexerWithDBDir instead.
-	return newDeadIndexer(fmt.Errorf("compat v1.0: use pkg/gnomes/indexer.NewIndexerWithDBDir(dbDir, …) until HyperGnomon exposes external-store injection"))
+	var firstErr error
+	for scid := range scids {
+		if _, err := idx.inner.IndexSingleSCID(scid, varstoreonly, skipfsrecheck); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("AddSCIDToIndex(%s): %w", scid, err)
+		}
+	}
+	return firstErr
 }
 
 // NewIndexerWithDBDir is the HyperGnomon-native constructor that the
@@ -155,13 +182,30 @@ func NewIndexerWithDBDir(
 }
 
 // wrapIndexer is the internal facade-builder. Exposed so tests can
-// construct an Indexer around a pre-built internal instance.
+// construct an Indexer around a pre-built internal instance. The inner
+// indexer owns its store (NewIndexerWithDBDir path) so BBSBackend is nil.
 func wrapIndexer(inner *hgindexer.Indexer) *Indexer {
+	return wrapIndexerWithStore(inner, nil)
+}
+
+// wrapIndexerWithStore builds the facade and records the caller-owned bbolt
+// store (the NewIndexer injection path). When bolt is non-nil the internal
+// indexer borrows it (does not close it), so the facade's Close releases it.
+func wrapIndexerWithStore(inner *hgindexer.Indexer, bolt *compatstorage.BboltStore) *Indexer {
 	idx := &Indexer{
 		DBType:           "boltdb",
 		inner:            inner,
 		fieldRefreshStop: make(chan struct{}),
-		BBSBackend:       nil, // populated via Inner() accessor; not widely used
+		BBSBackend:       bolt,
+	}
+	if bolt != nil {
+		// Wire GravDBBackend as a DELEGATING handle over the same bbolt store. A
+		// civilware consumer (HOLOGRAM) defaults to dbType="gravdb" and reads
+		// through GravDBBackend — both its dbType=="gravdb" dispatch branches and
+		// its hardcoded GravDBBackend.GetSCIDInteractionHeight path — so a nil
+		// GravDBBackend would make those reads silently return empty. Delegating
+		// to bbolt makes every read path land on real data.
+		idx.GravDBBackend = compatstorage.NewGravDBDelegate(bolt)
 	}
 	idx.startFieldRefresh()
 	return idx
@@ -207,6 +251,13 @@ func (idx *Indexer) Close() {
 	}
 	if idx.inner != nil {
 		idx.inner.Close()
+	}
+	// Close the injected store the compat layer owns (NewIndexer path). The
+	// internal indexer borrowed it (ownStore=false) so didn't close it. For the
+	// NewIndexerWithDBDir path BBSBackend is nil and the inner indexer already
+	// closed its own store above.
+	if idx.BBSBackend != nil {
+		_ = idx.BBSBackend.Close()
 	}
 }
 
