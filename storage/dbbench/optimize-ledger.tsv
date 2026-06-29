@@ -1,0 +1,15 @@
+engine	iter	allocs	bytes	ns_median	status	description
+bbolt	0	6733	921242	3135700	baseline	unmodified adapter
+sqlite	0	12644	399019	11143600	baseline	unmodified adapter
+graviton	0	22243	6429894	24964463	baseline	unmodified adapter
+bbolt	1	6687	915563	3342670	keep	pre-map 256MiB InitialMmapSize (fewer grow+remap allocs)
+bbolt	2	6687	915662	3436715	discard	manual Begin/Commit (no alloc gain; closure already stack-alloc)
+bbolt	3	6960	928019	3418208	discard	FillPercent=0.9 (random keys split fuller pages: more allocs)
+bbolt	4	6688	915114	3076866	discard	NoGrowSync (allocs tie within jitter; not a strict primary-metric gain)
+sqlite	1	12644	399036	10525498	discard	reuse variadic args slice (no alloc gain; database/sql copies internally)
+sqlite	2	9373	242058	3065943	keep	INSERT OR REPLACE -> ON CONFLICT DO UPDATE upsert (no delete+insert churn)
+sqlite	3	2583	228493	2924634	keep	multi-row INSERT (100 rows/stmt): ~10 Execs not 1000
+sqlite	4	2477	242311	4389773	discard	chunk=500: -4% allocs but +50% ns (giant-stmt prepare cost)
+sqlite	5	2568	226279	2727304	keep	persistent prepared stmt (prepare once at open not per batch)
+sqlite	6	2179	207513	1545168	keep	cache_size=-64MiB + temp_store=memory (DB stays resident; fewer spills)
+graviton	1	22237	6429134	24513976	discard	tree.Commit() vs package Commit: -6 allocs but re-measure 22265 (within +/-30 jitter); no real gain
