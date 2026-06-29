@@ -67,7 +67,6 @@ func TestEnginesRoundTrip(t *testing.T) {
 	got := map[string]snap{}
 
 	for _, f := range engineFactories() {
-		f := f
 		t.Run(f.name, func(t *testing.T) {
 			dir := t.TempDir()
 			e, err := f.open(dir)
@@ -147,7 +146,6 @@ func BenchmarkBatchWrite(b *testing.B) {
 	}
 	for _, tc := range cases {
 		for _, f := range engineFactories() {
-			tc, f := tc, f
 			b.Run(tc.name+"/"+f.name, func(b *testing.B) {
 				batches := rotatingBatches(8, writeBatchN, tc.valSize)
 				e, err := f.open(b.TempDir())
@@ -176,7 +174,6 @@ func BenchmarkBatchWrite(b *testing.B) {
 func BenchmarkPointRead(b *testing.B) {
 	pairs := pointPairs(readM, 80)
 	for _, f := range engineFactories() {
-		f := f
 		b.Run(f.name, func(b *testing.B) {
 			e, done := openPopulated(b, f, pairs)
 			defer done()
@@ -201,7 +198,6 @@ func BenchmarkPointRead(b *testing.B) {
 func BenchmarkRangeScan(b *testing.B) {
 	pairs := heightPairs(readM)
 	for _, f := range engineFactories() {
-		f := f
 		b.Run(f.name, func(b *testing.B) {
 			e, done := openPopulated(b, f, pairs)
 			defer done()
@@ -226,7 +222,6 @@ func BenchmarkRangeScan(b *testing.B) {
 func BenchmarkScanAll(b *testing.B) {
 	pairs := heightPairs(readM)
 	for _, f := range engineFactories() {
-		f := f
 		b.Run(f.name, func(b *testing.B) {
 			e, done := openPopulated(b, f, pairs)
 			defer done()

@@ -39,7 +39,6 @@ func backendFactories() []backendFactory {
 
 func TestStorageConformance(t *testing.T) {
 	for _, f := range backendFactories() {
-		f := f
 		t.Run(f.name, func(t *testing.T) {
 			t.Run("OwnersAndIndexHeight", func(t *testing.T) { conformanceOwners(t, f.open) })
 			t.Run("FlushBatchRoundTrip", func(t *testing.T) { conformanceFlushRoundTrip(t, f.open) })

@@ -63,7 +63,7 @@ func assertAddrSCIDs(t *testing.T, store *BboltStore, addr string, exp map[strin
 // newEmptyBatch seeds addrSCIDArena with cap 1024, so adding 3000 distinct
 // pairs guarantees >=2 reallocs. The test bypasses the pool via newEmptyBatch
 // for determinism. (Also passes on the pre-change code where each entry is its
-// own heap alloc — it is a behaviour gate, green before and after.)
+// own heap alloc — it is a behavior gate, green before and after.)
 func TestAddrSCIDs_ArenaWithinBatchRealloc(t *testing.T) {
 	store := openTestStore(t)
 	const addr = "dero1qarenawithinbatch"

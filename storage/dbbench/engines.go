@@ -20,7 +20,7 @@ type engine interface {
 // sink defends the read benchmarks against dead-code elimination — every scanned
 // value length is summed here so the compiler cannot drop the loop body. The
 // benchmarks run serially (no b.RunParallel), so an unsynchronized int is fine.
-var sink int
+var sink int //nolint:unused
 
 type engineFactory struct {
 	name string

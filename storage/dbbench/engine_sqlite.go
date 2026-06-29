@@ -82,7 +82,7 @@ func (e *sqliteEngine) batchWrite(pairs []kv) error {
 		full := tx.Stmt(e.insChunk) // reuse the persistent prepared statement in this tx
 		for i := 0; i+sqlInsertChunk <= len(pairs); i += sqlInsertChunk {
 			if err := exec(full, pairs[i:i+sqlInsertChunk]); err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return err
 			}
 		}
@@ -90,13 +90,13 @@ func (e *sqliteEngine) batchWrite(pairs []kv) error {
 	if rem := len(pairs) % sqlInsertChunk; rem > 0 {
 		tail, err := tx.Prepare(multiRowUpsert(rem))
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return err
 		}
 		err = exec(tail, pairs[len(pairs)-rem:])
 		tail.Close()
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return err
 		}
 	}

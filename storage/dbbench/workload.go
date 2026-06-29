@@ -37,14 +37,6 @@ type kv struct {
 // graviton has no fsync knob; NewDiskStore persists on Commit either way.
 const durability = "bulk" // "bulk" | "durable"
 
-// be8 encodes a height as 8-byte big-endian, matching the BE8 height keys the
-// real store uses so range scans sort by height (storage/bbolt.go).
-func be8(h uint64) []byte {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], h)
-	return b[:]
-}
-
 // fill writes a deterministic pseudo-random byte pattern derived from seed into
 // dst (xorshift64). Deterministic so every engine and every run sees identical
 // bytes — no Date.now/random drift, results are reproducible.
