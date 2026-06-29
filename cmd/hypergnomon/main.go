@@ -35,6 +35,9 @@ func main() {
 		case "clean":
 			runClean(os.Args[2:])
 			return
+		case "compact":
+			runCompact(os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			// Fall through to normal flag.Parse so `-h` prints the full flag list.
 		}
@@ -45,6 +48,7 @@ func main() {
 	// CLI flags
 	endpoint := flag.String("daemon-rpc-address", "127.0.0.1:10102", "DERO daemon RPC address")
 	dbDir := flag.String("db-dir", "gnomondb", "Database directory")
+	storageBackend := flag.String("storage-backend", "bbolt", "Storage backend: bbolt (default, shipped) | sqlite (planned) | graviton (unsupported)")
 	searchFilter := flag.String("search-filter", "", "SC code search filter (;;; separated)")
 	scidExclusions := flag.String("sf-scid-exclusions", "", "SCIDs to exclude (;;; separated)")
 	parallelBlocks := flag.Int("num-parallel-blocks", structures.DefaultParallelBlocks, "Number of blocks to fetch in parallel")
@@ -85,6 +89,14 @@ func main() {
 	timingEvery := flag.Int("timing-every", 10, "How many batches between timing summaries")
 	classifySeedCacheDir := flag.String("classify-seed-cache-dir", "", "Cross-DB classify seed cache directory (empty = OS user cache)")
 	flag.Parse()
+
+	// Validate the storage backend up front so an unsupported/unimplemented
+	// choice fails fast with a clear message, rather than surfacing as a
+	// generic failure inside the daemon-connection retry loop below.
+	if err := storage.ValidateBackend(*storageBackend); err != nil {
+		fmt.Fprintf(os.Stderr, "storage backend: %v\n", err)
+		os.Exit(2)
+	}
 
 	// Start pprof server if requested. Handlers are registered on a
 	// dedicated mux (not DefaultServeMux) so profiling is only ever exposed
@@ -183,6 +195,7 @@ func main() {
 		idx, err = indexer.New(indexer.Config{
 			Endpoint:               node,
 			DBDir:                  *dbDir,
+			Backend:                *storageBackend,
 			SearchFilter:           filters,
 			SCIDExclusions:         exclusions,
 			ParallelBlocks:         *parallelBlocks,
@@ -228,6 +241,7 @@ func main() {
 		idx, err = indexer.New(indexer.Config{
 			Endpoint:               input,
 			DBDir:                  *dbDir,
+			Backend:                *storageBackend,
 			SearchFilter:           filters,
 			SCIDExclusions:         exclusions,
 			ParallelBlocks:         *parallelBlocks,
@@ -350,6 +364,10 @@ func runResync(args []string) {
 		os.Exit(2)
 	}
 
+	// NOTE: resync (like clean) is bbolt-only maintenance tooling — it bypasses
+	// the storage.Open factory and hardwires the bbolt store. If a second backend
+	// ever ships, route this through storage.Open(backend, *dbDir, "") so it
+	// honors --storage-backend instead of silently resetting the wrong store.
 	store, err := storage.NewBboltStore(*dbDir, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open db: %v\n", err)
@@ -362,6 +380,37 @@ func runResync(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("index reset: %s\n", *dbDir)
+}
+
+// runCompact implements `hypergnomon compact [--db-dir=...]`: rewrites the bbolt
+// store dropping free/fragmented pages (bbolt.Compact), reclaiming disk and
+// improving page locality. The indexer must be stopped — the store is locked
+// while running, so this fails fast if it is in use. The original is kept as
+// HYPERGNOMON.db.bak for rollback.
+func runCompact(args []string) {
+	fs := flag.NewFlagSet("compact", flag.ExitOnError)
+	dbDir := fs.String("db-dir", "gnomondb", "Database directory")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	// NOTE: bbolt-only maintenance (like resync/clean) — bypasses the storage.Open
+	// factory. Route through the factory if a second backend ever ships.
+	const txMaxSize = 64 << 20 // bound the per-transaction copy during compaction
+	res, err := storage.CompactBbolt(*dbDir, txMaxSize)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "compact: %v\n", err)
+		os.Exit(1)
+	}
+
+	pct := 0.0
+	if res.Before > 0 {
+		pct = 100 * float64(res.Before-res.After) / float64(res.Before)
+	}
+	fmt.Printf("compacted %s: %.1f MiB -> %.1f MiB (reclaimed %.1f%%)\n",
+		filepath.Join(*dbDir, "HYPERGNOMON.db"),
+		float64(res.Before)/1048576, float64(res.After)/1048576, pct)
+	fmt.Printf("original kept at %s — delete it once the compacted DB starts cleanly\n", res.BackupPath)
 }
 
 // runClean implements `hypergnomon clean <network> [--force]`. network names
