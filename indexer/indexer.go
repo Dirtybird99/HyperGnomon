@@ -51,9 +51,10 @@ type Indexer struct {
 	adaptiveBatchSize      atomic.Int64
 
 	// Backends
-	RPCPool *hgrpc.Pool
-	Store   storage.Storage
-	Closing atomic.Bool
+	RPCPool  *hgrpc.Pool
+	Store    storage.Storage
+	ownStore bool // true if New opened Store (and Close must release it); false when injected
+	Closing  atomic.Bool
 
 	// Route B finality: SafeHeight = max(LastIndexedHeight - FinalityDepth, 0).
 	// Exposed in every API response so clients can distinguish "indexed"
@@ -81,8 +82,17 @@ type Indexer struct {
 
 // Config holds indexer configuration.
 type Config struct {
-	Endpoint               string
-	DBDir                  string
+	Endpoint string
+	DBDir    string
+	// Backend selects the storage engine via storage.Open. Empty defaults to
+	// "bbolt" (the only shipped backend); "sqlite" is planned, "graviton"
+	// unsupported. See storage/factory.go. Ignored when Store is non-nil.
+	Backend string
+	// Store, when non-nil, is an already-opened store the indexer uses instead
+	// of opening its own via Backend/DBDir (external-store injection — used by
+	// the pkg/gnomes compat shim, which hands over a consumer's pre-opened
+	// store). Close() will NOT release an injected store; the caller owns it.
+	Store                  storage.Storage
 	SearchFilter           []string
 	SCIDExclusions         []string
 	ParallelBlocks         int
@@ -147,15 +157,25 @@ func New(cfg Config) (*Indexer, error) {
 		exclusions[scid] = struct{}{}
 	}
 
-	store, err := storage.NewBboltStore(cfg.DBDir, strings.Join(cfg.SearchFilter, ";;;"))
-	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
+	// Use a caller-injected store (external-store injection) when provided;
+	// otherwise open one via the backend factory. ownStore records whether
+	// Close should release it — an injected store is the caller's to close.
+	store := cfg.Store
+	ownStore := false
+	if store == nil {
+		s, err := storage.Open(cfg.Backend, cfg.DBDir, strings.Join(cfg.SearchFilter, ";;;"))
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		store, ownStore = s, true
 	}
 
 	// Create RPC connection pool early so API server can use it
 	pool, err := hgrpc.NewPool(cfg.Endpoint, cfg.PoolSize)
 	if err != nil {
-		store.Close()
+		if ownStore {
+			store.Close()
+		}
 		return nil, fmt.Errorf("rpc pool: %w", err)
 	}
 
@@ -175,6 +195,7 @@ func New(cfg Config) (*Indexer, error) {
 		CodePolicy:             normalizeCodePolicy(cfg.CodePolicy),
 		ClassifySeedCacheDir:   cfg.ClassifySeedCacheDir,
 		Store:                  store,
+		ownStore:               ownStore,
 		RPCPool:                pool,
 		Bus:                    cfg.Bus,
 		timer:                  newStageTimer(cfg.Timing, cfg.TimingEvery),
@@ -650,20 +671,27 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 		}
 
 		if fb.txResult != nil && len(fb.txResult.Txs_as_hex) > 0 {
-			txMap := make(map[string]int, len(fb.allTxHashes))
-			for i, h := range fb.allTxHashes {
-				txMap[h] = i
-			}
-
+			// txIdx tracks position in fb.allTxHashes, which the fetcher builds as
+			// the in-order concatenation of every block's txHashes (fetcherLoop and
+			// fetchSingleBlock append to bi.txHashes and allTxHashes adjacently under
+			// identical filtering). The nested traversal below visits hashes in that
+			// exact append order, so a running counter reproduces the old
+			// map[hash]index lookup without allocating a map (tx hashes are unique,
+			// so map and counter agree). ti is captured and the counter advanced at
+			// the top of each iteration — including the skip branch — so the mid-loop
+			// decode skips stay aligned with Txs_as_hex when the RPC returns fewer
+			// Txs_as_hex than hashes.
+			txIdx := 0
 			for _, bi := range fb.blocks {
 				for _, hashStr := range bi.txHashes {
-					txIdx, ok := txMap[hashStr]
-					if !ok || txIdx >= len(fb.txResult.Txs_as_hex) {
+					ti := txIdx
+					txIdx++
+					if ti >= len(fb.txResult.Txs_as_hex) {
 						continue
 					}
 
 					tDec := time.Now()
-					txHex := fb.txResult.Txs_as_hex[txIdx]
+					txHex := fb.txResult.Txs_as_hex[ti]
 					txBin, err := hex.DecodeString(txHex)
 					if err != nil {
 						idx.timer.record(stageProcTxDecode, time.Since(tDec))
@@ -680,7 +708,7 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 					switch tx.TransactionType {
 					case transaction.SC_TX:
 						tSC := time.Now()
-						idx.processSCTx(&tx, fb.txResult.Txs[txIdx], hashStr, bi.height, batch)
+						idx.processSCTx(&tx, fb.txResult.Txs[ti], hashStr, bi.height, batch)
 						idx.timer.record(stageProcSCTx, time.Since(tSC))
 					case transaction.REGISTRATION:
 						fb.regCount++
@@ -689,7 +717,7 @@ func (idx *Indexer) processorLoop(in <-chan *fetchedBatch, out chan<- *processed
 					case transaction.NORMAL:
 						normCount++
 						tN := time.Now()
-						idx.processNormalTx(&tx, fb.txResult.Txs[txIdx], hashStr, bi.height, batch)
+						idx.processNormalTx(&tx, fb.txResult.Txs[ti], hashStr, bi.height, batch)
 						idx.timer.record(stageProcNormal, time.Since(tN))
 					}
 				}
@@ -1345,7 +1373,7 @@ func (idx *Indexer) Close() {
 	if idx.RPCPool != nil {
 		idx.RPCPool.Close()
 	}
-	if idx.Store != nil {
+	if idx.Store != nil && idx.ownStore {
 		if err := idx.Store.Close(); err != nil {
 			logger.Warnf("store close: %v", err)
 		}
