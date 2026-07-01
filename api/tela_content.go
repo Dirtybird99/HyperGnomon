@@ -610,21 +610,38 @@ func mimeForDocType(docType string) string {
 // on-wire is `base64.StdEncoding.EncodeToString(gzip(raw))`. So we must
 // base64-decode first, THEN gunzip. Tolerates leading/trailing whitespace
 // that the /* … */ comment framing might have left after TrimSpace.
+// base64BufPool recycles the transient base64-decode buffer in
+// decompressTELAGzip. The buffer is fully consumed by gunzipBytes before
+// return and never escapes (gunzip produces a fresh output slice), so it is
+// safe to recycle. Pooling a *[]byte (not []byte) avoids the per-Put
+// interface-boxing allocation.
+var base64BufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0); return &b },
+}
+
 func decompressTELAGzip(b []byte) ([]byte, error) {
 	// Trim any whitespace inside the comment that survived the outer trim.
 	s := bytes.TrimSpace(b)
 	// Decode straight from the []byte. The old DecodeString(string(s)) allocated
 	// a string from s AND converted it back to []byte internally; Decode(dst, s)
-	// does neither — just the one dst buffer.
-	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(s)))
+	// does neither — just the one dst buffer, which we recycle via a pool.
+	need := base64.StdEncoding.DecodedLen(len(s))
+	bufp := base64BufPool.Get().(*[]byte)
+	if cap(*bufp) < need {
+		*bufp = make([]byte, need)
+	}
+	decoded := (*bufp)[:need]
 	n, err := base64.StdEncoding.Decode(decoded, s)
 	if err != nil {
+		base64BufPool.Put(bufp)
 		// Fall back to raw gzip — some fixtures or non-standard deploys
 		// may skip the base64 layer. The caller then gets a real gzip
 		// error if that fails too.
 		return gunzipBytes(b)
 	}
-	return gunzipBytes(decoded[:n])
+	out, gzErr := gunzipBytes(decoded[:n])
+	base64BufPool.Put(bufp)
+	return out, gzErr
 }
 
 // gzipReaderPool recycles gzip.Readers across decompress calls. A fresh
