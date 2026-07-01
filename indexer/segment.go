@@ -645,10 +645,12 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 				segLog.Warnf("merge normaltx: %s: %v", addr, err)
 				return nil
 			}
-			if batch.NormalTxs[addr] == nil {
-				batch.NormalTxs[addr] = make([]*structures.NormalTXWithSCIDParse, 0, len(txs))
+			for _, tx := range txs {
+				if tx == nil {
+					continue
+				}
+				batch.AddNormalTx(addr, tx.Txid, tx.Scid, tx.Fees, tx.Height)
 			}
-			batch.NormalTxs[addr] = append(batch.NormalTxs[addr], txs...)
 			return nil
 		})
 

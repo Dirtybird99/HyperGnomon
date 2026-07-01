@@ -847,19 +847,19 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Store normal txs: one composite key per record (append-only), same
 		// O(total^2) -> O(delta) reasoning as heights above.
 		normBucket := tx.Bucket(bucketNormTx)
-		for _, addr := range sortedBatchKeys(batch.NormalTxs) {
-			txs := batch.NormalTxs[addr]
-			for _, ntx := range txs {
-				if ntx == nil {
-					continue
-				}
-				keyBuf = appendNormTxKey(keyBuf[:0], addr, ntx.Height, ntx.Txid, ntx.Scid)
-				// Typed v1 (tag 0x08): 1 alloc for the buffer vs msgpack's ~5.
-				// DecodeNormalTxEntry dispatches typed-vs-legacy by byte[0].
-				val := ntx.MarshalTyped()
-				if err := normBucket.Put(keyBuf, val); err != nil {
-					return err
-				}
+		// Sort the flat (addr, tx) records by addr for deterministic write order
+		// and bbolt page locality (0-alloc in-place sort).
+		slices.SortFunc(batch.NormalTxs, func(a, b NormalTxRef) int {
+			return strings.Compare(a.Addr, b.Addr)
+		})
+		for i := range batch.NormalTxs {
+			e := &batch.NormalTxs[i]
+			keyBuf = appendNormTxKey(keyBuf[:0], e.Addr, e.Tx.Height, e.Tx.Txid, e.Tx.Scid)
+			// Typed v1 (tag 0x08): 1 alloc for the buffer vs msgpack's ~5.
+			// DecodeNormalTxEntry dispatches typed-vs-legacy by byte[0].
+			val := e.Tx.MarshalTyped()
+			if err := normBucket.Put(keyBuf, val); err != nil {
+				return err
 			}
 		}
 

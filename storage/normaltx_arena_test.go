@@ -19,20 +19,16 @@ func normTxKeyOf(r *structures.NormalTXWithSCIDParse) normTxKey {
 	return normTxKey{height: r.Height, txid: r.Txid, scid: r.Scid}
 }
 
-// TestNormalTxArena_WithinBatchRealloc forces the batch-owned normalTxArena to
-// reallocate multiple times inside a SINGLE batch while re-touching addrs that
-// received records BEFORE the first realloc. AddNormalTx carves each record
-// from the arena and publishes &arena[len-1] into NormalTxs[addr]; if a realloc
-// ever invalidated an already-published pointer (e.g. by re-indexing the arena),
-// the early records' Height/Txid/Scid would corrupt and their composite bucket
-// keys would drift. The test reads every record back via GetNormalTxWithSCIDByAddr
-// and asserts the exact per-addr multiset. Green before AND after the arena
-// change (a behavior gate). -race cannot catch this — the bug is single-threaded
-// pointer invalidation, not a data race.
+// TestNormalTxArena_WithinBatchRealloc grows the flat NormalTxs value slice past
+// its initial cap inside a SINGLE batch while re-touching addrs that received
+// records before the grow. NormalTxs holds (addr, record) VALUES (no pointer
+// arena), so a slice realloc copies entries and cannot corrupt earlier ones —
+// this guards that every appended record survives the grow with exact fields and
+// reads back correctly via GetNormalTxWithSCIDByAddr (a behavior gate, green
+// before and after the flat-slice change).
 //
-// newEmptyBatch seeds normalTxArena with cap 512, so >512 distinct records force
-// >=1 realloc; the re-touch phase adds more after the realloc so an early addr's
-// slice holds both pre- and post-realloc pointers at once.
+// newEmptyBatch seeds NormalTxs with cap 512, so >512 records force >=1 realloc;
+// the re-touch phase adds more after the realloc.
 func TestNormalTxArena_WithinBatchRealloc(t *testing.T) {
 	store := openTestStore(t)
 
@@ -78,21 +74,23 @@ func TestNormalTxArena_WithinBatchRealloc(t *testing.T) {
 		}
 	}
 
-	// In-memory arena-stability check: every published pointer still holds its
-	// original fields (catches realloc corruption independent of storage keying).
-	for addr, want := range exp {
-		got := batch.NormalTxs[addr]
-		if len(got) != len(want) {
-			t.Fatalf("in-mem count for %s: got %d want %d", addr, len(got), len(want))
+	// In-memory check: every appended (addr, record) survives the slice grow with
+	// its exact fields (values, not pointers — a realloc copies them).
+	inMem := make(map[string]int, len(exp))
+	for i := range batch.NormalTxs {
+		e := &batch.NormalTxs[i]
+		w := exp[e.Addr][normTxKeyOf(&e.Tx)]
+		if w == nil {
+			t.Fatalf("in-mem stray record %+v for %s", e.Tx, e.Addr)
 		}
-		for _, p := range got {
-			w := want[normTxKeyOf(p)]
-			if w == nil {
-				t.Fatalf("in-mem stray record %+v for %s", *p, addr)
-			}
-			if p.Fees != w.Fees {
-				t.Fatalf("in-mem fees drift for %s @%d: got %d want %d", addr, p.Height, p.Fees, w.Fees)
-			}
+		if e.Tx.Fees != w.Fees {
+			t.Fatalf("in-mem fees drift for %s @%d: got %d want %d", e.Addr, e.Tx.Height, e.Tx.Fees, w.Fees)
+		}
+		inMem[e.Addr]++
+	}
+	for addr, want := range exp {
+		if inMem[addr] != len(want) {
+			t.Fatalf("in-mem count for %s: got %d want %d", addr, inMem[addr], len(want))
 		}
 	}
 

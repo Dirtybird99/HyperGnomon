@@ -109,6 +109,17 @@ type Storage interface {
 // allocated one inner map per distinct addr.
 type addrSCIDKey struct{ addr, scid string }
 
+// NormalTxRef is one accumulated normal-TX record tagged with the address that
+// touched it. WriteBatch.NormalTxs is a flat slice of these instead of an
+// addr->[]*record map: FlushBatch flattens the map back to (addr, record) pairs
+// anyway, so the per-addr slices (one heap alloc each) and the pointer arena were
+// pure overhead. A flat value slice grows amortized and carries no pointers, so
+// there is no arena-realloc pointer-invalidation footgun.
+type NormalTxRef struct {
+	Addr string
+	Tx   structures.NormalTXWithSCIDParse
+}
+
 // WriteBatch accumulates writes across multiple blocks for atomic commit.
 // This is the arena pattern applied to database writes:
 // accumulate everything, flush once, instead of per-item writes.
@@ -117,7 +128,7 @@ type WriteBatch struct {
 	Invocations  []structures.InvokeRecord                       // all invocations
 	Variables    map[string]map[int64][]*structures.SCIDVariable // scid -> height -> vars
 	Heights      map[string][]int64                              // scid -> interaction heights
-	NormalTxs    map[string][]*structures.NormalTXWithSCIDParse  // addr -> txs
+	NormalTxs    []NormalTxRef                                   // flat (addr, tx) pairs
 	InvalidSCIDs map[string]uint64                               // scid -> fees
 	RegTxCount   int64
 	BurnTxCount  int64
@@ -163,15 +174,6 @@ type WriteBatch struct {
 	// backing array stays alive via the map pointer, and all mutations go
 	// through inner[scid]. Reset truncates to [:0] (keeping capacity).
 	addrSCIDArena []structures.AddrSCIDEntry
-
-	// normalTxArena backs the *NormalTXWithSCIDParse values stored in NormalTxs.
-	// Each ring member's record is carved from this slice (append + take-address)
-	// instead of a per-record heap alloc. The records are write-once — never
-	// mutated after publish — so, as with addrSCIDArena, a mid-batch
-	// append-driven realloc cannot invalidate a live record: earlier records stay
-	// reachable (and their old backing array alive) via NormalTxs[addr], and no
-	// arena slot is re-indexed after publish. Reset truncates to [:0].
-	normalTxArena []structures.NormalTXWithSCIDParse
 }
 
 // batchPool recycles WriteBatch instances. At steady state, a batch is pulled,
@@ -190,7 +192,7 @@ func newEmptyBatch() *WriteBatch {
 		Invocations:   make([]structures.InvokeRecord, 0, 128),
 		Variables:     make(map[string]map[int64][]*structures.SCIDVariable, 32),
 		Heights:       make(map[string][]int64, 32),
-		NormalTxs:     make(map[string][]*structures.NormalTXWithSCIDParse, 16),
+		NormalTxs:     make([]NormalTxRef, 0, 512),
 		InvalidSCIDs:  make(map[string]uint64, 4),
 		BlockHashes:   make(map[int64]string, 100),
 		Installs:      make(map[string]*structures.InstallRecord, 4),
@@ -199,7 +201,6 @@ func newEmptyBatch() *WriteBatch {
 		SCCodes:       make(map[string]*structures.SCCodeEntry, 4),
 		OwnerSCIDs:    make(map[string]map[string]struct{}, 16),
 		addrSCIDArena: make([]structures.AddrSCIDEntry, 0, 1024),
-		normalTxArena: make([]structures.NormalTXWithSCIDParse, 0, 512),
 	}
 }
 
@@ -259,22 +260,18 @@ func (b *WriteBatch) AddInteractionHeight(scid string, height int64) {
 }
 
 // AddNormalTx records that addr participated (as a ring member) in a normal TX
-// touching scid. The record is carved from the batch-owned arena instead of a
-// per-call heap alloc; the pointer appended to NormalTxs[addr] is the canonical
-// handle and the record is never mutated after publish, so an arena realloc
-// cannot invalidate an already-published record (see normalTxArena doc).
+// touching scid. Appends one flat (addr, record) entry — no per-addr slice and
+// no pointer arena; the flat NormalTxs slice grows amortized.
 func (b *WriteBatch) AddNormalTx(addr, txid, scid string, fees uint64, height int64) {
-	b.normalTxArena = append(b.normalTxArena, structures.NormalTXWithSCIDParse{
-		Txid:   txid,
-		Scid:   scid,
-		Fees:   fees,
-		Height: height,
+	b.NormalTxs = append(b.NormalTxs, NormalTxRef{
+		Addr: addr,
+		Tx: structures.NormalTXWithSCIDParse{
+			Txid:   txid,
+			Scid:   scid,
+			Fees:   fees,
+			Height: height,
+		},
 	})
-	ntx := &b.normalTxArena[len(b.normalTxArena)-1]
-	if b.NormalTxs[addr] == nil {
-		b.NormalTxs[addr] = make([]*structures.NormalTXWithSCIDParse, 0, 4)
-	}
-	b.NormalTxs[addr] = append(b.NormalTxs[addr], ntx)
 }
 
 // AddBlockHash records the block hash at a given height for reorg detection.
@@ -387,14 +384,13 @@ func (b *WriteBatch) Reset() {
 	b.Invocations = b.Invocations[:0]
 	clear(b.Variables)
 	clear(b.Heights)
-	clear(b.NormalTxs)
+	b.NormalTxs = b.NormalTxs[:0]
 	clear(b.InvalidSCIDs)
 	clear(b.BlockHashes)
 	clear(b.Installs)
 	clear(b.Classes)
 	clear(b.AddrSCIDs)
 	b.addrSCIDArena = b.addrSCIDArena[:0]
-	b.normalTxArena = b.normalTxArena[:0]
 	clear(b.SCCodes)
 	clear(b.OwnerSCIDs)
 	b.RegTxCount = 0
