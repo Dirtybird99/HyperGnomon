@@ -424,7 +424,8 @@ func (s *BboltStore) StoreSCIDVariableDetails(scid string, vars []*structures.SC
 		if err := b.Put([]byte(key), val); err != nil {
 			return err
 		}
-		return putLatestSCVarsHeight(tx.Bucket(bucketScVarsLatest), scid, height)
+		_, err = putLatestSCVarsHeight(tx.Bucket(bucketScVarsLatest), nil, scid, height)
+		return err
 	})
 }
 
@@ -483,16 +484,22 @@ func latestSCVarsHeightTx(tx *bolt.Tx, scid string) int64 {
 	return maxH
 }
 
-func putLatestSCVarsHeight(b *bolt.Bucket, scid string, height int64) error {
+// putLatestSCVarsHeight upserts the latest-seen height for scid. keyScratch is a
+// reusable key buffer the caller threads across calls: bbolt clones keys on Put
+// and never retains the Get key, so one backing slice is safe for both. Returns
+// the possibly-grown scratch. The value stays a fresh per-call 8-byte slice
+// (bbolt holds value headers until commit, so values cannot share a buffer).
+func putLatestSCVarsHeight(b *bolt.Bucket, keyScratch []byte, scid string, height int64) ([]byte, error) {
 	if scid == "" || height <= 0 {
-		return nil
+		return keyScratch, nil
 	}
-	if existing := b.Get([]byte(scid)); len(existing) >= 8 && decHeight(existing) >= height {
-		return nil
+	keyScratch = append(keyScratch[:0], scid...)
+	if existing := b.Get(keyScratch); len(existing) >= 8 && decHeight(existing) >= height {
+		return keyScratch, nil
 	}
 	val := make([]byte, 8)
 	copy(val, encHeight(height))
-	return b.Put([]byte(scid), val)
+	return keyScratch, b.Put(keyScratch, val)
 }
 
 func (s *BboltStore) StoreSCIDInteractionHeight(scid string, height int64) error {
@@ -683,11 +690,16 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// Store owners
 		ownerBucket := tx.Bucket(bucketOwners)
 		var newOwners int64
+		// Reused scid key-scratch (Get + Put): bbolt clones keys on Put and never
+		// retains the Get key. The owner value stays a fresh per-Put []byte (bbolt
+		// holds value headers until commit, so values cannot share a buffer).
+		var ownerKeyBuf []byte
 		for scid, owner := range batch.Owners {
-			if ownerBucket.Get([]byte(scid)) == nil {
+			ownerKeyBuf = append(ownerKeyBuf[:0], scid...)
+			if ownerBucket.Get(ownerKeyBuf) == nil {
 				newOwners++
 			}
-			if err := ownerBucket.Put([]byte(scid), []byte(owner)); err != nil {
+			if err := ownerBucket.Put(ownerKeyBuf, []byte(owner)); err != nil {
 				return fmt.Errorf("batch owner %s: %w", scid, err)
 			}
 		}
@@ -708,6 +720,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// []byte(scid) copy for consecutive same-SCID records.
 		var lastInvScid string
 		var lastInvBucket *bolt.Bucket
+		// Reused scid bucket-name key: bbolt's CreateBucket clones the key
+		// (newKey := cloneBytes(key)) and seek never retains it, so one backing
+		// slice is safe. Each unique scid otherwise costs a fresh []byte(scid).
+		var invBucketKeyBuf []byte
 		for _, inv := range batch.Invocations {
 			if inv.Scid == "" {
 				// Defense in depth: an empty bucket name makes bbolt error
@@ -719,7 +735,8 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			b := lastInvBucket
 			if b == nil || inv.Scid != lastInvScid {
 				var err error
-				b, err = tx.CreateBucketIfNotExists([]byte(inv.Scid))
+				invBucketKeyBuf = append(invBucketKeyBuf[:0], inv.Scid...)
+				b, err = tx.CreateBucketIfNotExists(invBucketKeyBuf)
 				if err != nil {
 					return fmt.Errorf("batch invoke bucket %s: %w", inv.Scid, err)
 				}
@@ -762,6 +779,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// eagerly (node.put clones the key into its own arena).
 		varBucket := tx.Bucket(bucketScVars)
 		varLatestBucket := tx.Bucket(bucketScVarsLatest)
+		var latestKeyBuf []byte // reused across putLatestSCVarsHeight calls
 		for _, scid := range sortedBatchKeys(batch.Variables) {
 			heightVars := batch.Variables[scid]
 			for height, vars := range heightVars {
@@ -775,8 +793,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 				if err := varBucket.Put(keyBuf, val); err != nil {
 					return err
 				}
-				if err := putLatestSCVarsHeight(varLatestBucket, scid, height); err != nil {
-					return err
+				var phErr error
+				latestKeyBuf, phErr = putLatestSCVarsHeight(varLatestBucket, latestKeyBuf, scid, height)
+				if phErr != nil {
+					return phErr
 				}
 			}
 		}
@@ -788,6 +808,13 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// (measured: 173µs -> 5.7ms per identical flush as history grows
 		// 1k -> 100k). Only same-height duplicates read back a (tiny) count.
 		heightBucket := tx.Bucket(bucketHeight)
+		// Value arena: each record's value is a small uvarint count. One growable
+		// arena replaces one make() per *distinct* record. The distinct count
+		// isn't known up front (same-height runs collapse below), so grow from a
+		// small cap. bbolt keeps each Put'd sub-slice valid until commit; a
+		// realloc leaves earlier sub-slices pointing at their still-live old
+		// backing array, and appends never mutate an earlier sub-slice's bytes.
+		heightValArena := make([]byte, 0, 64)
 		for _, scid := range sortedBatchKeys(batch.Heights) {
 			heights := batch.Heights[scid]
 			// heights is batch-owned scratch (Reset after flush) and arrives
@@ -809,9 +836,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 						count += prev
 					}
 				}
-				val := make([]byte, binary.MaxVarintLen64)
-				val = val[:binary.PutUvarint(val, count)]
-				if err := heightBucket.Put(keyBuf, val); err != nil {
+				hStart := len(heightValArena)
+				heightValArena = binary.AppendUvarint(heightValArena, count)
+				if err := heightBucket.Put(keyBuf, heightValArena[hStart:]); err != nil {
 					return err
 				}
 			}
@@ -1009,17 +1036,31 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// always v1, so legacy blobs get upgraded on next touch.
 		if len(batch.AddrSCIDs) > 0 {
 			parent := tx.Bucket(bucketAddrSCIDs)
-			// Each Put stores the slice header; bolt copies to the page only
-			// at commit. Using a single shared backing array across Puts
-			// would leave all earlier-Put'd slice headers pointing at the
-			// last iteration's bytes. Allocate one slice per Put.
+			// Reused scid key-scratch (Get + Put): bbolt.Bucket.Put clones the
+			// key (key = cloneBytes(key)) and Get never retains it, so one
+			// backing slice serves both across every pair.
+			var scidKeyBuf []byte
+			// One exactly-sized value arena for all entries: each encodes to a
+			// fixed EncodedAddrSCIDEntrySize, so the pair count gives the precise
+			// capacity — a single allocation, no growth, replacing one 25-byte
+			// slice per Put. bbolt keeps each Put'd sub-slice valid until commit
+			// (the backing array stays alive via its stored headers; a later
+			// append never mutates an earlier sub-slice's bytes).
+			addrPairs := 0
+			for _, scids := range batch.AddrSCIDs {
+				addrPairs += len(scids)
+			}
+			addrValArena := make([]byte, 0, addrPairs*structures.EncodedAddrSCIDEntrySize)
+			var addrBucketKeyBuf []byte // reused addr bucket-name key (CreateBucket clones)
 			for addr, scids := range batch.AddrSCIDs {
-				subBucket, err := parent.CreateBucketIfNotExists([]byte(addr))
+				addrBucketKeyBuf = append(addrBucketKeyBuf[:0], addr...)
+				subBucket, err := parent.CreateBucketIfNotExists(addrBucketKeyBuf)
 				if err != nil {
 					return fmt.Errorf("batch addr bucket %s: %w", addr, err)
 				}
 				for scid, delta := range scids {
-					existing := subBucket.Get([]byte(scid))
+					scidKeyBuf = append(scidKeyBuf[:0], scid...)
+					existing := subBucket.Get(scidKeyBuf)
 					merged := delta
 					if existing != nil {
 						var cur structures.AddrSCIDEntry
@@ -1039,7 +1080,9 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 							}
 						}
 					}
-					if err := subBucket.Put([]byte(scid), merged.MarshalTyped()); err != nil {
+					vStart := len(addrValArena)
+					addrValArena = merged.MarshalTypedAppend(addrValArena)
+					if err := subBucket.Put(scidKeyBuf, addrValArena[vStart:]); err != nil {
 						return err
 					}
 				}
