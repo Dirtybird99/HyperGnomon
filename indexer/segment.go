@@ -525,6 +525,7 @@ func (ss *SegmentSync) handleInvokeSC(client *hgrpc.Client, scid, sender, entryp
 
 // processNormalTx handles a normal transaction with SCID payload within a segment.
 func (ss *SegmentSync) processNormalTx(tx *transaction.Transaction, txInfo rpc.Tx_Related_Info, txid string, height int64, batch *storage.WriteBatch) {
+	fees := tx.Fees() // constant per tx — hoisted out of the ring loop
 	for j := 0; j < len(tx.Payloads); j++ {
 		scidStr := tx.Payloads[j].SCID.String()
 		if scidStr == "0000000000000000000000000000000000000000000000000000000000000000" {
@@ -532,16 +533,9 @@ func (ss *SegmentSync) processNormalTx(tx *transaction.Transaction, txInfo rpc.T
 		}
 		for _, addr := range txInfo.Ring[j] {
 			addr = hgpool.InternAddress(addr)
-			ntx := &structures.NormalTXWithSCIDParse{
-				Txid:   txid,
-				Scid:   scidStr,
-				Fees:   tx.Fees(),
-				Height: height,
-			}
-			if batch.NormalTxs[addr] == nil {
-				batch.NormalTxs[addr] = make([]*structures.NormalTXWithSCIDParse, 0, 4)
-			}
-			batch.NormalTxs[addr] = append(batch.NormalTxs[addr], ntx)
+			// Arena-carved record (see storage.WriteBatch.AddNormalTx) rather than
+			// a per-ring-member heap alloc.
+			batch.AddNormalTx(addr, txid, scidStr, fees, height)
 		}
 	}
 }
@@ -651,10 +645,12 @@ func (ss *SegmentSync) mergeBucket(bucketName string, b *bolt.Bucket, batch *sto
 				segLog.Warnf("merge normaltx: %s: %v", addr, err)
 				return nil
 			}
-			if batch.NormalTxs[addr] == nil {
-				batch.NormalTxs[addr] = make([]*structures.NormalTXWithSCIDParse, 0, len(txs))
+			for _, tx := range txs {
+				if tx == nil {
+					continue
+				}
+				batch.AddNormalTx(addr, tx.Txid, tx.Scid, tx.Fees, tx.Height)
 			}
-			batch.NormalTxs[addr] = append(batch.NormalTxs[addr], txs...)
 			return nil
 		})
 

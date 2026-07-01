@@ -1294,6 +1294,7 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 
 // processNormalTx handles a normal transaction with SCID payload.
 func (idx *Indexer) processNormalTx(tx *transaction.Transaction, txInfo rpc.Tx_Related_Info, txid string, height int64, batch *storage.WriteBatch) {
+	fees := tx.Fees() // constant per tx — hoisted out of the ring loop
 	for j := 0; j < len(tx.Payloads); j++ {
 		scidStr := tx.Payloads[j].SCID.String()
 		// Zero hash means no SCID
@@ -1305,18 +1306,10 @@ func (idx *Indexer) processNormalTx(tx *transaction.Transaction, txInfo rpc.Tx_R
 			addr = hgpool.InternAddress(addr)
 			// Route B: ring member touched this SCID. Useful for "this address
 			// might be a participant of this SCID." Heavy but cardinality is
-			// bounded by ring size.
+			// bounded by ring size. The record is arena-carved (see AddNormalTx)
+			// rather than a per-ring-member heap alloc.
 			batch.AddAddrSCID(addr, scidStr, height)
-			ntx := &structures.NormalTXWithSCIDParse{
-				Txid:   txid,
-				Scid:   scidStr,
-				Fees:   tx.Fees(),
-				Height: height,
-			}
-			if batch.NormalTxs[addr] == nil {
-				batch.NormalTxs[addr] = make([]*structures.NormalTXWithSCIDParse, 0, 4)
-			}
-			batch.NormalTxs[addr] = append(batch.NormalTxs[addr], ntx)
+			batch.AddNormalTx(addr, txid, scidStr, fees, height)
 		}
 	}
 }

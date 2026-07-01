@@ -45,9 +45,7 @@ func TestSegmentMerge_RoundTripsData(t *testing.T) {
 			Height:     1001,
 		},
 	})
-	segBatch.NormalTxs[addr] = []*structures.NormalTXWithSCIDParse{
-		{Txid: "feed0001feed0001feed0001feed0001feed0001feed0001feed0001feed0001", Scid: scid, Fees: 10, Height: 1002},
-	}
+	segBatch.AddNormalTx(addr, "feed0001feed0001feed0001feed0001feed0001feed0001feed0001feed0001", scid, 10, 1002)
 	segBatch.InvalidSCIDs["badscidbadscidbadscidbadscidbadscidbadscidbadscidbadscidbadscid0"] = 42
 	segBatch.RegTxCount = 5
 	segBatch.BurnTxCount = 3

@@ -67,12 +67,7 @@ func BenchmarkFlushBatch_NormalTxAccumulation(b *testing.B) {
 				batch := NewWriteBatch()
 				for i := 0; i < chunk && at+i < n; i++ {
 					h := int64(at + i)
-					batch.NormalTxs[addr] = append(batch.NormalTxs[addr], &structures.NormalTXWithSCIDParse{
-						Txid:   fmt.Sprintf("%064d", h),
-						Scid:   benchHistScid,
-						Fees:   100,
-						Height: h,
-					})
+					batch.AddNormalTx(addr, fmt.Sprintf("%064d", h), benchHistScid, 100, h)
 				}
 				if err := store.FlushBatch(batch); err != nil {
 					b.Fatalf("preseed flush: %v", err)
@@ -87,12 +82,7 @@ func BenchmarkFlushBatch_NormalTxAccumulation(b *testing.B) {
 				batch := NewWriteBatch()
 				for i := int64(0); i < 10; i++ {
 					h := next + i
-					batch.NormalTxs[addr] = append(batch.NormalTxs[addr], &structures.NormalTXWithSCIDParse{
-						Txid:   fmt.Sprintf("%064d", h),
-						Scid:   benchHistScid,
-						Fees:   100,
-						Height: h,
-					})
+					batch.AddNormalTx(addr, fmt.Sprintf("%064d", h), benchHistScid, 100, h)
 				}
 				if err := store.FlushBatch(batch); err != nil {
 					b.Fatalf("flush: %v", err)
@@ -253,10 +243,8 @@ func TestNormalTx_CompositeRoundTripAndLegacyMerge(t *testing.T) {
 
 	// Composite records via batch flush and via the single-record path.
 	batch := NewWriteBatch()
-	batch.NormalTxs[addr] = append(batch.NormalTxs[addr],
-		&structures.NormalTXWithSCIDParse{Txid: "bb", Scid: benchHistScid, Fees: 2, Height: 20},
-		&structures.NormalTXWithSCIDParse{Txid: "cc", Scid: benchHistScid, Fees: 3, Height: 30},
-	)
+	batch.AddNormalTx(addr, "bb", benchHistScid, 2, 20)
+	batch.AddNormalTx(addr, "cc", benchHistScid, 3, 30)
 	if err := store.FlushBatch(batch); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -304,10 +292,8 @@ func TestNormalTx_MultiPayloadDistinctSCIDs(t *testing.T) {
 	scidB := "2222222222222222222222222222222222222222222222222222222222222222"
 
 	batch := NewWriteBatch()
-	batch.NormalTxs[addr] = append(batch.NormalTxs[addr],
-		&structures.NormalTXWithSCIDParse{Txid: txid, Scid: scidA, Fees: 1, Height: 42},
-		&structures.NormalTXWithSCIDParse{Txid: txid, Scid: scidB, Fees: 1, Height: 42},
-	)
+	batch.AddNormalTx(addr, txid, scidA, 1, 42)
+	batch.AddNormalTx(addr, txid, scidB, 1, 42)
 	if err := store.FlushBatch(batch); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
