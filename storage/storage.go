@@ -103,6 +103,12 @@ type Storage interface {
 	ResetIndex() error
 }
 
+// addrSCIDKey is the flat composite key for WriteBatch.AddrSCIDs. Using a
+// struct key (two already-allocated string headers) means a new (addr, scid)
+// pair costs no allocation for the key — unlike a nested addr->scid map, which
+// allocated one inner map per distinct addr.
+type addrSCIDKey struct{ addr, scid string }
+
 // WriteBatch accumulates writes across multiple blocks for atomic commit.
 // This is the arena pattern applied to database writes:
 // accumulate everything, flush once, instead of per-item writes.
@@ -132,10 +138,12 @@ type WriteBatch struct {
 	// and the lookup scvars class-lookup sibling bucket.
 	Classes map[string]*structures.ClassMeta
 
-	// AddrSCIDs: addr -> scid -> delta. Merged into the addr_scids nested
+	// AddrSCIDs: (addr, scid) -> delta. Merged into the addr_scids nested
 	// bucket. FirstHeight=oldest, LastHeight=newest in batch, Count=delta.
-	// FlushBatch merges with existing entries (min/max/sum).
-	AddrSCIDs map[string]map[string]*structures.AddrSCIDEntry
+	// FlushBatch merges with existing entries (min/max/sum). Flat struct-keyed
+	// map (not nested addr->scid->entry): one map for all pairs instead of one
+	// inner map per distinct addr — a struct key allocates nothing per pair.
+	AddrSCIDs map[addrSCIDKey]*structures.AddrSCIDEntry
 
 	// SCCodes: scid -> install-time code snapshot. Populated at install time
 	// and on lazy backfill reads. Write-once per scid (DERO code is
@@ -187,7 +195,7 @@ func newEmptyBatch() *WriteBatch {
 		BlockHashes:   make(map[int64]string, 100),
 		Installs:      make(map[string]*structures.InstallRecord, 4),
 		Classes:       make(map[string]*structures.ClassMeta, 8),
-		AddrSCIDs:     make(map[string]map[string]*structures.AddrSCIDEntry, 16),
+		AddrSCIDs:     make(map[addrSCIDKey]*structures.AddrSCIDEntry, 64),
 		SCCodes:       make(map[string]*structures.SCCodeEntry, 4),
 		OwnerSCIDs:    make(map[string]map[string]struct{}, 16),
 		addrSCIDArena: make([]structures.AddrSCIDEntry, 0, 1024),
@@ -316,25 +324,21 @@ func (b *WriteBatch) AddAddrSCID(addr, scid string, height int64) {
 	if addr == "" {
 		return
 	}
-	inner, ok := b.AddrSCIDs[addr]
-	if !ok {
-		inner = make(map[string]*structures.AddrSCIDEntry, 2)
-		b.AddrSCIDs[addr] = inner
-	}
-	e, ok := inner[scid]
+	k := addrSCIDKey{addr: addr, scid: scid}
+	e, ok := b.AddrSCIDs[k]
 	if !ok {
 		// Carve a new entry from the batch-owned arena instead of a per-pair
 		// heap alloc. The pointer published into the map is the canonical
 		// handle; the arena is never re-indexed after this point, so a later
 		// append-driven realloc cannot invalidate it (the old backing array is
 		// kept alive by this very pointer, and every mutation below goes through
-		// inner[scid]).
+		// b.AddrSCIDs[k]).
 		b.addrSCIDArena = append(b.addrSCIDArena, structures.AddrSCIDEntry{
 			FirstHeight: height,
 			LastHeight:  height,
 			Count:       1,
 		})
-		inner[scid] = &b.addrSCIDArena[len(b.addrSCIDArena)-1]
+		b.AddrSCIDs[k] = &b.addrSCIDArena[len(b.addrSCIDArena)-1]
 		return
 	}
 	if height < e.FirstHeight {

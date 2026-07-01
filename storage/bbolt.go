@@ -1046,45 +1046,64 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			// slice per Put. bbolt keeps each Put'd sub-slice valid until commit
 			// (the backing array stays alive via its stored headers; a later
 			// append never mutates an earlier sub-slice's bytes).
-			addrPairs := 0
-			for _, scids := range batch.AddrSCIDs {
-				addrPairs += len(scids)
+			// Flat (addr, scid) map: sort keys by addr (then scid) so every pair
+			// for one addr is contiguous and we CreateBucketIfNotExists once per
+			// addr. The sorted-key slice is the loop's one added flush allocation,
+			// repaid many times over by the per-addr inner maps this flat layout
+			// removes on the build side (AddAddrSCID).
+			addrKeys := make([]addrSCIDKey, 0, len(batch.AddrSCIDs))
+			for k := range batch.AddrSCIDs {
+				addrKeys = append(addrKeys, k)
 			}
-			addrValArena := make([]byte, 0, addrPairs*structures.EncodedAddrSCIDEntrySize)
-			var addrBucketKeyBuf []byte // reused addr bucket-name key (CreateBucket clones)
-			for addr, scids := range batch.AddrSCIDs {
-				addrBucketKeyBuf = append(addrBucketKeyBuf[:0], addr...)
-				subBucket, err := parent.CreateBucketIfNotExists(addrBucketKeyBuf)
-				if err != nil {
-					return fmt.Errorf("batch addr bucket %s: %w", addr, err)
+			slices.SortFunc(addrKeys, func(a, b addrSCIDKey) int {
+				if c := strings.Compare(a.addr, b.addr); c != 0 {
+					return c
 				}
-				for scid, delta := range scids {
-					scidKeyBuf = append(scidKeyBuf[:0], scid...)
-					existing := subBucket.Get(scidKeyBuf)
-					merged := delta
-					if existing != nil {
-						var cur structures.AddrSCIDEntry
-						var decErr error
-						if structures.IsAddrSCIDEntryTyped(existing) {
-							decErr = cur.UnmarshalTyped(existing)
-						} else {
-							decErr = msgpack.Unmarshal(existing, &cur)
-						}
-						if decErr != nil {
-							logger.Warnf("addr_scids decode %s/%s: %v (overwriting)", addr, scid, decErr)
-						} else {
-							merged = &structures.AddrSCIDEntry{
-								FirstHeight: minInt64(cur.FirstHeight, delta.FirstHeight),
-								LastHeight:  maxInt64(cur.LastHeight, delta.LastHeight),
-								Count:       cur.Count + delta.Count,
-							}
+				return strings.Compare(a.scid, b.scid)
+			})
+			// One exactly-sized value arena for all entries: pair count == map len.
+			addrValArena := make([]byte, 0, len(batch.AddrSCIDs)*structures.EncodedAddrSCIDEntrySize)
+			var addrBucketKeyBuf []byte // reused addr bucket-name key (CreateBucket clones)
+			var subBucket *bolt.Bucket
+			var lastAddr string
+			haveBucket := false
+			for _, k := range addrKeys {
+				if !haveBucket || k.addr != lastAddr {
+					addrBucketKeyBuf = append(addrBucketKeyBuf[:0], k.addr...)
+					var err error
+					subBucket, err = parent.CreateBucketIfNotExists(addrBucketKeyBuf)
+					if err != nil {
+						return fmt.Errorf("batch addr bucket %s: %w", k.addr, err)
+					}
+					lastAddr = k.addr
+					haveBucket = true
+				}
+				delta := batch.AddrSCIDs[k]
+				scidKeyBuf = append(scidKeyBuf[:0], k.scid...)
+				existing := subBucket.Get(scidKeyBuf)
+				merged := delta
+				if existing != nil {
+					var cur structures.AddrSCIDEntry
+					var decErr error
+					if structures.IsAddrSCIDEntryTyped(existing) {
+						decErr = cur.UnmarshalTyped(existing)
+					} else {
+						decErr = msgpack.Unmarshal(existing, &cur)
+					}
+					if decErr != nil {
+						logger.Warnf("addr_scids decode %s/%s: %v (overwriting)", k.addr, k.scid, decErr)
+					} else {
+						merged = &structures.AddrSCIDEntry{
+							FirstHeight: minInt64(cur.FirstHeight, delta.FirstHeight),
+							LastHeight:  maxInt64(cur.LastHeight, delta.LastHeight),
+							Count:       cur.Count + delta.Count,
 						}
 					}
-					vStart := len(addrValArena)
-					addrValArena = merged.MarshalTypedAppend(addrValArena)
-					if err := subBucket.Put(scidKeyBuf, addrValArena[vStart:]); err != nil {
-						return err
-					}
+				}
+				vStart := len(addrValArena)
+				addrValArena = merged.MarshalTypedAppend(addrValArena)
+				if err := subBucket.Put(scidKeyBuf, addrValArena[vStart:]); err != nil {
+					return err
 				}
 			}
 		}
