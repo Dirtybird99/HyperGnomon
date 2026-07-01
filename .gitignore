@@ -1,6 +1,6 @@
 # Existing
-hypergnomon
-hypergnomon.exe
+/hypergnomon
+/hypergnomon.exe
 gnomondb/
 *.log
 *.prof
@@ -9,8 +9,8 @@ gnomondb/
 bench_*/
 bench_*.log
 # Binaries
-hypergnomon
-hypergnomon.exe
+/hypergnomon
+/hypergnomon.exe
 *.exe
 *.dll
 *.so
