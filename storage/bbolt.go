@@ -487,8 +487,10 @@ func latestSCVarsHeightTx(tx *bolt.Tx, scid string) int64 {
 // putLatestSCVarsHeight upserts the latest-seen height for scid. keyScratch is a
 // reusable key buffer the caller threads across calls: bbolt clones keys on Put
 // and never retains the Get key, so one backing slice is safe for both. Returns
-// the possibly-grown scratch. The value stays a fresh per-call 8-byte slice
-// (bbolt holds value headers until commit, so values cannot share a buffer).
+// the possibly-grown scratch. The value stays a fresh per-call 8-byte slice for
+// simplicity — one call per distinct (scid, height) is far below the volume of
+// the arena-backed loops in FlushBatch (an append-only shared arena would also
+// be safe, as heightValArena there shows).
 func putLatestSCVarsHeight(b *bolt.Bucket, keyScratch []byte, scid string, height int64) ([]byte, error) {
 	if scid == "" || height <= 0 {
 		return keyScratch, nil
@@ -852,13 +854,20 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		slices.SortFunc(batch.NormalTxs, func(a, b NormalTxRef) int {
 			return strings.Compare(a.Addr, b.Addr)
 		})
+		// Value arena: one growable buffer replaces one MarshalTyped make() per
+		// record. Same safety argument as heightValArena above: bbolt keeps each
+		// Put'd sub-slice valid until commit, a realloc leaves earlier sub-slices
+		// on their still-live old backing array, and appends never mutate an
+		// earlier sub-slice's bytes.
+		normTxValArena := make([]byte, 0, 1024)
 		for i := range batch.NormalTxs {
 			e := &batch.NormalTxs[i]
 			keyBuf = appendNormTxKey(keyBuf[:0], e.Addr, e.Tx.Height, e.Tx.Txid, e.Tx.Scid)
-			// Typed v1 (tag 0x08): 1 alloc for the buffer vs msgpack's ~5.
+			// Typed v1 (tag 0x08): arena-carved value vs msgpack's ~5 allocs.
 			// DecodeNormalTxEntry dispatches typed-vs-legacy by byte[0].
-			val := e.Tx.MarshalTyped()
-			if err := normBucket.Put(keyBuf, val); err != nil {
+			vStart := len(normTxValArena)
+			normTxValArena = e.Tx.MarshalTypedAppend(normTxValArena)
+			if err := normBucket.Put(keyBuf, normTxValArena[vStart:]); err != nil {
 				return err
 			}
 		}
@@ -1066,9 +1075,8 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			var addrBucketKeyBuf []byte // reused addr bucket-name key (CreateBucket clones)
 			var subBucket *bolt.Bucket
 			var lastAddr string
-			haveBucket := false
 			for _, k := range addrKeys {
-				if !haveBucket || k.addr != lastAddr {
+				if subBucket == nil || k.addr != lastAddr {
 					addrBucketKeyBuf = append(addrBucketKeyBuf[:0], k.addr...)
 					var err error
 					subBucket, err = parent.CreateBucketIfNotExists(addrBucketKeyBuf)
@@ -1076,7 +1084,6 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 						return fmt.Errorf("batch addr bucket %s: %w", k.addr, err)
 					}
 					lastAddr = k.addr
-					haveBucket = true
 				}
 				delta := batch.AddrSCIDs[k]
 				scidKeyBuf = append(scidKeyBuf[:0], k.scid...)

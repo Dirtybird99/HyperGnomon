@@ -172,7 +172,7 @@ type WriteBatch struct {
 	// map; the arena is never re-indexed after an entry is published, so a
 	// mid-batch append-driven realloc cannot invalidate a live entry — the old
 	// backing array stays alive via the map pointer, and all mutations go
-	// through inner[scid]. Reset truncates to [:0] (keeping capacity).
+	// through b.AddrSCIDs[k]. Reset truncates to [:0] (keeping capacity).
 	addrSCIDArena []structures.AddrSCIDEntry
 }
 

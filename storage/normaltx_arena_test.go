@@ -37,7 +37,6 @@ func TestNormalTxArena_WithinBatchRealloc(t *testing.T) {
 	const early = 40
 
 	addrOf := func(i int) string { return fmt.Sprintf("deroaddr%056d", i) }
-	scidOf := func(i int) string { return fmt.Sprintf("%064x", i) }
 	txidOf := func(a, n int) string { return fmt.Sprintf("%032x%032x", a, n) }
 
 	exp := make(map[string]map[normTxKey]*structures.NormalTXWithSCIDParse, nAddrs)
@@ -47,7 +46,7 @@ func TestNormalTxArena_WithinBatchRealloc(t *testing.T) {
 		addr := addrOf(addrIdx)
 		rec := &structures.NormalTXWithSCIDParse{
 			Txid:   txidOf(addrIdx, n),
-			Scid:   scidOf(addrIdx),
+			Scid:   scidForIdx(addrIdx),
 			Fees:   uint64(100 + addrIdx),
 			Height: height,
 		}
@@ -129,7 +128,7 @@ func TestNormalTxArena_CrossBatchReuse(t *testing.T) {
 	store := openTestStore(t)
 
 	addr := "deroaddrcrossbatch000000000000000000000000000000000000000000000"
-	scid := fmt.Sprintf("%064x", 1)
+	scid := scidForIdx(1)
 
 	batch := newEmptyBatch()
 

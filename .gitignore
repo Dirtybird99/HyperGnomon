@@ -1,13 +1,3 @@
-# Existing
-/hypergnomon
-/hypergnomon.exe
-gnomondb/
-*.log
-*.prof
-
-# Bench artifacts
-bench_*/
-bench_*.log
 # Binaries
 /hypergnomon
 /hypergnomon.exe
@@ -16,12 +6,18 @@ bench_*.log
 *.so
 *.dylib
 
+# Bench artifacts
+bench_*/
+bench_*.log
+bench-*.txt
+
 # Database files
 gnomondb/
 *.db
 *.db.bak
 
 # Test output
+*.log
 *.test
 *.out
 coverage.html
@@ -42,7 +38,6 @@ vendor/
 
 # Segments temp (parallel sync)
 segments/
-bench-*.txt
 
 # Local agent/temp artifacts
 .claude/

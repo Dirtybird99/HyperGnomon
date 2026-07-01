@@ -619,6 +619,18 @@ var base64BufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0); return &b },
 }
 
+// maxPooledB64Buf caps what putBase64Buf retains: without it, one rare
+// multi-MB TELA asset would pin its decode buffer per-P between GCs while the
+// steady state needs a few KB. Oversized buffers are dropped for GC; the
+// common small case still recycles.
+const maxPooledB64Buf = 256 << 10
+
+func putBase64Buf(bufp *[]byte) {
+	if cap(*bufp) <= maxPooledB64Buf {
+		base64BufPool.Put(bufp)
+	}
+}
+
 func decompressTELAGzip(b []byte) ([]byte, error) {
 	// Trim any whitespace inside the comment that survived the outer trim.
 	s := bytes.TrimSpace(b)
@@ -633,14 +645,14 @@ func decompressTELAGzip(b []byte) ([]byte, error) {
 	decoded := (*bufp)[:need]
 	n, err := base64.StdEncoding.Decode(decoded, s)
 	if err != nil {
-		base64BufPool.Put(bufp)
+		putBase64Buf(bufp)
 		// Fall back to raw gzip — some fixtures or non-standard deploys
 		// may skip the base64 layer. The caller then gets a real gzip
 		// error if that fails too.
 		return gunzipBytes(b)
 	}
 	out, gzErr := gunzipBytes(decoded[:n])
-	base64BufPool.Put(bufp)
+	putBase64Buf(bufp)
 	return out, gzErr
 }
 
