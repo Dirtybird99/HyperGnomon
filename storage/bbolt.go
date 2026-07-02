@@ -697,7 +697,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// retains the Get key. The owner value stays a fresh per-Put []byte (bbolt
 		// holds value headers until commit, so values cannot share a buffer).
 		var ownerKeyBuf []byte
-		for scid, owner := range batch.Owners {
+		// Sorted keys: 50k registry-fastsync owners inserted in map-random
+		// order maximize B+tree page splits (see sortedBatchKeys).
+		for _, scid := range sortedBatchKeys(batch.Owners) {
+			owner := batch.Owners[scid]
 			ownerKeyBuf = append(ownerKeyBuf[:0], scid...)
 			if ownerBucket.Get(ownerKeyBuf) == nil {
 				newOwners++
@@ -939,15 +942,33 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			}
 		}
 
-		// Installs: height-prefixed, range-scannable.
+		// Installs: height-prefixed, range-scannable. Sort by the BUCKET key
+		// order (height, then scid) — installKey is height-prefixed, so the
+		// map key's scid-first order would still insert map-randomly.
 		if len(batch.Installs) > 0 {
 			insBucket := tx.Bucket(bucketInstalls)
-			for mapKey, rec := range batch.Installs {
+			type instRef struct {
+				mapKey string
+				scid   string
+				h      int64
+			}
+			instKeys := make([]instRef, 0, len(batch.Installs))
+			for mapKey := range batch.Installs {
 				scid, h, ok := parseSCIDHeightKey(mapKey)
 				if !ok {
 					continue
 				}
-				if err := insBucket.Put(installKey(h, scid), rec.MarshalTyped()); err != nil {
+				instKeys = append(instKeys, instRef{mapKey: mapKey, scid: scid, h: h})
+			}
+			slices.SortFunc(instKeys, func(a, b instRef) int {
+				if c := cmp.Compare(a.h, b.h); c != 0 {
+					return c
+				}
+				return strings.Compare(a.scid, b.scid)
+			})
+			for _, k := range instKeys {
+				rec := batch.Installs[k.mapKey]
+				if err := insBucket.Put(installKey(k.h, k.scid), rec.MarshalTyped()); err != nil {
 					return err
 				}
 			}
@@ -1045,11 +1066,14 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// a prefix scan returns every scid for the given owner.
 		if len(batch.OwnerSCIDs) > 0 {
 			osBucket := tx.Bucket(bucketOwnerSCIDs)
-			for owner, scids := range batch.OwnerSCIDs {
+			// Sorted outer+inner so inserts land in bucket-key order
+			// (owner-prefixed composite keys); same page-split reasoning as
+			// the Owners loop above.
+			for _, owner := range sortedBatchKeys(batch.OwnerSCIDs) {
 				if owner == "" {
 					continue
 				}
-				for scid := range scids {
+				for _, scid := range sortedBatchKeys(batch.OwnerSCIDs[owner]) {
 					if err := osBucket.Put(ownerSCIDKey(owner, scid), nil); err != nil {
 						return err
 					}
