@@ -359,13 +359,14 @@ func main() {
 		}
 	}()
 
-	// TELA-only mode: discover TELA apps and exit without chain scanning
+	// TELA-only mode: discover TELA apps and exit without chain scanning.
+	// TELAProbeSettled flips only after the probe's cache/seed saves complete
+	// (or a fresh cache hit makes the probe unnecessary), so no grace sleep is
+	// needed before exiting.
 	if *telaOnly {
-		for structures.TELACount.Load() == 0 {
+		for !structures.TELAProbeSettled.Load() {
 			time.Sleep(100 * time.Millisecond)
 		}
-		// Give probe a moment to finish writing cache
-		time.Sleep(2 * time.Second)
 		structures.Logger.Infof("TELA-only mode: %d apps discovered. Exiting.", structures.TELACount.Load())
 		return
 	}

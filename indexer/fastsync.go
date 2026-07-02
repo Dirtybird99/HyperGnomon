@@ -81,6 +81,8 @@ func (idx *Indexer) FastSync(testnet bool) error {
 						otherCount += len(v)
 					}
 					structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
+					// No probe will run on this path — discovery is settled now.
+					structures.TELAProbeSettled.Store(true)
 					elapsed := time.Since(start)
 					logger.Infof("FastSync: cache fresh v%d (height %d, %d blocks behind) — %d INDEX + %d DOC + %d other classes loaded in %s",
 						cached.Version, cached.Height, chainHeight-cached.Height,
@@ -254,8 +256,11 @@ func (idx *Indexer) FastSync(testnet bool) error {
 		// applying a seed would leave the corrupt historical scvars in place.
 		trueCacheMiss := cacheErr != nil || cached == nil
 		if cacheUsable {
-			// Cache hit! Load known TELA SCIDs instantly.
+			// Cache hit! Load known TELA SCIDs instantly. Discovery is settled
+			// here — any probe launched below is a delta refresh (early-exit)
+			// that doesn't gate --tela-only.
 			structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
+			structures.TELAProbeSettled.Store(true)
 			logger.Infof("TELA cache hit: %d INDEX + %d DOC from height %d (instant load)",
 				len(cached.IndexSCIDs), len(cached.DocSCIDs), cached.Height)
 
@@ -405,6 +410,12 @@ func (idx *Indexer) FastSync(testnet bool) error {
 // Phase 1: Batch GetSC(code=true) across 8 connections to find SCIDs with telaVersion/docVersion
 // Phase 2: Batch GetSC(variables=true) for only the matched TELA SCIDs to get metadata
 func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, allowEarlyExit bool, seedCtx *classifySeedProbeContext) {
+	// A FULL probe settles TELA discovery when it returns — after the cache
+	// and seed saves in the tail, which is what --tela-only must not outrun.
+	// Delta probes (allowEarlyExit) are background refreshes and don't gate it.
+	if !allowEarlyExit {
+		defer structures.TELAProbeSettled.Store(true)
+	}
 	start := time.Now()
 	probeBatchSize := normalizeClassifyProbeBatchSize(idx.ClassifyProbeBatchSize)
 	var probed atomic.Int64
