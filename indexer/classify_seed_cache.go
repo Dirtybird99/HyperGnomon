@@ -326,6 +326,8 @@ func (idx *Indexer) applyClassifySeedCache(cache *classifySeedCache) error {
 		logger.Warnf("classify seed local tela cache save: %v", err)
 	}
 	structures.TELACount.Store(int64(len(cache.IndexSCIDs) + len(cache.DocSCIDs)))
+	// Settlement (TELAProbeSettled) is the CALLER's concern: the fastsync seed
+	// branch settles or defers to its delta probe after this returns.
 	return nil
 }
 

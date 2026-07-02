@@ -84,6 +84,12 @@ HyperGnomon falls back to the normal live classify probe.
 
 Discover all TELA apps, print a summary, then exit. No chain scanning beyond the probe. Designed for CI / cache-warming jobs.
 
+Requires `--fastsync` (discovery runs from the GnomonSC registry probe; startup
+fails fast otherwise). Exits as soon as discovery results are durable — after
+the classify probe's cache saves, or after a cache hit's delta probe has
+flushed any newly-deployed SCIDs. A network with zero TELA apps exits cleanly
+with "0 apps discovered" (older builds waited forever).
+
 ### `--testnet` (default `false`)
 
 Use the testnet GnomonSC SCID (`c9d2…`). Default is the mainnet SCID (`a053…`).
