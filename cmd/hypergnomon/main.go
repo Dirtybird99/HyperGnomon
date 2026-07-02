@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	rpprof "runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -74,6 +75,7 @@ func main() {
 	testnet := flag.Bool("testnet", false, "Use testnet GnomonSC SCID")
 	memLimit := flag.Int64("mem-limit", 0, "GOMEMLIMIT in bytes (0 = unset)")
 	pprofAddr := flag.String("pprof-address", "", "pprof HTTP address (e.g. 127.0.0.1:6060, empty=disabled)")
+	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file, flushed on shutdown (empty=disabled; source for refreshing cmd/hypergnomon/default.pgo)")
 	debugMode := flag.Bool("debug", false, "Enable debug logging")
 	// --turbo defaults to true. Non-turbo is now a diagnostic / replay mode:
 	// it performs the slower per-SCID GetSC pass that predates the registry+probe
@@ -130,6 +132,23 @@ func main() {
 		structures.Logger.SetLevel(logrus.DebugLevel)
 	} else {
 		structures.Logger.SetLevel(logrus.InfoLevel)
+	}
+
+	// Whole-run CPU profile (the PGO refresh source for default.pgo). Stopped
+	// via defer on every clean exit path (--tela-only return, scanLoop exit
+	// after Ctrl+C flips Closing) and again in the signal handler below, which
+	// guards the flush against teardown paths that os.Exit past the defers.
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			structures.Logger.Fatalf("--cpuprofile: create %s: %v", *cpuProfile, err)
+		}
+		if err := rpprof.StartCPUProfile(f); err != nil {
+			structures.Logger.Fatalf("--cpuprofile: start: %v", err)
+		}
+		structures.Logger.Infof("CPU profiling to %s", *cpuProfile)
+		defer f.Close()
+		defer rpprof.StopCPUProfile()
 	}
 
 	// Set GOMEMLIMIT for GC optimization
@@ -315,6 +334,10 @@ func main() {
 	go func() {
 		<-sigChan
 		structures.Logger.Info("Shutting down...")
+		// Flush any --cpuprofile before teardown: some shutdown paths reach
+		// os.Exit (Fatalf), which would skip the deferred stop in main.
+		// Double-stop is a no-op when main's defer also runs.
+		rpprof.StopCPUProfile()
 		idx.Close()
 	}()
 
