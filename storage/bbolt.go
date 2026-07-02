@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -782,24 +783,35 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		varBucket := tx.Bucket(bucketScVars)
 		varLatestBucket := tx.Bucket(bucketScVarsLatest)
 		var latestKeyBuf []byte // reused across putLatestSCVarsHeight calls
-		for _, scid := range sortedBatchKeys(batch.Variables) {
-			heightVars := batch.Variables[scid]
-			for height, vars := range heightVars {
-				keyBuf = keyBuf[:0]
-				keyBuf = append(keyBuf, scid...)
-				keyBuf = append(keyBuf, ':')
-				keyBuf = strconv.AppendInt(keyBuf, height, 10)
-				// Exact-size single allocation; the nil-append pattern paid
-				// log2(size) realloc+copies per snapshot.
-				val := structures.MarshalSCIDVariablesTyped(vars)
-				if err := varBucket.Put(keyBuf, val); err != nil {
-					return err
-				}
-				var phErr error
-				latestKeyBuf, phErr = putLatestSCVarsHeight(varLatestBucket, latestKeyBuf, scid, height)
-				if phErr != nil {
-					return phErr
-				}
+		// Flat (scid, height) map: sort keys by (scid, height) for deterministic
+		// write order and bbolt page locality. The nested layout sorted scids but
+		// walked each scid's heights in random map order.
+		varKeys := make([]VarKey, 0, len(batch.Variables))
+		for k := range batch.Variables {
+			varKeys = append(varKeys, k)
+		}
+		slices.SortFunc(varKeys, func(a, b VarKey) int {
+			if c := strings.Compare(a.Scid, b.Scid); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.Height, b.Height)
+		})
+		for _, k := range varKeys {
+			vars := batch.Variables[k]
+			keyBuf = keyBuf[:0]
+			keyBuf = append(keyBuf, k.Scid...)
+			keyBuf = append(keyBuf, ':')
+			keyBuf = strconv.AppendInt(keyBuf, k.Height, 10)
+			// Exact-size single allocation; the nil-append pattern paid
+			// log2(size) realloc+copies per snapshot.
+			val := structures.MarshalSCIDVariablesTyped(vars)
+			if err := varBucket.Put(keyBuf, val); err != nil {
+				return err
+			}
+			var phErr error
+			latestKeyBuf, phErr = putLatestSCVarsHeight(varLatestBucket, latestKeyBuf, k.Scid, k.Height)
+			if phErr != nil {
+				return phErr
 			}
 		}
 
