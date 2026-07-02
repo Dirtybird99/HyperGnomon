@@ -26,7 +26,7 @@ go build -o hypergnomon ./cmd/hypergnomon/
 - `--fastsync` — Bootstrap from GnomonSC registry
 - `--turbo` — Skip per-SC variable fetch during scan (default: `true`)
 - `--mem-limit` — `GOMEMLIMIT` in bytes
-- `--cpuprofile` — Whole-run CPU profile file, flushed on shutdown (PGO refresh source)
+- `--cpuprofile` — Whole-run CPU profile file, flushed on shutdown (PGO refresh source; daemon mode only)
 - `--debug` — Enable debug logging
 
 Full flag reference with rationale for each default: [DOCS/FLAGS.md](DOCS/FLAGS.md).

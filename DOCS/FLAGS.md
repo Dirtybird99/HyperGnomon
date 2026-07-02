@@ -146,11 +146,17 @@ Enable debug logging. Prints per-scan-cycle detail; noisy.
 ### `--cpuprofile` (default `""`)
 
 Write a whole-run CPU profile to the given file, flushed on shutdown (Ctrl+C or
-`--tela-only` exit). Empty disables. This is the refresh source for the committed
-PGO profile: run a representative sync with `--cpuprofile=cpu.prof` (optionally
-merge phase captures with `go tool pprof -proto a.prof b.prof > default.pgo`)
-and replace `cmd/hypergnomon/default.pgo`; Go ≥1.21 applies it automatically at
-build time (`-pgo=auto`). For sampling a live process without restarting, use
+`--tela-only` exit). Empty disables. Daemon mode only — the `resync`/`clean`/
+`compact` subcommands reject it. Error exits (a startup `Fatalf`, `kill -9`) skip
+the flush and lose the profile. While active it holds the process's one CPU
+profiler, so `--pprof-address`'s `/debug/pprof/profile` endpoint returns
+"cpu profiling already in use" for the whole run (the other endpoints still work).
+
+This is the refresh source for the committed PGO profile: run a representative
+sync with `--cpuprofile=cpu.prof` (optionally merge phase captures with
+`go tool pprof -proto a.prof b.prof > default.pgo`) and replace
+`cmd/hypergnomon/default.pgo`; Go ≥1.21 applies it automatically at build time
+(`-pgo=auto`). For windowed sampling of a live process without restarting, use
 `--pprof-address` instead.
 
 ### `--adapt-batch` (default `true`)
