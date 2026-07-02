@@ -47,17 +47,16 @@ func (idx *Indexer) publishBatchEvents(b *storage.WriteBatch, newHeight, safeHei
 		})
 	}
 
-	// Variable snapshots — coalesce to one event per (scid, height).
-	for scid, heightMap := range b.Variables {
-		for h, vars := range heightMap {
-			bus.Publish(eventbus.Event{
-				Type:       eventbus.EventVarChange,
-				Height:     h,
-				SafeHeight: safeHeight,
-				SCID:       scid,
-				Payload:    vars,
-			})
-		}
+	// Variable snapshots — one event per (scid, height), which is exactly one
+	// entry of the flat Variables map.
+	for k, vars := range b.Variables {
+		bus.Publish(eventbus.Event{
+			Type:       eventbus.EventVarChange,
+			Height:     k.Height,
+			SafeHeight: safeHeight,
+			SCID:       k.Scid,
+			Payload:    vars,
+		})
 	}
 
 	// Class assignments — one event per SCID whose class metadata was

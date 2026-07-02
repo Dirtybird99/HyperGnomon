@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
-	"container/list"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -30,29 +29,99 @@ type telaContentCache struct {
 	mu       sync.Mutex
 	maxBytes int64
 	size     int64
-	ll       *list.List
-	items    map[string]*list.Element
-	// byScid: scid → set of cache keys touching that scid. Parallel to
-	// items; kept in sync on every Put/evict/InvalidatePrefix.
-	byScid map[string]map[string]struct{}
+	// Intrusive LRU ring with a sentinel root: one *telaCacheNode per entry
+	// carries the list links AND the payload, where container/list cost two
+	// allocations per entry (the Element plus the boxed item Value) and an
+	// interface assertion on every Get.
+	root  telaCacheNode // sentinel: root.next = front (MRU), root.prev = back (LRU)
+	count int
+	items map[string]*telaCacheNode
+	// free: capped singly-linked recycle list (via .next) of nodes released
+	// by evict/InvalidatePrefix, so a Put after churn allocates no node.
+	// Freed nodes are scrubbed (entry/key/scid cleared) so the list never
+	// pins a body or key string.
+	free      *telaCacheNode
+	freeCount int
+	// freeKeys recycles byScid key-slices released when a scid's last entry
+	// is removed, so re-indexing a churned scid allocates no slice.
+	freeKeys [][]string
+	// byScid: scid → cache keys touching that scid. Parallel to items; kept
+	// in sync on every Put/evict/InvalidatePrefix. A small slice, not a set:
+	// keys are unique by construction (indexAddLocked runs only on a fresh
+	// items insert) and a scid has ≤ 4 keys in practice (INDEX + a few DOCs),
+	// so linear removal beats a per-scid map's header+bucket allocations.
+	byScid map[string][]string
 }
 
-type telaContentCacheItem struct {
-	key   string
-	scid  string // parsed once at Put time so evict + invalidate don't re-split
-	entry *structures.TELAContentEntry
+type telaCacheNode struct {
+	prev, next *telaCacheNode
+	key        string
+	scid       string // parsed once at Put time so evict + invalidate don't re-split
+	entry      *structures.TELAContentEntry
 }
 
 func newTELAContentCache(maxBytes int64) *telaContentCache {
 	if maxBytes <= 0 {
 		maxBytes = 128 * 1024 * 1024
 	}
-	return &telaContentCache{
+	c := &telaContentCache{
 		maxBytes: maxBytes,
-		ll:       list.New(),
-		items:    make(map[string]*list.Element, 64),
-		byScid:   make(map[string]map[string]struct{}, 16),
+		items:    make(map[string]*telaCacheNode, 64),
+		byScid:   make(map[string][]string, 16),
 	}
+	c.root.prev = &c.root
+	c.root.next = &c.root
+	return c
+}
+
+// unlinkLocked removes n from the ring; moveToFrontLocked and pushFrontLocked
+// (re)insert at the MRU position. All require c.mu held.
+func (c *telaContentCache) unlinkLocked(n *telaCacheNode) {
+	n.prev.next = n.next
+	n.next.prev = n.prev
+}
+
+func (c *telaContentCache) pushFrontLocked(n *telaCacheNode) {
+	n.prev = &c.root
+	n.next = c.root.next
+	n.prev.next = n
+	n.next.prev = n
+}
+
+func (c *telaContentCache) moveToFrontLocked(n *telaCacheNode) {
+	if c.root.next == n {
+		return
+	}
+	c.unlinkLocked(n)
+	c.pushFrontLocked(n)
+}
+
+// maxFreeNodes caps the recycle list (~72 B per node, so ≤ ~74 KB retained).
+const maxFreeNodes = 1024
+
+// newNodeLocked pops a recycled node or allocates one; freeNodeLocked scrubs
+// a released node and pushes it onto the capped free list. Both need c.mu.
+func (c *telaContentCache) newNodeLocked(key, scid string, entry *structures.TELAContentEntry) *telaCacheNode {
+	n := c.free
+	if n == nil {
+		return &telaCacheNode{key: key, scid: scid, entry: entry}
+	}
+	c.free = n.next
+	c.freeCount--
+	n.key, n.scid, n.entry = key, scid, entry
+	return n
+}
+
+func (c *telaContentCache) freeNodeLocked(n *telaCacheNode) {
+	n.key, n.scid, n.entry = "", "", nil
+	n.prev = nil
+	if c.freeCount >= maxFreeNodes {
+		n.next = nil
+		return
+	}
+	n.next = c.free
+	c.free = n
+	c.freeCount++
 }
 
 // scidFromCacheKey extracts the scid portion of a "<scid>|<path>" key.
@@ -68,12 +137,12 @@ func scidFromCacheKey(key string) string {
 func (c *telaContentCache) Get(key string) *structures.TELAContentEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	el, ok := c.items[key]
+	n, ok := c.items[key]
 	if !ok {
 		return nil
 	}
-	c.ll.MoveToFront(el)
-	return el.Value.(*telaContentCacheItem).entry
+	c.moveToFrontLocked(n)
+	return n.entry
 }
 
 func (c *telaContentCache) Put(key string, entry *structures.TELAContentEntry) {
@@ -83,16 +152,18 @@ func (c *telaContentCache) Put(key string, entry *structures.TELAContentEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	scid := scidFromCacheKey(key)
-	if el, ok := c.items[key]; ok {
-		c.size -= int64(len(el.Value.(*telaContentCacheItem).entry.Body))
-		el.Value = &telaContentCacheItem{key: key, scid: scid, entry: entry}
+	if n, ok := c.items[key]; ok {
+		c.size -= int64(len(n.entry.Body))
+		n.entry = entry
 		c.size += int64(len(entry.Body))
-		c.ll.MoveToFront(el)
+		c.moveToFrontLocked(n)
 		c.evictLocked()
 		return
 	}
-	el := c.ll.PushFront(&telaContentCacheItem{key: key, scid: scid, entry: entry})
-	c.items[key] = el
+	n := c.newNodeLocked(key, scid, entry)
+	c.pushFrontLocked(n)
+	c.count++
+	c.items[key] = n
 	c.size += int64(len(entry.Body))
 	c.indexAddLocked(scid, key)
 	c.evictLocked()
@@ -105,39 +176,68 @@ func (c *telaContentCache) indexAddLocked(scid, key string) {
 	if scid == "" {
 		return
 	}
-	set, ok := c.byScid[scid]
-	if !ok {
-		set = make(map[string]struct{}, 2)
-		c.byScid[scid] = set
+	keys := c.byScid[scid]
+	if keys == nil {
+		if n := len(c.freeKeys); n > 0 {
+			keys = c.freeKeys[n-1]
+			c.freeKeys = c.freeKeys[:n-1]
+		} else {
+			// One right-sized allocation up front: ≤ 4 keys per scid in
+			// practice, so nil→1→2→4 append-growth reallocs never happen.
+			keys = make([]string, 0, 4)
+		}
 	}
-	set[key] = struct{}{}
+	c.byScid[scid] = append(keys, key)
+}
+
+// freeKeysLocked scrubs and recycles a released byScid key-slice. Capped by
+// the same order of magnitude as maxFreeNodes; requires c.mu.
+func (c *telaContentCache) freeKeysLocked(keys []string) {
+	if cap(keys) == 0 || len(c.freeKeys) >= 256 {
+		return
+	}
+	keys = keys[:cap(keys)]
+	for i := range keys {
+		keys[i] = "" // release key-string references
+	}
+	c.freeKeys = append(c.freeKeys, keys[:0])
 }
 
 func (c *telaContentCache) indexRemoveLocked(scid, key string) {
 	if scid == "" {
 		return
 	}
-	set, ok := c.byScid[scid]
+	keys, ok := c.byScid[scid]
 	if !ok {
 		return
 	}
-	delete(set, key)
-	if len(set) == 0 {
+	for i, k := range keys {
+		if k == key {
+			keys[i] = keys[len(keys)-1]
+			keys = keys[:len(keys)-1]
+			break
+		}
+	}
+	if len(keys) == 0 {
 		delete(c.byScid, scid)
+		c.freeKeysLocked(keys)
+	} else {
+		c.byScid[scid] = keys
 	}
 }
 
 func (c *telaContentCache) evictLocked() {
-	for c.size > c.maxBytes && c.ll.Len() > 0 {
-		back := c.ll.Back()
-		if back == nil {
+	for c.size > c.maxBytes && c.count > 0 {
+		back := c.root.prev
+		if back == &c.root {
 			return
 		}
-		item := back.Value.(*telaContentCacheItem)
-		c.ll.Remove(back)
-		delete(c.items, item.key)
-		c.indexRemoveLocked(item.scid, item.key)
-		c.size -= int64(len(item.entry.Body))
+		c.unlinkLocked(back)
+		c.count--
+		delete(c.items, back.key)
+		c.indexRemoveLocked(back.scid, back.key)
+		c.size -= int64(len(back.entry.Body))
+		c.freeNodeLocked(back)
 	}
 }
 
@@ -149,26 +249,25 @@ func (c *telaContentCache) InvalidatePrefix(scid string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	set, ok := c.byScid[scid]
+	keys, ok := c.byScid[scid]
 	if !ok {
 		return
 	}
-	// Collect keys into a local slice so we don't mutate while iterating.
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
+	// Safe to range keys directly: the loop mutates c.items and the ring,
+	// never the slice — the whole byScid entry is deleted after the range.
 	for _, key := range keys {
-		el, ok := c.items[key]
+		n, ok := c.items[key]
 		if !ok {
 			continue
 		}
-		item := el.Value.(*telaContentCacheItem)
-		c.ll.Remove(el)
+		c.unlinkLocked(n)
+		c.count--
 		delete(c.items, key)
-		c.size -= int64(len(item.entry.Body))
+		c.size -= int64(len(n.entry.Body))
+		c.freeNodeLocked(n)
 	}
 	delete(c.byScid, scid)
+	c.freeKeysLocked(keys)
 }
 
 // runTELAInvalidator subscribes to EventInstall/EventVarChange and drops

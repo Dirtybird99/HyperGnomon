@@ -109,6 +109,17 @@ type Storage interface {
 // allocated one inner map per distinct addr.
 type addrSCIDKey struct{ addr, scid string }
 
+// VarKey is the flat composite key for WriteBatch.Variables: one snapshot per
+// (scid, height). A struct key (an already-allocated string header + an int)
+// costs no allocation per snapshot — unlike the nested scid->height map, which
+// allocated one inner map per distinct scid per batch cycle. Exported (unlike
+// addrSCIDKey) because indexer consumers iterate the field directly
+// (publishBatchEvents, classify seed-cache building).
+type VarKey struct {
+	Scid   string
+	Height int64
+}
+
 // NormalTxRef is one accumulated normal-TX record tagged with the address that
 // touched it. WriteBatch.NormalTxs is a flat slice of these instead of an
 // addr->[]*record map: FlushBatch flattens the map back to (addr, record) pairs
@@ -124,12 +135,12 @@ type NormalTxRef struct {
 // This is the arena pattern applied to database writes:
 // accumulate everything, flush once, instead of per-item writes.
 type WriteBatch struct {
-	Owners       map[string]string                               // scid -> owner
-	Invocations  []structures.InvokeRecord                       // all invocations
-	Variables    map[string]map[int64][]*structures.SCIDVariable // scid -> height -> vars
-	Heights      map[string][]int64                              // scid -> interaction heights
-	NormalTxs    []NormalTxRef                                   // flat (addr, tx) pairs
-	InvalidSCIDs map[string]uint64                               // scid -> fees
+	Owners       map[string]string                     // scid -> owner
+	Invocations  []structures.InvokeRecord             // all invocations
+	Variables    map[VarKey][]*structures.SCIDVariable // (scid, height) -> vars snapshot
+	Heights      map[string][]int64                    // scid -> interaction heights
+	NormalTxs    []NormalTxRef                         // flat (addr, tx) pairs
+	InvalidSCIDs map[string]uint64                     // scid -> fees
 	RegTxCount   int64
 	BurnTxCount  int64
 	NormTxCount  int64
@@ -190,7 +201,7 @@ func newEmptyBatch() *WriteBatch {
 	return &WriteBatch{
 		Owners:        make(map[string]string, 32),
 		Invocations:   make([]structures.InvokeRecord, 0, 128),
-		Variables:     make(map[string]map[int64][]*structures.SCIDVariable, 32),
+		Variables:     make(map[VarKey][]*structures.SCIDVariable, 64),
 		Heights:       make(map[string][]int64, 32),
 		NormalTxs:     make([]NormalTxRef, 0, 512),
 		InvalidSCIDs:  make(map[string]uint64, 4),
@@ -246,12 +257,10 @@ func (b *WriteBatch) AddInvocation(rec structures.InvokeRecord) {
 	b.Invocations = append(b.Invocations, rec)
 }
 
-// AddVariables adds SC variable snapshot to the batch.
+// AddVariables adds SC variable snapshot to the batch. Same-(scid, height)
+// duplicates overwrite, matching the old nested-map semantics.
 func (b *WriteBatch) AddVariables(scid string, height int64, vars []*structures.SCIDVariable) {
-	if b.Variables[scid] == nil {
-		b.Variables[scid] = make(map[int64][]*structures.SCIDVariable, 4)
-	}
-	b.Variables[scid][height] = vars
+	b.Variables[VarKey{Scid: scid, Height: height}] = vars
 }
 
 // AddInteractionHeight adds a height record to the batch.

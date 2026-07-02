@@ -245,16 +245,14 @@ func TestBboltStore_FlushBatch(t *testing.T) {
 	}
 
 	// Verify variable snapshots.
-	for scid, heightMap := range batch.Variables {
-		for height, wantVars := range heightMap {
-			gotVars, err := store.GetSCIDVariableDetailsAtHeight(scid, height)
-			if err != nil {
-				t.Fatalf("GetSCIDVariableDetailsAtHeight(%s, %d): %v", scid[:16], height, err)
-			}
-			if len(gotVars) != len(wantVars) {
-				t.Fatalf("var count mismatch at %s:%d: got %d, want %d",
-					scid[:16], height, len(gotVars), len(wantVars))
-			}
+	for k, wantVars := range batch.Variables {
+		gotVars, err := store.GetSCIDVariableDetailsAtHeight(k.Scid, k.Height)
+		if err != nil {
+			t.Fatalf("GetSCIDVariableDetailsAtHeight(%s, %d): %v", k.Scid[:16], k.Height, err)
+		}
+		if len(gotVars) != len(wantVars) {
+			t.Fatalf("var count mismatch at %s:%d: got %d, want %d",
+				k.Scid[:16], k.Height, len(gotVars), len(wantVars))
 		}
 	}
 

@@ -384,10 +384,8 @@ func newClassifySeedCacheFromProbe(network, gnomonSCID, registryHash string, hei
 		for scid, meta := range varBatch.Classes {
 			cache.Classes[scid] = cloneClassMeta(meta)
 		}
-		for scid, heightVars := range varBatch.Variables {
-			for h, vars := range heightVars {
-				cache.Variables[scid] = classifySeedVars{Height: h, Vars: cloneSCIDVariables(vars)}
-			}
+		for k, vars := range varBatch.Variables {
+			cache.Variables[k.Scid] = classifySeedVars{Height: k.Height, Vars: cloneSCIDVariables(vars)}
 		}
 	}
 	if codeBatch != nil {
