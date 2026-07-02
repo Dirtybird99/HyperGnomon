@@ -961,8 +961,14 @@ func (s *Server) handleGetTELACount(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// jsonContentType is the shared canonical Content-Type value slice. Header.Set
+// builds a fresh []string{v} per call — the only allocation writeJSON made.
+// Assigning one shared slice is safe because nothing mutates header value
+// slices in place (net/http and this package only read or replace them).
+var jsonContentType = []string{"application/json"}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header()["Content-Type"] = jsonContentType
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		logger.Errorf("json encode: %v", err)
