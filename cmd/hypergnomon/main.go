@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	rpprof "runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -74,6 +75,9 @@ func main() {
 	testnet := flag.Bool("testnet", false, "Use testnet GnomonSC SCID")
 	memLimit := flag.Int64("mem-limit", 0, "GOMEMLIMIT in bytes (0 = unset)")
 	pprofAddr := flag.String("pprof-address", "", "pprof HTTP address (e.g. 127.0.0.1:6060, empty=disabled)")
+	// Named to match `go test -cpuprofile` / pprof muscle memory — the one
+	// deliberate exception to this file's kebab-case flag convention.
+	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file, flushed on shutdown (empty=disabled; source for refreshing cmd/hypergnomon/default.pgo)")
 	debugMode := flag.Bool("debug", false, "Enable debug logging")
 	// --turbo defaults to true. Non-turbo is now a diagnostic / replay mode:
 	// it performs the slower per-SCID GetSC pass that predates the registry+probe
@@ -130,6 +134,25 @@ func main() {
 		structures.Logger.SetLevel(logrus.DebugLevel)
 	} else {
 		structures.Logger.SetLevel(logrus.InfoLevel)
+	}
+
+	// Whole-run CPU profile (the PGO refresh source for default.pgo). Flushed
+	// by the deferred stop on every clean exit path: --tela-only's return and
+	// the normal daemon shutdown (Ctrl+C flips Closing, scanLoop exits, main
+	// returns). Fatalf/os.Exit paths skip defers and lose the profile — all
+	// such sites currently run before the daemon starts, so at most an
+	// almost-empty file is lost.
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			structures.Logger.Fatalf("--cpuprofile: create %s: %v", *cpuProfile, err)
+		}
+		if err := rpprof.StartCPUProfile(f); err != nil {
+			structures.Logger.Fatalf("--cpuprofile: start: %v", err)
+		}
+		structures.Logger.Infof("CPU profiling to %s", *cpuProfile)
+		defer f.Close()
+		defer rpprof.StopCPUProfile()
 	}
 
 	// Set GOMEMLIMIT for GC optimization
