@@ -925,7 +925,7 @@ func (s *Server) handleGetInitialSCIDCode(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "indexer not configured")
 		return
 	}
-	scid := r.URL.Query().Get("scid")
+	scid := queryParam(r, "scid")
 	if scid == "" {
 		writeError(w, http.StatusBadRequest, "missing scid")
 		return
@@ -961,8 +961,50 @@ func (s *Server) handleGetTELACount(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// queryParam returns the first value for key in r's raw query, matching
+// url.Values.Get semantics for well-formed inputs while avoiding the
+// url.Values map (+ per-key slices) that r.URL.Query() builds per call.
+// Mirrors ParseQuery's tolerance: pairs containing ';' or with undecodable
+// escapes are skipped; a bare "key" yields "". QueryUnescape returns its
+// input unchanged (no allocation) when nothing needs decoding — the common
+// case for hex scids.
+func queryParam(r *http.Request, key string) string {
+	q := r.URL.RawQuery
+	for q != "" {
+		var pair string
+		pair, q, _ = strings.Cut(q, "&")
+		if pair == "" || strings.Contains(pair, ";") {
+			continue
+		}
+		k, v, _ := strings.Cut(pair, "=")
+		if k != key {
+			// The key itself may be percent-encoded (rare) — only then pay
+			// the unescape to compare.
+			if !strings.ContainsAny(k, "%+") {
+				continue
+			}
+			ku, err := url.QueryUnescape(k)
+			if err != nil || ku != key {
+				continue
+			}
+		}
+		val, err := url.QueryUnescape(v)
+		if err != nil {
+			continue
+		}
+		return val
+	}
+	return ""
+}
+
+// jsonContentType is the shared canonical Content-Type value slice. Header.Set
+// builds a fresh []string{v} per call — the only allocation writeJSON made.
+// Assigning one shared slice is safe because nothing mutates header value
+// slices in place (net/http and this package only read or replace them).
+var jsonContentType = []string{"application/json"}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header()["Content-Type"] = jsonContentType
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		logger.Errorf("json encode: %v", err)
