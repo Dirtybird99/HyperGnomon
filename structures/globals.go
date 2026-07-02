@@ -68,10 +68,14 @@ var Logger = logrus.New()
 // TELACount tracks the number of TELA apps discovered during fastsync probe.
 var TELACount atomic.Int64
 
-// TELAProbeSettled flips true once TELA discovery has fully finished: either
-// a full classify probe returned (including its cache/seed saves) or a fresh
-// cache hit made a probe unnecessary. Unlike TELACount — which is set as soon
-// as apps are counted, before the probe tail writes its caches — this is the
-// signal `--tela-only` waits on to exit without racing the cache writes.
-// Delta (early-exit) refresh probes do not gate it.
+// TELAProbeSettled flips true once TELA discovery has fully finished AND its
+// results are durable: a full classify probe returned (including its
+// cache/seed saves), a cache hit's gating delta probe finished flushing any
+// newly-deployed SCIDs, or a fresh cache hit made a probe unnecessary. Unlike
+// TELACount — set as soon as apps are counted — this is the signal
+// `--tela-only` waits on to exit without racing cache or batch writes.
+// Terminal classify paths settle via indexer's settleTELADiscovery helper,
+// which couples this flag with the readiness log marker so neither can be
+// added without the other. Never reset at runtime; tests that drive a settle
+// path must Store(false) in setup or later tests pass vacuously.
 var TELAProbeSettled atomic.Bool

@@ -136,6 +136,13 @@ func main() {
 		structures.Logger.SetLevel(logrus.InfoLevel)
 	}
 
+	// --tela-only exits when TELA discovery settles, and discovery only runs
+	// from the FastSync registry probe — without --fastsync it would wait
+	// forever. Fail fast at startup instead.
+	if *telaOnly && !*fastsync {
+		structures.Logger.Fatalf("--tela-only requires --fastsync: TELA discovery runs from the GnomonSC registry probe")
+	}
+
 	// Whole-run CPU profile (the PGO refresh source for default.pgo). Flushed
 	// by the deferred stop on every clean exit path: --tela-only's return and
 	// the normal daemon shutdown (Ctrl+C flips Closing, scanLoop exits, main
@@ -293,6 +300,11 @@ func main() {
 	if *fastsync {
 		structures.Logger.Info("FastSync enabled, syncing from GnomonSC...")
 		if err := idx.FastSync(*testnet); err != nil {
+			if *telaOnly {
+				// Discovery can never settle after a failed FastSync — exit
+				// with the error instead of waiting forever below.
+				structures.Logger.Fatalf("FastSync failed; --tela-only cannot discover apps: %v", err)
+			}
 			structures.Logger.Errorf("FastSync failed (continuing with normal sync): %v", err)
 		} else {
 			structures.Logger.Info("FastSync complete")
@@ -360,9 +372,9 @@ func main() {
 	}()
 
 	// TELA-only mode: discover TELA apps and exit without chain scanning.
-	// TELAProbeSettled flips only after the probe's cache/seed saves complete
-	// (or a fresh cache hit makes the probe unnecessary), so no grace sleep is
-	// needed before exiting.
+	// TELAProbeSettled flips only once discovery results are durable — after
+	// the probe's cache/seed saves, or after a cache hit's delta probe has
+	// flushed any newly-deployed SCIDs — so no grace sleep is needed.
 	if *telaOnly {
 		for !structures.TELAProbeSettled.Load() {
 			time.Sleep(100 * time.Millisecond)

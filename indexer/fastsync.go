@@ -30,6 +30,18 @@ type registryEntry struct {
 	height int64
 }
 
+// settleTELADiscovery marks TELA discovery finished for --tela-only AND emits
+// the "Classify probe complete" readiness marker (cmd/benchvs waits on that
+// exact phrase). The two are coupled in one helper on purpose: every terminal
+// classify path must do both, and hand-placing them separately has twice
+// produced a path that emitted the marker without settling — an indefinite
+// --tela-only hang. probeTELA's full-probe path settles via its own defer
+// (its markers are logged with per-phase timings internally).
+func settleTELADiscovery(reason string, elapsed time.Duration) {
+	structures.TELAProbeSettled.Store(true)
+	logger.Infof("Classify probe complete: %s | Total: %s", reason, elapsed.Round(time.Millisecond))
+}
+
 // FastSync bootstraps the indexer from the on-chain GnomonSC registry.
 // Instead of scanning from block 1, it:
 //  1. Queries the Gnomon SC for all registered SCIDs
@@ -81,15 +93,12 @@ func (idx *Indexer) FastSync(testnet bool) error {
 						otherCount += len(v)
 					}
 					structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
-					// No probe will run on this path — discovery is settled now.
-					structures.TELAProbeSettled.Store(true)
 					elapsed := time.Since(start)
 					logger.Infof("FastSync: cache fresh v%d (height %d, %d blocks behind) — %d INDEX + %d DOC + %d other classes loaded in %s",
 						cached.Version, cached.Height, chainHeight-cached.Height,
 						len(cached.IndexSCIDs), len(cached.DocSCIDs), otherCount, elapsed.Round(time.Millisecond))
-					// Readiness marker: cmd/benchvs --ready-log-pattern waits for
-					// this exact phrase, and no probe will run on this path.
-					logger.Infof("Classify probe complete: cache fresh | Total: 0s")
+					// No probe will run on this path.
+					settleTELADiscovery("cache fresh", 0)
 					return nil
 				}
 				logger.Warnf("FastSync: cache height-fresh but scvars reads failed — forcing re-probe to heal corrupted variable blobs (pre-fix HyperGnomon artifact)")
@@ -192,9 +201,8 @@ func (idx *Indexer) FastSync(testnet bool) error {
 
 	if len(candidates) == 0 {
 		logger.Warn("FastSync: no SCIDs found in GnomonSC registry")
-		// Readiness marker: nothing to classify, but consumers (benchvs)
-		// still wait for this phrase before declaring the node ready.
-		logger.Infof("Classify probe complete: empty registry | Total: 0s")
+		// Nothing to classify — discovery is settled with zero apps.
+		settleTELADiscovery("empty registry", 0)
 		return idx.Store.StoreLastIndexHeight(chainHeight)
 	}
 
@@ -256,11 +264,8 @@ func (idx *Indexer) FastSync(testnet bool) error {
 		// applying a seed would leave the corrupt historical scvars in place.
 		trueCacheMiss := cacheErr != nil || cached == nil
 		if cacheUsable {
-			// Cache hit! Load known TELA SCIDs instantly. Discovery is settled
-			// here — any probe launched below is a delta refresh (early-exit)
-			// that doesn't gate --tela-only.
+			// Cache hit! Load known TELA SCIDs instantly.
 			structures.TELACount.Store(int64(len(cached.IndexSCIDs) + len(cached.DocSCIDs)))
-			structures.TELAProbeSettled.Store(true)
 			logger.Infof("TELA cache hit: %d INDEX + %d DOC from height %d (instant load)",
 				len(cached.IndexSCIDs), len(cached.DocSCIDs), cached.Height)
 
@@ -273,20 +278,30 @@ func (idx *Indexer) FastSync(testnet bool) error {
 			}
 
 			if len(deltaCandidates) > 0 {
+				// The delta probe gates settlement: --tela-only must not exit
+				// while its FlushBatch of newly-deployed SCIDs is in flight
+				// (delta finds are not re-cached, so an abandoned flush would
+				// drop them again on every subsequent run).
 				logger.Infof("TELA delta probe: %d new SCIDs since height %d", len(deltaCandidates), cached.Height)
-				go idx.probeTELA(deltaCandidates, chainHeight, true, nil)
+				go func() {
+					idx.probeTELA(deltaCandidates, chainHeight, true, nil)
+					structures.TELAProbeSettled.Store(true)
+				}()
 			} else {
 				logger.Info("TELA delta probe: no new SCIDs since last run")
-				// Readiness marker — every terminal classify path must emit it.
-				logger.Infof("Classify probe complete: tela cache | Total: 0s")
+				settleTELADiscovery("tela cache", 0)
 			}
 		} else if deltaCandidates, ok := trueLocalCacheMissSeed(idx, trueCacheMiss, network, gnomonSCID, candidates); ok {
 			if len(deltaCandidates) > 0 {
+				// Same gating as the tela-cache delta above.
 				logger.Infof("Classify seed delta probe: %d new SCIDs since seed height", len(deltaCandidates))
-				go idx.probeTELA(deltaCandidates, chainHeight, true, nil)
+				go func() {
+					idx.probeTELA(deltaCandidates, chainHeight, true, nil)
+					structures.TELAProbeSettled.Store(true)
+				}()
 			} else {
 				logger.Info("Classify seed delta probe: no new SCIDs since seed cache")
-				logger.Infof("Classify probe complete: seed cache | Total: 0s")
+				settleTELADiscovery("seed cache", 0)
 			}
 		} else {
 			// Cache missing, old-version, or corrupt — full probe. This is the
@@ -410,9 +425,8 @@ func (idx *Indexer) FastSync(testnet bool) error {
 // Phase 1: Batch GetSC(code=true) across 8 connections to find SCIDs with telaVersion/docVersion
 // Phase 2: Batch GetSC(variables=true) for only the matched TELA SCIDs to get metadata
 func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, allowEarlyExit bool, seedCtx *classifySeedProbeContext) {
-	// A FULL probe settles TELA discovery when it returns — after the cache
-	// and seed saves in the tail, which is what --tela-only must not outrun.
-	// Delta probes (allowEarlyExit) are background refreshes and don't gate it.
+	// A FULL probe settles when it returns — after the cache/seed saves in
+	// the tail. Gating delta probes are settled by their launch-site wrapper.
 	if !allowEarlyExit {
 		defer structures.TELAProbeSettled.Store(true)
 	}
@@ -471,6 +485,9 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 	work := make(chan []string, 16)
 
 	var sinceLastFind atomic.Int64
+	// probeComplete is the LOCAL early-exit signal between this probe's
+	// workers ("found enough, stop probing") — unrelated to the global
+	// structures.TELAProbeSettled exit gate set when the whole probe returns.
 	var probeComplete atomic.Bool
 
 	var wg sync.WaitGroup
