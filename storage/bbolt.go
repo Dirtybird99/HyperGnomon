@@ -796,7 +796,7 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			}
 			return cmp.Compare(a.Height, b.Height)
 		})
-		for _, k := range varKeys {
+		for i, k := range varKeys {
 			vars := batch.Variables[k]
 			keyBuf = keyBuf[:0]
 			keyBuf = append(keyBuf, k.Scid...)
@@ -808,10 +808,19 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			if err := varBucket.Put(keyBuf, val); err != nil {
 				return err
 			}
-			var phErr error
-			latestKeyBuf, phErr = putLatestSCVarsHeight(varLatestBucket, latestKeyBuf, k.Scid, k.Height)
-			if phErr != nil {
-				return phErr
+			// Latest-height upsert once per scid run, not per snapshot: keys
+			// are sorted by (scid, height) ascending, so within a run every
+			// successive height beats the previous — the helper's
+			// existing>=height skip could never fire (a rw-tx Get sees the
+			// tx's own Puts). The run's LAST key holds the batch max; the
+			// helper's guard still protects against a higher height already
+			// in the DB from an earlier flush.
+			if i+1 == len(varKeys) || varKeys[i+1].Scid != k.Scid {
+				var phErr error
+				latestKeyBuf, phErr = putLatestSCVarsHeight(varLatestBucket, latestKeyBuf, k.Scid, k.Height)
+				if phErr != nil {
+					return phErr
+				}
 			}
 		}
 
