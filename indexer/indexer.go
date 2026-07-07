@@ -1276,20 +1276,37 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 	// Route B: refresh class metadata (TELA apps bump version via STORE) and
 	// record addr→scid edge.
 	if len(scVars) > 0 {
-		sc := ClassifySCVars(scid, "", scVars)
-		// Preserve InstallHeight if we have prior meta; this is a refresh.
-		existingMeta, _ := idx.Store.GetSCIDClass(scid)
-		installH := height
-		if existingMeta != nil {
-			installH = existingMeta.InstallHeight
-		}
-		batch.AddClass(scid, &structures.ClassMeta{
-			Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
-			DURL: sc.DURL, Version: sc.Version,
-			InstallHeight: installH, LastHeight: height,
-		})
+		idx.refreshClassMetaOnInvoke(scid, height, scVars, batch)
 	}
 	batch.AddAddrSCID(sender, scid, height)
+}
+
+// refreshClassMetaOnInvoke rebuilds the stored ClassMeta from a fresh
+// post-invoke variable snapshot, seeding the refresh with the STORED class: an
+// invoke carries no SC code, so ClassifySCVars(scid, "", …) can only ever
+// yield UNKNOWN — which used to overwrite the install-time Class/Tags and
+// drop the class-gated fields (Version etc.) on every invoke, i.e. on every
+// normal TELA update. ClassifySCVarsWithClass re-applies the known class and
+// extracts the class-gated fields from the fresh vars in one pass (same shape
+// as the fastsync + tela_refresher refreshes).
+func (idx *Indexer) refreshClassMetaOnInvoke(scid string, height int64, scVars []*structures.SCIDVariable, batch *storage.WriteBatch) {
+	existingMeta, _ := idx.Store.GetSCIDClass(scid)
+	var sc SCClass
+	installH := height
+	if existingMeta != nil {
+		// Preserve InstallHeight; this is a refresh.
+		installH = existingMeta.InstallHeight
+		sc = ClassifySCVarsWithClass(scid, existingMeta.Class, scVars)
+	} else {
+		// No prior meta (invoke seen before its install, or install not
+		// indexed): classify code-less as before.
+		sc = ClassifySCVars(scid, "", scVars)
+	}
+	batch.AddClass(scid, &structures.ClassMeta{
+		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+		DURL: sc.DURL, Version: sc.Version,
+		InstallHeight: installH, LastHeight: height,
+	})
 }
 
 // processNormalTx handles a normal transaction with SCID payload.
