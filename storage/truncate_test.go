@@ -41,6 +41,7 @@ func trHexID(n int) string { return fmt.Sprintf("%064x", n) }
 var (
 	trScidX = trHexID(0x11)
 	trScidY = trHexID(0x22)
+	trScidZ = trHexID(0x33)
 )
 
 func buildReorgChain(t *testing.T, store *BboltStore, maxH int64) {
@@ -358,6 +359,45 @@ func TestTruncateToHeight_RefresherScVarsNoHeight(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestTruncateToHeight_TELAContentDropped covers the durable TELA content cache,
+// which the sync fixture (WriteBatch) structurally cannot populate — so it needs
+// its own test. Cached bodies for affected scids (touched > H) must be dropped
+// (on-chain content above the fork may have changed), while an unaffected scid's
+// cache is left intact.
+func TestTruncateToHeight_TELAContentDropped(t *testing.T) {
+	const H = int64(3)
+	s := newTestStore(t)
+	buildReorgChain(t, s, 8) // X interacts every h>=3 (affected); Y installed at 4 (affected)
+
+	// Control Z: installed at h=1, no activity > H → not affected.
+	zb := NewWriteBatch()
+	zb.LastHeight = 8
+	installSC(zb, trScidZ, "addrZ", 1, "TELA-INDEX-1", "AppZ", "z.tela")
+	if err := s.FlushBatch(zb); err != nil {
+		t.Fatalf("flush Z: %v", err)
+	}
+
+	body := &structures.TELAContentEntry{Body: []byte("hi"), MIME: "text/html"}
+	for _, scid := range []string{trScidX, trScidY, trScidZ} {
+		if err := s.PutTELAContent(scid, "index.html", body); err != nil {
+			t.Fatalf("PutTELAContent %s: %v", scid, err)
+		}
+	}
+
+	if err := s.TruncateToHeight(H); err != nil {
+		t.Fatalf("TruncateToHeight: %v", err)
+	}
+
+	for _, scid := range []string{trScidX, trScidY} {
+		if c, _ := s.GetTELAContent(scid, "index.html"); c != nil {
+			t.Errorf("tela_content for affected %s survived truncate", scid)
+		}
+	}
+	if c, _ := s.GetTELAContent(trScidZ, "index.html"); c == nil {
+		t.Errorf("tela_content for unaffected Z was wrongly dropped")
+	}
 }
 
 // TestTruncateToHeight_Edges covers no-op and full-wipe boundaries.

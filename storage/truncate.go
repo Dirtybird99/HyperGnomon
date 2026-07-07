@@ -22,6 +22,28 @@ import (
 //	Step 2  delete height-keyed detail > h across every bucket.
 //	Step 3  drop latest-wins/derived state for scids first installed > h, lower
 //	        the scvars_latest pointers, and recompute sc_count + lastindexedheight.
+//
+// Bucket coverage — every bucket in the store's bucket list is accounted for:
+//
+//	blockhashes, installs               deleted > h (BE8 seek)
+//	height, scvars, per-SCID invokes    deleted > h (affected-scid bounded)
+//	normaltxwithscid                    deleted > h (full scan; addr-keyed)
+//	class prefix, class_scid, owners,
+//	  sccode, owner_scids               dropped for scids first installed > h
+//	tela_content                        dropped for all affected scids (cache)
+//	addr_scids                          recomputed from surviving <= h invokes
+//	scvars_latest                       lowered to the max surviving <= h
+//	stats: sc_count, lastindexedheight  decremented / pinned to h
+//	headers, tags                       inert (never written)
+//
+// KNOWN LIMITATIONS (not restored by truncate alone — see the interface doc):
+//   - stats reg/burn/normtxcount: counted-and-discarded, no per-height source →
+//     left for replay to recount.
+//   - invalidscidinvokes: a failed deploy stores scid->fees with NO height (it
+//     returns before AddInstall), so a > h invalid deploy cannot be located and
+//     is left in place; replay re-adds it idempotently if still on the new chain.
+//   - owners / class_scid re-mutated above the fork (owner transfer, class-meta
+//     bump on a <= h scid) keep their > h value pending replay.
 func (s *BboltStore) TruncateToHeight(h int64) error {
 	if h < 0 {
 		h = 0
@@ -186,6 +208,19 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 			return false
 		}); err != nil {
 			return err
+		}
+
+		// tela_content: a durable serve-cache keyed <scid>|<path>. On-chain
+		// content for an affected scid may have changed above the fork, so drop
+		// its cached bodies (they re-cache on the next serve). Bounded to affected
+		// scids (O(reorg depth)), unlike a full-bucket scrub.
+		if tc := tx.Bucket(bucketTELAContent); tc != nil {
+			for scid := range affected {
+				prefix := append([]byte(scid), '|')
+				if err := deletePrefixWhere(tc, prefix, func([]byte) bool { return true }); err != nil {
+					return err
+				}
+			}
 		}
 
 		// scvars_latest: lower each affected pointer to the max surviving (<=h)

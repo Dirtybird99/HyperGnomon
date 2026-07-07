@@ -105,11 +105,15 @@ type Storage interface {
 	// TruncateToHeight removes all index state attributable to heights > h,
 	// making the store a prefix-consistent snapshot as of h. Height-keyed detail
 	// and the reversible aggregates (interaction-height counts, addr_scids,
-	// sc_count, scvars_latest) are restored to their <=h values; latest-wins
-	// entities (owner, class-meta) mutated at <=h AND again at >h retain their
-	// >h value pending replay, and the counted-and-discarded tx-count stats
-	// (reg/burn/norm) are left for replay to recount. One atomic transaction.
-	// Intended for reorg truncate+replay (DESIGN.md §6, M2).
+	// sc_count, scvars_latest) are restored to their <=h values, and the durable
+	// tela_content cache is dropped for every affected scid. NOT restored by
+	// truncate alone (left for replay):
+	//   - owner/class-meta mutated at <=h AND again at >h keep their >h value;
+	//   - the counted-and-discarded tx-count stats (reg/burn/norm) drift until
+	//     replay recounts them;
+	//   - an invalidscidinvokes (failed-deploy) entry created >h stores no height
+	//     and is left in place (replay re-adds it idempotently if still on-chain).
+	// One atomic transaction. Intended for reorg truncate+replay (DESIGN.md §6, M2).
 	TruncateToHeight(h int64) error
 }
 
