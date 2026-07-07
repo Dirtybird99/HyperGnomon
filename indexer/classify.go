@@ -615,7 +615,10 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {
-	b := []byte(str)
+	// Read-only view over str's backing array: json.Unmarshal only reads its
+	// input, and both the RawMessage fast path and the map fallback copy out any
+	// retained bytes, so nothing aliases this view. See readOnlyBytes.
+	b := readOnlyBytes(str)
 
 	// Fast path: capture only the three fields we consume as raw JSON, letting
 	// the decoder skip the large unknown subtrees real G45 metadata carries
