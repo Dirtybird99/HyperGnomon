@@ -79,6 +79,12 @@ func (idx *Indexer) checkReorgForBlock(height int64, bl *block.Block) {
 // Keeping the policy in one function means the fetcher's reorg-check site
 // stays a single line and M2 can change the response (truncate, pause,
 // re-fetch) without touching the hot loop.
+//
+// Counter semantics: ReorgDetected counts mismatch OBSERVATIONS, not distinct
+// reorgs — the live single-block path re-fires on every tip poll while a
+// mismatch persists (which is what a real reorg looks like until M2.3
+// truncates), so one reorg can bump the counter and the warn log several
+// times. M2.3's truncate+replay is what makes both one-shot.
 func (idx *Indexer) onReorgDetected(oldTip, newTip int64) {
 	idx.ReorgDetected.Add(1)
 	logger.Warnf("reorg detected: stored tip=%d incoming tip=%d — TODO(M2): truncate+replay",

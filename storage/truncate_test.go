@@ -73,6 +73,11 @@ func buildReorgChain(t *testing.T, store *BboltStore, maxH int64) {
 			b.AddVariables(trScidX, h, []*structures.SCIDVariable{
 				{Key: "likes", Value: fmt.Sprintf("%d", h)},
 			})
+			// Ring-member touch: the pipeline (processNormalTx) records BOTH the
+			// addr→scid edge and the normal-tx detail for every ring member — with
+			// no invocation record. The paired AddAddrSCID here keeps the fixture
+			// faithful so the prefix-equivalence oracle covers that edge source.
+			b.AddAddrSCID(trAddrC, trScidX, h)
 			b.AddNormalTx(trAddrC, trHexID(0x3000+int(h)), trScidX, 7, h)
 		}
 
@@ -245,6 +250,21 @@ func TestTruncateToHeight_AddrSCIDsRecompute(t *testing.T) {
 			e.FirstHeight, e.LastHeight, e.Count)
 	}
 
+	// addrC touched scidX only as a normal-tx ring member (no invocation
+	// records). Its h=3 touch is ≤ H and must survive the recompute.
+	cx, err := s.GetAddressSCIDs(trAddrC)
+	if err != nil {
+		t.Fatalf("GetAddressSCIDs(C): %v", err)
+	}
+	ce := cx[trScidX]
+	if ce == nil {
+		t.Fatalf("addr_scids[C][X] missing after truncate (ring-member edge dropped)")
+	}
+	if ce.Count != 1 || ce.FirstHeight != 3 || ce.LastHeight != 3 {
+		t.Errorf("addr_scids[C][X] = {First:%d Last:%d Count:%d}, want {3 3 1}",
+			ce.FirstHeight, ce.LastHeight, ce.Count)
+	}
+
 	// addrB's only touch (scidY install at h=4) is > H → entry gone entirely.
 	by, err := s.GetAddressSCIDs(trAddrB)
 	if err != nil {
@@ -397,6 +417,81 @@ func TestTruncateToHeight_TELAContentDropped(t *testing.T) {
 	}
 	if c, _ := s.GetTELAContent(trScidZ, "index.html"); c == nil {
 		t.Errorf("tela_content for unaffected Z was wrongly dropped")
+	}
+}
+
+// TestTruncateToHeight_FastsyncOwnerEdgeSurvives guards the fastsync-shaped
+// addr_scids source: turbo fastsync writes owner+install+interaction+addr edge
+// with NO invocation record (fastsync.go). If such an SC later becomes affected
+// (here: a refresher scvars snapshot > H), the recompute must not destroy the
+// owner's ≤H edge just because no invocation records exist for it.
+func TestTruncateToHeight_FastsyncOwnerEdgeSurvives(t *testing.T) {
+	const H = int64(3)
+	s := newTestStore(t)
+
+	// Fastsync-style seed at h=2: no AddInvocation, no per-SCID bucket.
+	b1 := NewWriteBatch()
+	b1.LastHeight = 2
+	b1.AddOwner(trScidX, trAddrA)
+	b1.AddInteractionHeight(trScidX, 2)
+	b1.AddInstall(trScidX, 2, &structures.InstallRecord{Owner: trAddrA})
+	b1.AddAddrSCID(trAddrA, trScidX, 2)
+	if err := s.FlushBatch(b1); err != nil {
+		t.Fatalf("flush fastsync seed: %v", err)
+	}
+	// Refresher-style scvars snapshot above the fork makes scidX affected.
+	b2 := NewWriteBatch()
+	b2.LastHeight = 5
+	b2.AddVariables(trScidX, 5, []*structures.SCIDVariable{{Key: "likes", Value: "9"}})
+	if err := s.FlushBatch(b2); err != nil {
+		t.Fatalf("flush refresh: %v", err)
+	}
+
+	if err := s.TruncateToHeight(H); err != nil {
+		t.Fatalf("TruncateToHeight: %v", err)
+	}
+	ax, err := s.GetAddressSCIDs(trAddrA)
+	if err != nil {
+		t.Fatalf("GetAddressSCIDs(A): %v", err)
+	}
+	e := ax[trScidX]
+	if e == nil {
+		t.Fatalf("addr_scids[A][X] (fastsync owner edge, written at 2 <= H) destroyed by truncate")
+	}
+	if e.Count != 1 || e.FirstHeight != 2 || e.LastHeight != 2 {
+		t.Errorf("addr_scids[A][X] = {First:%d Last:%d Count:%d}, want {2 2 1}",
+			e.FirstHeight, e.LastHeight, e.Count)
+	}
+}
+
+// TestTruncateToHeight_SCCountOwnerlessInstall pins the sc_count decrement to
+// owners entries actually removed: the on-demand refresh path can write an
+// install with owner=="" and no AddOwner (indexer refreshOneSCID), which never
+// bumped sc_count on the way in — truncating it away must not decrement.
+func TestTruncateToHeight_SCCountOwnerlessInstall(t *testing.T) {
+	const N, H = int64(8), int64(3)
+	s := newTestStore(t)
+	buildReorgChain(t, s, N) // scidX owner at h=2, scidY owner at h=4 → sc_count=2
+
+	// Ownerless install above the fork (refresh-path shape: no AddOwner).
+	b := NewWriteBatch()
+	b.LastHeight = 6
+	scidW := trHexID(0x44)
+	b.AddInteractionHeight(scidW, 6)
+	b.AddInstall(scidW, 6, &structures.InstallRecord{Owner: ""})
+	if err := s.FlushBatch(b); err != nil {
+		t.Fatalf("flush ownerless install: %v", err)
+	}
+	if n, _ := s.GetSCIDCount(); n != 2 {
+		t.Fatalf("pre-truncate sc_count = %d, want 2", n)
+	}
+
+	if err := s.TruncateToHeight(H); err != nil {
+		t.Fatalf("TruncateToHeight: %v", err)
+	}
+	// Only scidY's owners entry was removed; scidW never had one.
+	if n, _ := s.GetSCIDCount(); n != 1 {
+		t.Errorf("post-truncate sc_count = %d, want 1 (scidX only)", n)
 	}
 }
 

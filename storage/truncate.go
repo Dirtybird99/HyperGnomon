@@ -89,33 +89,85 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 			}
 		}
 
-		// ---- Step 1: recompute addr_scids from surviving (<=h) invocations ----
+		// ---- Step 1: recompute addr_scids from surviving (<=h) detail ----
+		// An addr_scids entry can originate from THREE pipeline sources, and the
+		// recompute must union all of them or legitimate ≤h edges get destroyed:
+		//   (1) invocation records (install/invoke paths pair AddInvocation with
+		//       AddAddrSCID);
+		//   (2) normal-tx ring membership (processNormalTx pairs AddNormalTx with
+		//       AddAddrSCID — NO invocation record);
+		//   (3) install-owner edges with no invocation at all (turbo fastsync and
+		//       the on-demand refresh path).
 		survivors := map[addrSCIDKey]*structures.AddrSCIDEntry{}
+		// (1) invocation records of affected scids.
 		for scid := range affected {
 			invB := tx.Bucket([]byte(scid))
 			if invB == nil {
 				continue
 			}
 			if err := invB.ForEach(func(k, _ []byte) error {
-				sender, hh, ok := parseInvocationKey(k)
-				if !ok || hh > h {
-					return nil
-				}
-				key := addrSCIDKey{addr: sender, scid: scid}
-				if e := survivors[key]; e != nil {
-					if hh < e.FirstHeight {
-						e.FirstHeight = hh
-					}
-					if hh > e.LastHeight {
-						e.LastHeight = hh
-					}
-					e.Count++
-				} else {
-					survivors[key] = &structures.AddrSCIDEntry{FirstHeight: hh, LastHeight: hh, Count: 1}
+				if sender, hh, ok := parseInvocationKey(k); ok && hh <= h {
+					mergeAddrTouch(survivors, sender, scid, hh)
 				}
 				return nil
 			}); err != nil {
 				return err
+			}
+		}
+		// (2) surviving normal-tx records of affected scids. Folded into the SAME
+		// single pass that collects the > h keys Step 2 deletes, so the bucket is
+		// full-scanned once, not twice; the affected lookup stays allocation-free
+		// (map access via string(bytes) doesn't materialize) so unaffected keys
+		// cost nothing extra.
+		var normTxToDel [][]byte
+		if nb := tx.Bucket(bucketNormTx); nb != nil {
+			if err := nb.ForEach(func(k, _ []byte) error {
+				if normTxHeight(k) > h {
+					normTxToDel = append(normTxToDel, cloneKey(k))
+					return nil
+				}
+				if addr, scid, hh, ok := splitNormTxKey(k); ok && hh <= h {
+					if _, aff := affected[string(scid)]; aff {
+						mergeAddrTouch(survivors, string(addr), string(scid), hh)
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		// (3) surviving installs of affected scids: fastsync/refresh write the
+		// owner edge without any invocation record. Added only when (1)+(2) left
+		// nothing for (owner, scid), so pipeline installs — whose install
+		// invocation already contributed — are not double-counted. Best-effort:
+		// a fastsync edge later re-touched by real invocations recomputes from
+		// those invocations alone (fastsync state is not fresh-sync-identical
+		// anyway, see the class InstallHeight caveat on the interface).
+		if ib := tx.Bucket(bucketInstalls); ib != nil {
+			stop := encHeight(h + 1)
+			c := ib.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				if len(k) < 9 || k[8] != '|' { // not a <BE8 h>|<scid> key
+					continue
+				}
+				if bytes.Compare(k[:8], stop) >= 0 {
+					break // BE8-prefixed keys are height-sorted; rest are > h
+				}
+				// affected lookup before materializing the scid string — the
+				// string(bytes) map access doesn't allocate, so the ≤h walk is
+				// free for unaffected scids.
+				if _, aff := affected[string(k[9:])]; !aff {
+					continue
+				}
+				rec, err := decodeInstallRecord(v)
+				if err != nil || rec == nil || rec.Owner == "" {
+					continue
+				}
+				scid := string(k[9:])
+				key := addrSCIDKey{addr: rec.Owner, scid: scid}
+				if survivors[key] == nil {
+					mergeAddrTouch(survivors, rec.Owner, scid, decHeight(k[:8]))
+				}
 			}
 		}
 		if err := applyAddrSCIDRollback(tx, affected, survivors); err != nil {
@@ -163,12 +215,15 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 			}
 		}
 
-		// normaltxwithscid (addr-prefixed) + class prefix (class-prefixed): the
-		// height is embedded mid-key, so full-scan on the decoded height.
-		if err := deleteWhere(tx.Bucket(bucketNormTx), func(k []byte) bool {
-			return normTxHeight(k) > h
-		}); err != nil {
-			return err
+		// normaltxwithscid: the height is embedded mid-key, so it needs a full
+		// scan on the decoded height — already done in Step 1(2), which collected
+		// the > h keys; just delete them here.
+		if nb := tx.Bucket(bucketNormTx); nb != nil {
+			for _, k := range normTxToDel {
+				if err := nb.Delete(k); err != nil {
+					return err
+				}
+			}
 		}
 
 		// ---- Step 3: latest-wins / derived + aggregate stats ----
@@ -179,9 +234,16 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		// an installed-above scid (re-classification never raises InstallHeight).
 		classPrefix := tx.Bucket(bucketClass)
 		classIdx := tx.Bucket(bucketClassIdx)
+		ownersB := tx.Bucket(bucketOwners)
 		scidKeyedBuckets := [][]byte{bucketOwners, bucketClassIdx, bucketSCCode, bucketInvalid}
+		var ownersDeleted int64
 		for scid := range installedAbove {
 			key := []byte(scid)
+			// The refresh path can install with owner=="" and no owners entry, so
+			// count what the owners bucket actually loses for the sc_count fixup.
+			if ownersB != nil && ownersB.Get(key) != nil {
+				ownersDeleted++
+			}
 			if classPrefix != nil && classIdx != nil {
 				if v := classIdx.Get(key); v != nil {
 					if meta, err := decodeClassMeta(v); err == nil && meta != nil {
@@ -229,6 +291,9 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		latest := tx.Bucket(bucketScVarsLatest)
 		vb := tx.Bucket(bucketScVars)
 		for scid := range affected {
+			if latest == nil {
+				break
+			}
 			maxH := maxSurvivingScVarsHeight(vb, scid, h)
 			if maxH == 0 {
 				if err := latest.Delete([]byte(scid)); err != nil {
@@ -247,9 +312,13 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		// lastindexedheight to h; leave the counted-and-discarded tx-count stats
 		// (reg/burn/norm) for replay to recount.
 		stats := tx.Bucket(bucketStats)
-		// sc_count: the owners bucket lost exactly len(installedAbove) entries,
-		// so decrement the stored count rather than rescan the whole bucket.
-		if n := int64(len(installedAbove)); n > 0 {
+		if stats == nil {
+			return nil
+		}
+		// sc_count: decrement by the owners entries actually removed (NOT by
+		// len(installedAbove) — ownerless refresh-path installs never bumped the
+		// count on the way in) rather than rescan the whole bucket.
+		if n := ownersDeleted; n > 0 {
 			if v := stats.Get([]byte("sc_count")); v != nil {
 				if cur, err := strconv.ParseInt(string(v), 10, 64); err == nil {
 					nv := cur - n
@@ -481,4 +550,40 @@ func normTxHeight(k []byte) int64 {
 		return 0
 	}
 	return decHeight(k[i1+1 : i1+9])
+}
+
+// splitNormTxKey fully parses a "<addr>:<BE8 h>:<txid>:<scid>" key. The scid is
+// located from the RIGHT (a ':' byte can legitimately occur inside the BE8
+// height) and validated as a 64-char tail. The briefly-used scid-less composite
+// form and legacy whole-addr blobs return ok=false — they cannot be attributed
+// to a scid, matching normTxHeight's legacy tolerance. addr/scid are returned
+// as sub-slices of k (no allocation); callers copy only when they keep them.
+func splitNormTxKey(k []byte) (addr, scid []byte, height int64, ok bool) {
+	sep := bytes.IndexByte(k, ':')
+	if sep < 0 || len(k) <= sep+9 || k[sep+9] != ':' {
+		return nil, nil, 0, false
+	}
+	last := bytes.LastIndexByte(k, ':')
+	if last < sep+10 || len(k)-last-1 != 64 {
+		return nil, nil, 0, false
+	}
+	return k[:sep], k[last+1:], decHeight(k[sep+1 : sep+9]), true
+}
+
+// mergeAddrTouch folds one (addr, scid, height) interaction into the survivors
+// map with the same min/max/sum semantics FlushBatch uses to merge addr_scids
+// entries, so a recomputed entry is byte-identical to a fresh-sync one.
+func mergeAddrTouch(survivors map[addrSCIDKey]*structures.AddrSCIDEntry, addr, scid string, hh int64) {
+	key := addrSCIDKey{addr: addr, scid: scid}
+	if e := survivors[key]; e != nil {
+		if hh < e.FirstHeight {
+			e.FirstHeight = hh
+		}
+		if hh > e.LastHeight {
+			e.LastHeight = hh
+		}
+		e.Count++
+		return
+	}
+	survivors[key] = &structures.AddrSCIDEntry{FirstHeight: hh, LastHeight: hh, Count: 1}
 }
