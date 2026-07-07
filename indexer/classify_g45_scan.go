@@ -95,8 +95,15 @@ const (
 // storing them in SCClass, so a few-byte Name cannot pin an arbitrarily large
 // (potentially hostile) blob inside long-lived ClassMeta holders (eventbus
 // queues, the classify seed cache). Real mainnet corpus blobs top out under
-// 2KB, so the clone never fires on the benchmark path; retention per ClassMeta
-// is capped at this many bytes.
+// 2KB, so the clone never fires on the benchmark path.
+//
+// The guard measures len(str) — the cap therefore holds only when str's
+// backing array IS the blob, which is true for every retained-classification
+// path today (all decode vars from RPC JSON, where each string value gets its
+// own allocation). A future caller classifying storage-typed-decoded vars
+// (whose strings are views of ONE coalesced per-SC buffer, see
+// structures.UnmarshalSCIDVariablesTyped/ownedCut) into a retained ClassMeta
+// would need to cap on the backing array instead.
 const g45CloneThreshold = 4096
 
 // g45MaxDepth caps nesting the scanner will validate. It sits far below

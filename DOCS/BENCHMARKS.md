@@ -182,11 +182,15 @@ The opted-out speculative path is deliberately short-circuited — subscribers w
 ### Classifier rule walk
 
 ```
-BenchmarkClassifySC_TELAIndex   2.1 µs/op    5 allocs   (middle-of-table hit)
-BenchmarkClassifySC_TELADoc     5.1 µs/op    5 allocs
-BenchmarkClassifySC_G45NFA      550 ns/op    5 allocs   (first-rule hit)
-BenchmarkClassifySC_Miss        14.1 µs/op   4 allocs   (full-table walk + fallback)
+BenchmarkClassifySC_TELAIndex   3.0 µs/op    3 allocs / 64 B   (middle-of-table hit)
+BenchmarkClassifySC_TELADoc     5.3 µs/op    3 allocs / 64 B
+BenchmarkClassifySC_G45NFA      400 ns/op    3 allocs / 64 B   (first-rule hit)
+BenchmarkClassifySC_Miss        18.5 µs/op   3 allocs / 64 B   (full-table walk + fallback)
 ```
+
+(Re-measured July 2026 after the shared per-class Tags slices change — the
+former 4-5 allocs included a per-call Tags `make`+`append` that classification
+now avoids entirely.)
 
 `ClassifySC` runs once per new SC install; a 14 µs worst-case is invisible in scan wall-clock. This bench exists as a regression guard — if the rule table ever grows to 50+ rules or a rule's pattern becomes expensive, the Miss bench is first to show it.
 

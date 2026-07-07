@@ -222,7 +222,7 @@ Every number below has a reproducible harness. Hardware, date, daemon endpoint, 
 | `WorkItem_Pool` vs `New` | 2,300 ns / 5.7 KB | 18 ns / 0 B | **127×** |
 | `FlushBatch_100` vs individual writes | 88 µs/record | 6.1 µs/record | **14×** |
 | `FlushBatch` vs 100k-interaction history (heights) | 5,684 µs (blob layout) | 118 µs (composite keys) | **48×, flat in history size** |
-| `ClassifyCorpus/Full` — 45,589 real mainnet G45 SCs, golden-gated (July 2026) | 1,970,788 allocs / 79.3 MB | 415 allocs / 34 KB | **−99.98% allocs** |
+| `ClassifyCorpus/Full` — 45,589 real mainnet G45 SCs, golden-gated (July 2026) | 1,970,788 allocs / 79.3 MB | 415 allocs / 34 KB | **4,749× fewer allocs** |
 
 Full table with reproduction command, hardware, and methodology: [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
 
