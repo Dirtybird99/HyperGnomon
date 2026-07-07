@@ -36,6 +36,12 @@ type classRule struct {
 	pattern string // substring to look for in SC code
 	class   string
 	tag     string
+	// tags is the precomputed, shared ClassMeta.Tags slice for this rule's
+	// class — ["all", tag] with len==cap. Populated once in init() so the
+	// classify hot paths alias it instead of allocating per call. len==cap
+	// makes any caller append reallocate (copy-on-append safety); see the
+	// anti-alias gate in classify_tags_alias_test.go.
+	tags []string
 }
 
 // rules are evaluated in order; first match wins. Rule ordering matters when
@@ -89,25 +95,50 @@ var rules = []classRule{
 	{pattern: "crowd_mining", class: "EPOCH", tag: "epoch"},
 }
 
-// tagsForClass returns the ClassMeta.Tags slice for a given class name.
+// Precomputed, shared Tags slices returned by classification. Each is a slice
+// literal (guaranteed len==cap), so any caller append reallocates rather than
+// writing into the shared backing array. The specials cover the well-known
+// SCIDs and the DERO-ASSET fallback; tagsAll is the bare universal-filter tag
+// returned for UNKNOWN. Per-rule class tags live on classRule.tags (built in
+// init). These arrays are never mutated in place — see the audit note on
+// classRule.tags and the anti-alias gate in classify_tags_alias_test.go.
+var (
+	tagsAll         = []string{"all"}
+	tagsNameservice = []string{"all", "nameservice"}
+	tagsGnomon      = []string{"all", "gnomon"}
+	tagsAsset       = []string{"all", "asset"}
+)
+
+// init builds the per-rule shared Tags slice once, mirroring the historic
+// []string{"all", r.tag}. Package-var initialization (including rules) is
+// guaranteed complete before init runs.
+func init() {
+	for i := range rules {
+		rules[i].tags = []string{"all", rules[i].tag}
+	}
+}
+
+// tagsForClass returns the shared ClassMeta.Tags slice for a given class name.
 // Mirrors the rules table so the fastsync probe can label SCIDs without
 // re-running the full pattern match when it already knows the class.
 // Always includes "all" as the first tag for the universal-filter convention.
+// The returned slice is shared and immutable (len==cap); callers must not
+// mutate elements in place — append is safe (it reallocates).
 func tagsForClass(class string) []string {
-	for _, r := range rules {
-		if r.class == class {
-			return []string{"all", r.tag}
+	for i := range rules {
+		if rules[i].class == class {
+			return rules[i].tags
 		}
 	}
 	switch class {
 	case "NAMESERVICE":
-		return []string{"all", "nameservice"}
+		return tagsNameservice
 	case "GNOMONSC":
-		return []string{"all", "gnomon"}
+		return tagsGnomon
 	case "DERO-ASSET":
-		return []string{"all", "asset"}
+		return tagsAsset
 	}
-	return []string{"all"}
+	return tagsAll
 }
 
 // classifyDEROAsset is a last-resort fallback that recognizes pre-G45 token
@@ -123,33 +154,32 @@ func classifyDEROAsset(code string) bool {
 // SCID, code, and stored variables. Every returned SCClass includes the "all"
 // tag so callers can use it as a universal filter.
 func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
-	// Tags presized to cap 2 so the single tag append on every matched /
-	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
-	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
-	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
-	sc := SCClass{Class: "UNKNOWN"}
-	sc.Tags = make([]string, 1, 2)
-	sc.Tags[0] = "all"
+	// Tags alias precomputed, shared, len==cap slices instead of being built
+	// per call: UNKNOWN keeps the bare ["all"]; each matched / well-known-SCID
+	// path assigns its 2-tag slice (value/len/order identical to the old
+	// make+append). Zero Tags allocation per classification; append-safe
+	// because len==cap.
+	sc := SCClass{Class: "UNKNOWN", Tags: tagsAll}
 
 	// 1. Well-known SCIDs take priority over code inspection.
 	switch scid {
 	case structures.NameServiceSCID:
 		sc.Class = "NAMESERVICE"
-		sc.Tags = append(sc.Tags, "nameservice")
+		sc.Tags = tagsNameservice
 		extractHeaders(&sc, vars)
 		return sc
 	case structures.GnomonSCID_Mainnet, structures.GnomonSCID_Testnet:
 		sc.Class = "GNOMONSC"
-		sc.Tags = append(sc.Tags, "gnomon")
+		sc.Tags = tagsGnomon
 		extractHeaders(&sc, vars)
 		return sc
 	}
 
 	// 2. Pattern-match against SC code (first match wins).
-	for _, r := range rules {
-		if strings.Contains(code, r.pattern) {
-			sc.Class = r.class
-			sc.Tags = append(sc.Tags, r.tag)
+	for i := range rules {
+		if strings.Contains(code, rules[i].pattern) {
+			sc.Class = rules[i].class
+			sc.Tags = rules[i].tags
 			break
 		}
 	}
@@ -158,7 +188,7 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 	// rule matched above.
 	if sc.Class == "UNKNOWN" && code != "" && classifyDEROAsset(code) {
 		sc.Class = "DERO-ASSET"
-		sc.Tags = append(sc.Tags, "asset")
+		sc.Tags = tagsAsset
 	}
 
 	// 4. Extract human-readable headers from variables.
@@ -179,37 +209,34 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 // already hold parsed SC variables as a slice. It mirrors ClassifySC without
 // first materializing a map.
 func ClassifySCVars(scid string, code string, vars []*structures.SCIDVariable) SCClass {
-	// Tags presized to cap 2 so the single tag append on every matched /
-	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
-	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
-	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
-	sc := SCClass{Class: "UNKNOWN"}
-	sc.Tags = make([]string, 1, 2)
-	sc.Tags[0] = "all"
+	// Tags alias precomputed, shared, len==cap slices instead of being built
+	// per call — identical value/len/order to the old make+append, zero Tags
+	// allocation, append-safe because len==cap. See ClassifySC.
+	sc := SCClass{Class: "UNKNOWN", Tags: tagsAll}
 
 	switch scid {
 	case structures.NameServiceSCID:
 		sc.Class = "NAMESERVICE"
-		sc.Tags = append(sc.Tags, "nameservice")
+		sc.Tags = tagsNameservice
 		extractClassVars(&sc, vars)
 		return sc
 	case structures.GnomonSCID_Mainnet, structures.GnomonSCID_Testnet:
 		sc.Class = "GNOMONSC"
-		sc.Tags = append(sc.Tags, "gnomon")
+		sc.Tags = tagsGnomon
 		extractClassVars(&sc, vars)
 		return sc
 	}
 
-	for _, r := range rules {
-		if strings.Contains(code, r.pattern) {
-			sc.Class = r.class
-			sc.Tags = append(sc.Tags, r.tag)
+	for i := range rules {
+		if strings.Contains(code, rules[i].pattern) {
+			sc.Class = rules[i].class
+			sc.Tags = rules[i].tags
 			break
 		}
 	}
 	if sc.Class == "UNKNOWN" && code != "" && classifyDEROAsset(code) {
 		sc.Class = "DERO-ASSET"
-		sc.Tags = append(sc.Tags, "asset")
+		sc.Tags = tagsAsset
 	}
 	extractClassVars(&sc, vars)
 	return sc
