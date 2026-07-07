@@ -1290,7 +1290,28 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 // extracts the class-gated fields from the fresh vars in one pass (same shape
 // as the fastsync + tela_refresher refreshes).
 func (idx *Indexer) refreshClassMetaOnInvoke(scid string, height int64, scVars []*structures.SCIDVariable, batch *storage.WriteBatch) {
-	existingMeta, _ := idx.Store.GetSCIDClass(scid)
+	// The authoritative prior meta may still be PENDING in this very batch —
+	// install + invoke of the same SC inside one flush window is the normal
+	// pattern during catch-up sync. batch.Classes must win over the flushed
+	// store: a store miss here would route to the code-less fallback, whose
+	// UNKNOWN record overwrites the pending install-time AddClass (last
+	// AddClass wins per scid), and the stored-class seeding would then
+	// re-store UNKNOWN on every later invoke, permanently.
+	existingMeta := batch.Classes[scid]
+	if existingMeta == nil {
+		stored, err := idx.Store.GetSCIDClass(scid)
+		if err != nil {
+			// A failed read must not degrade the stored class (the code-less
+			// fallback can only yield UNKNOWN, and that sticks). Skip this
+			// refresh; the next invoke retries. A missing record is
+			// (nil, nil), not an error, so the fresh-SC path is unaffected.
+			return
+		}
+		existingMeta = stored
+	}
+	// Note: if a FUTURE binary stored a class this binary's tagsForClass does
+	// not know, the refresh keeps the Class string but resets Tags to ["all"]
+	// (version-skew only; every class this binary can produce is covered).
 	var sc SCClass
 	installH := height
 	if existingMeta != nil {

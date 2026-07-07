@@ -114,8 +114,67 @@ func TestInvokeRefreshG45KeepsClassAndMetadata(t *testing.T) {
 	if got.Class != "G45-NFT" {
 		t.Fatalf("invoke refresh degraded Class: got %q, want G45-NFT", got.Class)
 	}
+	if len(got.Tags) != 2 || got.Tags[0] != "all" || got.Tags[1] != "g45" {
+		// The g45 tag also gates metadata-blob extraction, so degradation
+		// here silently disables Name/Desc fills too.
+		t.Fatalf("invoke refresh degraded Tags: got %v, want [all g45]", got.Tags)
+	}
 	if got.Name != "Duck #1" {
 		t.Fatalf("refresh lost metadata name: got %q", got.Name)
+	}
+	if got.InstallHeight != 50 || got.LastHeight != 60 {
+		t.Fatalf("heights: InstallHeight=%d LastHeight=%d, want 50/60", got.InstallHeight, got.LastHeight)
+	}
+}
+
+// TestInvokeRefreshSameBatchInstall pins the same-flush-window case surfaced
+// by adversarial review: an SC installed AND invoked inside one batch. The
+// install's correct AddClass is still pending (not flushed), so the refresh
+// must read it from batch.Classes — a store-only lookup would miss, classify
+// code-less as UNKNOWN, and overwrite the pending install-time record; the
+// stored-class seeding would then re-store UNKNOWN on every later invoke.
+func TestInvokeRefreshSameBatchInstall(t *testing.T) {
+	store, err := storage.NewBboltStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer store.Close()
+	idx := &Indexer{Store: store}
+
+	const scid = "dd04000000000000000000000000000000000000000000000000000000000004"
+
+	// One batch: install-time classification queued, then an invoke of the
+	// same SC before any flush.
+	batch := storage.NewWriteBatch()
+	batch.AddClass(scid, &structures.ClassMeta{
+		Class: "TELA-INDEX-1", Tags: []string{"all", "tela"},
+		Name: "MyApp", DURL: "myapp.tela", Version: "1.0.0",
+		InstallHeight: 100, LastHeight: 100,
+	})
+	idx.refreshClassMetaOnInvoke(scid, 105, []*structures.SCIDVariable{
+		strVar("var_header_name", "MyApp"),
+		strVar("dURL", "myapp.tela"),
+		strVar("telaVersion", "1.0.1"),
+	}, batch)
+	if err := store.FlushBatch(batch); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	got, err := store.GetSCIDClass(scid)
+	if err != nil || got == nil {
+		t.Fatalf("GetSCIDClass: meta=%v err=%v", got, err)
+	}
+	if got.Class != "TELA-INDEX-1" {
+		t.Fatalf("same-batch invoke clobbered pending install class: got %q, want TELA-INDEX-1", got.Class)
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "all" || got.Tags[1] != "tela" {
+		t.Fatalf("same-batch invoke degraded Tags: got %v, want [all tela]", got.Tags)
+	}
+	if got.Version != "1.0.1" {
+		t.Fatalf("refresh missed the version bump: got %q, want 1.0.1", got.Version)
+	}
+	if got.InstallHeight != 100 || got.LastHeight != 105 {
+		t.Fatalf("heights: InstallHeight=%d LastHeight=%d, want 100/105", got.InstallHeight, got.LastHeight)
 	}
 }
 
