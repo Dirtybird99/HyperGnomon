@@ -588,25 +588,90 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {
+	b := []byte(str)
+
+	// Fast path: capture only the three fields we consume as raw JSON, letting
+	// the decoder skip the large unknown subtrees real G45 metadata carries
+	// ("attributes" objects, "id", "image") without materializing them into a
+	// map[string]interface{}. RawMessage (vs a *string struct) is deliberate:
+	// it distinguishes an absent key (nil) from a present JSON null ("null",
+	// which the original path renders as "<nil>"), so the fast path fires even
+	// for the common name-only metadata instead of always deferring to the map.
+	var fast struct {
+		Name        json.RawMessage `json:"name"`
+		Description json.RawMessage `json:"description"`
+		Icon        json.RawMessage `json:"icon"`
+	}
+	if json.Unmarshal(b, &fast) == nil {
+		n, okN := g45FieldValue(sc.Name, fast.Name)
+		d, okD := g45FieldValue(sc.Desc, fast.Description)
+		i, okI := g45FieldValue(sc.IconURL, fast.Icon)
+		if okN && okD && okI {
+			if sc.Name == "" {
+				sc.Name = n
+			}
+			if sc.Desc == "" {
+				sc.Desc = d
+			}
+			if sc.IconURL == "" {
+				sc.IconURL = i
+			}
+			return
+		}
+	}
+
+	// Exact fallback: reproduce the original map-based rendering byte-for-byte
+	// for numeric/bool/array/object values of name/description/icon. varString
+	// renders every JSON-decoded type identically to fmt.Sprintf("%v", …):
+	// string and float64 via its typed branches (float uses 'g'/-1/64, exactly
+	// what %v produces), every other type through the same fmt default.
 	var meta map[string]interface{}
-	if err := json.Unmarshal([]byte(str), &meta); err != nil {
+	if err := json.Unmarshal(b, &meta); err != nil {
 		return
 	}
 	if sc.Name == "" {
 		if v, ok := meta["name"]; ok {
-			sc.Name = fmt.Sprintf("%v", v)
+			sc.Name = varString(v)
 		}
 	}
 	if sc.Desc == "" {
 		if v, ok := meta["description"]; ok {
-			sc.Desc = fmt.Sprintf("%v", v)
+			sc.Desc = varString(v)
 		}
 	}
 	if sc.IconURL == "" {
 		if v, ok := meta["icon"]; ok {
-			sc.IconURL = fmt.Sprintf("%v", v)
+			sc.IconURL = varString(v)
 		}
 	}
+}
+
+// g45FieldValue reports the string the original map path would assign for a
+// captured metadata value, and whether the fast path can render it exactly.
+// The returned string is only consumed when cur == "" (the field is still
+// unfilled); callers must apply the same empty-guard. Non-string, non-null
+// composites (number/bool/array/object) return ok=false so the caller defers
+// to the exact map-based fallback rather than re-implementing fmt rendering.
+func g45FieldValue(cur string, raw json.RawMessage) (string, bool) {
+	if cur != "" {
+		return "", true // header already won; value unused, map path skips too
+	}
+	if raw == nil {
+		return "", true // key absent: fill nothing (empty is a no-op)
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", false
+		}
+		return s, true
+	case 'n':
+		if string(raw) == "null" {
+			return "<nil>", true // matches fmt.Sprintf("%v", nil)
+		}
+	}
+	return "", false
 }
 
 func lookupVar(vars []*structures.SCIDVariable, key string) (interface{}, bool) {
