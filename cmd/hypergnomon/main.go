@@ -60,7 +60,7 @@ func main() {
 	apiAddress := flag.String("api-address", "127.0.0.1:8082", "HTTP API listen address")
 	wsAddress := flag.String("ws-address", "127.0.0.1:9190", "WebSocket server address")
 	telaCacheMB := flag.Int64("tela-cache-mb", 128, "TELA content in-memory cache cap (MB)")
-	telaVerifySigs := flag.Bool("tela-verify-sigs", false, "Enable X-TELA-Verify response header on /tela/... endpoints (v1.0 reports signature presence only; cryptographic verification ships in v1.1)")
+	telaVerifySigs := flag.Bool("tela-verify-sigs", false, "Enable X-TELA-Verify response header on /tela/... endpoints (v1.0 reports signature presence only; cryptographic verification ships in v1.2)")
 	// --persist-install-code: which SC classes get their install-time code
 	// persisted to the sccode bucket. "tela" (default) persists only
 	// TELA-INDEX-1 / TELA-DOC-1 / TELA-MOD-1 — the classes whose content

@@ -1276,20 +1276,58 @@ func (idx *Indexer) handleInvokeSC(scid, sender, entrypoint string, height int64
 	// Route B: refresh class metadata (TELA apps bump version via STORE) and
 	// record addr→scid edge.
 	if len(scVars) > 0 {
-		sc := ClassifySCVars(scid, "", scVars)
-		// Preserve InstallHeight if we have prior meta; this is a refresh.
-		existingMeta, _ := idx.Store.GetSCIDClass(scid)
-		installH := height
-		if existingMeta != nil {
-			installH = existingMeta.InstallHeight
-		}
-		batch.AddClass(scid, &structures.ClassMeta{
-			Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
-			DURL: sc.DURL, Version: sc.Version,
-			InstallHeight: installH, LastHeight: height,
-		})
+		idx.refreshClassMetaOnInvoke(scid, height, scVars, batch)
 	}
 	batch.AddAddrSCID(sender, scid, height)
+}
+
+// refreshClassMetaOnInvoke rebuilds the stored ClassMeta from a fresh
+// post-invoke variable snapshot, seeding the refresh with the STORED class: an
+// invoke carries no SC code, so ClassifySCVars(scid, "", …) can only ever
+// yield UNKNOWN — which used to overwrite the install-time Class/Tags and
+// drop the class-gated fields (Version etc.) on every invoke, i.e. on every
+// normal TELA update. ClassifySCVarsWithClass re-applies the known class and
+// extracts the class-gated fields from the fresh vars in one pass (same shape
+// as the fastsync + tela_refresher refreshes).
+func (idx *Indexer) refreshClassMetaOnInvoke(scid string, height int64, scVars []*structures.SCIDVariable, batch *storage.WriteBatch) {
+	// The authoritative prior meta may still be PENDING in this very batch —
+	// install + invoke of the same SC inside one flush window is the normal
+	// pattern during catch-up sync. batch.Classes must win over the flushed
+	// store: a store miss here would route to the code-less fallback, whose
+	// UNKNOWN record overwrites the pending install-time AddClass (last
+	// AddClass wins per scid), and the stored-class seeding would then
+	// re-store UNKNOWN on every later invoke, permanently.
+	existingMeta := batch.Classes[scid]
+	if existingMeta == nil {
+		stored, err := idx.Store.GetSCIDClass(scid)
+		if err != nil {
+			// A failed read must not degrade the stored class (the code-less
+			// fallback can only yield UNKNOWN, and that sticks). Skip this
+			// refresh; the next invoke retries. A missing record is
+			// (nil, nil), not an error, so the fresh-SC path is unaffected.
+			return
+		}
+		existingMeta = stored
+	}
+	// Note: if a FUTURE binary stored a class this binary's tagsForClass does
+	// not know, the refresh keeps the Class string but resets Tags to ["all"]
+	// (version-skew only; every class this binary can produce is covered).
+	var sc SCClass
+	installH := height
+	if existingMeta != nil {
+		// Preserve InstallHeight; this is a refresh.
+		installH = existingMeta.InstallHeight
+		sc = ClassifySCVarsWithClass(scid, existingMeta.Class, scVars)
+	} else {
+		// No prior meta (invoke seen before its install, or install not
+		// indexed): classify code-less as before.
+		sc = ClassifySCVars(scid, "", scVars)
+	}
+	batch.AddClass(scid, &structures.ClassMeta{
+		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
+		DURL: sc.DURL, Version: sc.Version,
+		InstallHeight: installH, LastHeight: height,
+	})
 }
 
 // processNormalTx handles a normal transaction with SCID payload.

@@ -10,9 +10,14 @@ import (
 )
 
 // SCClass represents a classified smart contract type.
+//
+// Tags aliases a shared, package-global slice (len == cap): callers MUST NOT
+// mutate its elements in place or reorder it — doing so corrupts the tag set
+// for every subsequent classification process-wide. Appending is safe (len ==
+// cap forces a reallocation); to modify, copy first (slices.Clone).
 type SCClass struct {
 	Class   string   // e.g. "G45-NFT", "TELA-DOC-1", "NFA", "NAMESERVICE", "UNKNOWN"
-	Tags    []string // e.g. ["g45", "nfa", "tela", "all"]
+	Tags    []string // shared read-only slice, e.g. ["all", "g45"] — see struct doc
 	Name    string   // from SC variables if available
 	Desc    string   // from SC variables if available
 	IconURL string   // from SC variables if available
@@ -36,6 +41,12 @@ type classRule struct {
 	pattern string // substring to look for in SC code
 	class   string
 	tag     string
+	// tags is the precomputed, shared ClassMeta.Tags slice for this rule's
+	// class — ["all", tag] with len==cap. Populated once in init() so the
+	// classify hot paths alias it instead of allocating per call. len==cap
+	// makes any caller append reallocate (copy-on-append safety); see the
+	// anti-alias gate in classify_tags_alias_test.go.
+	tags []string
 }
 
 // rules are evaluated in order; first match wins. Rule ordering matters when
@@ -89,25 +100,50 @@ var rules = []classRule{
 	{pattern: "crowd_mining", class: "EPOCH", tag: "epoch"},
 }
 
-// tagsForClass returns the ClassMeta.Tags slice for a given class name.
+// Precomputed, shared Tags slices returned by classification. Each is a slice
+// literal (guaranteed len==cap), so any caller append reallocates rather than
+// writing into the shared backing array. The specials cover the well-known
+// SCIDs and the DERO-ASSET fallback; tagsAll is the bare universal-filter tag
+// returned for UNKNOWN. Per-rule class tags live on classRule.tags (built in
+// init). These arrays are never mutated in place — see the audit note on
+// classRule.tags and the anti-alias gate in classify_tags_alias_test.go.
+var (
+	tagsAll         = []string{"all"}
+	tagsNameservice = []string{"all", "nameservice"}
+	tagsGnomon      = []string{"all", "gnomon"}
+	tagsAsset       = []string{"all", "asset"}
+)
+
+// init builds the per-rule shared Tags slice once, mirroring the historic
+// []string{"all", r.tag}. Package-var initialization (including rules) is
+// guaranteed complete before init runs.
+func init() {
+	for i := range rules {
+		rules[i].tags = []string{"all", rules[i].tag}
+	}
+}
+
+// tagsForClass returns the shared ClassMeta.Tags slice for a given class name.
 // Mirrors the rules table so the fastsync probe can label SCIDs without
 // re-running the full pattern match when it already knows the class.
 // Always includes "all" as the first tag for the universal-filter convention.
+// The returned slice is shared and immutable (len==cap); callers must not
+// mutate elements in place — append is safe (it reallocates).
 func tagsForClass(class string) []string {
-	for _, r := range rules {
-		if r.class == class {
-			return []string{"all", r.tag}
+	for i := range rules {
+		if rules[i].class == class {
+			return rules[i].tags
 		}
 	}
 	switch class {
 	case "NAMESERVICE":
-		return []string{"all", "nameservice"}
+		return tagsNameservice
 	case "GNOMONSC":
-		return []string{"all", "gnomon"}
+		return tagsGnomon
 	case "DERO-ASSET":
-		return []string{"all", "asset"}
+		return tagsAsset
 	}
-	return []string{"all"}
+	return tagsAll
 }
 
 // classifyDEROAsset is a last-resort fallback that recognizes pre-G45 token
@@ -122,34 +158,36 @@ func classifyDEROAsset(code string) bool {
 // ClassifySC determines the class and tags of a smart contract based on its
 // SCID, code, and stored variables. Every returned SCClass includes the "all"
 // tag so callers can use it as a universal filter.
+//
+// The returned Tags slice is shared and read-only — never mutate it in place;
+// see the SCClass doc.
 func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
-	// Tags presized to cap 2 so the single tag append on every matched /
-	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
-	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
-	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
-	sc := SCClass{Class: "UNKNOWN"}
-	sc.Tags = make([]string, 1, 2)
-	sc.Tags[0] = "all"
+	// Tags alias precomputed, shared, len==cap slices instead of being built
+	// per call: UNKNOWN keeps the bare ["all"]; each matched / well-known-SCID
+	// path assigns its 2-tag slice (value/len/order identical to the old
+	// make+append). Zero Tags allocation per classification; append-safe
+	// because len==cap.
+	sc := SCClass{Class: "UNKNOWN", Tags: tagsAll}
 
 	// 1. Well-known SCIDs take priority over code inspection.
 	switch scid {
 	case structures.NameServiceSCID:
 		sc.Class = "NAMESERVICE"
-		sc.Tags = append(sc.Tags, "nameservice")
+		sc.Tags = tagsNameservice
 		extractHeaders(&sc, vars)
 		return sc
 	case structures.GnomonSCID_Mainnet, structures.GnomonSCID_Testnet:
 		sc.Class = "GNOMONSC"
-		sc.Tags = append(sc.Tags, "gnomon")
+		sc.Tags = tagsGnomon
 		extractHeaders(&sc, vars)
 		return sc
 	}
 
 	// 2. Pattern-match against SC code (first match wins).
-	for _, r := range rules {
-		if strings.Contains(code, r.pattern) {
-			sc.Class = r.class
-			sc.Tags = append(sc.Tags, r.tag)
+	for i := range rules {
+		if strings.Contains(code, rules[i].pattern) {
+			sc.Class = rules[i].class
+			sc.Tags = rules[i].tags
 			break
 		}
 	}
@@ -158,7 +196,7 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 	// rule matched above.
 	if sc.Class == "UNKNOWN" && code != "" && classifyDEROAsset(code) {
 		sc.Class = "DERO-ASSET"
-		sc.Tags = append(sc.Tags, "asset")
+		sc.Tags = tagsAsset
 	}
 
 	// 4. Extract human-readable headers from variables.
@@ -178,38 +216,38 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 // ClassifySCVars is the allocation-light variant for indexer hot paths that
 // already hold parsed SC variables as a slice. It mirrors ClassifySC without
 // first materializing a map.
+//
+// The returned Tags slice is shared and read-only — never mutate it in place;
+// see the SCClass doc.
 func ClassifySCVars(scid string, code string, vars []*structures.SCIDVariable) SCClass {
-	// Tags presized to cap 2 so the single tag append on every matched /
-	// well-known-SCID path uses spare capacity instead of forcing a cap1→cap2
-	// realloc (−1 alloc/matched classify). Each matched path appends exactly one
-	// tag, so cap 2 always suffices; value/len/order are identical to ["all"].
-	sc := SCClass{Class: "UNKNOWN"}
-	sc.Tags = make([]string, 1, 2)
-	sc.Tags[0] = "all"
+	// Tags alias precomputed, shared, len==cap slices instead of being built
+	// per call — identical value/len/order to the old make+append, zero Tags
+	// allocation, append-safe because len==cap. See ClassifySC.
+	sc := SCClass{Class: "UNKNOWN", Tags: tagsAll}
 
 	switch scid {
 	case structures.NameServiceSCID:
 		sc.Class = "NAMESERVICE"
-		sc.Tags = append(sc.Tags, "nameservice")
+		sc.Tags = tagsNameservice
 		extractClassVars(&sc, vars)
 		return sc
 	case structures.GnomonSCID_Mainnet, structures.GnomonSCID_Testnet:
 		sc.Class = "GNOMONSC"
-		sc.Tags = append(sc.Tags, "gnomon")
+		sc.Tags = tagsGnomon
 		extractClassVars(&sc, vars)
 		return sc
 	}
 
-	for _, r := range rules {
-		if strings.Contains(code, r.pattern) {
-			sc.Class = r.class
-			sc.Tags = append(sc.Tags, r.tag)
+	for i := range rules {
+		if strings.Contains(code, rules[i].pattern) {
+			sc.Class = rules[i].class
+			sc.Tags = rules[i].tags
 			break
 		}
 	}
 	if sc.Class == "UNKNOWN" && code != "" && classifyDEROAsset(code) {
 		sc.Class = "DERO-ASSET"
-		sc.Tags = append(sc.Tags, "asset")
+		sc.Tags = tagsAsset
 	}
 	extractClassVars(&sc, vars)
 	return sc
@@ -588,23 +626,79 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {
+	// Scanner tier (H9): a hand-rolled, zero-alloc top-level scan that extracts
+	// simple-string "name"/"description"/"icon" values without any encoding/json
+	// machinery. It fires only when it can prove byte-equivalence with the
+	// decoders below (see classify_g45_scan.go); on ANY deviation it hands
+	// back a non-OK verdict and the untouched SCClass either falls through to
+	// the original map decode (g45vFallback) or skips it outright when that
+	// decode provably sets nothing (g45vNoFields — bad JSON, non-object, or a
+	// number the map decode would reject; see the verdict constants). The
+	// empty-guards here mirror the map path exactly (fill only when the field
+	// is still ""). The scanner returns zero-copy substrings of str; for
+	// blobs past g45CloneThreshold the extracted fields are cloned so a tiny
+	// Name cannot pin a huge (potentially hostile) blob in ClassMeta held by
+	// eventbus queues or the seed cache. Real corpus blobs max out under 2KB,
+	// so the guard never fires on the benchmark path.
+	switch name, desc, icon, verdict := g45ScanMetaVerdict(str); verdict {
+	case g45vOK:
+		if len(str) > g45CloneThreshold {
+			name = strings.Clone(name)
+			desc = strings.Clone(desc)
+			icon = strings.Clone(icon)
+		}
+		if sc.Name == "" {
+			sc.Name = name
+		}
+		if sc.Desc == "" {
+			sc.Desc = desc
+		}
+		if sc.IconURL == "" {
+			sc.IconURL = icon
+		}
+		return
+	case g45vNoFields:
+		return
+	}
+	extractG45MetadataFallback(sc, str)
+}
+
+// extractG45MetadataFallback is the ORIGINAL map[string]interface{} decode,
+// kept byte-for-byte equivalent to pre-optimization Gnomon behavior: exact
+// (case-sensitive) key lookups, and whole-blob strictness — if ANY value in
+// the blob fails decoding (e.g. a number outside float64 range), nothing is
+// set. It is the correctness oracle behind the scanner tier and the
+// differential-test reference; every scanner decline lands here so unusual
+// shapes always get original semantics. A previous json.RawMessage struct
+// fast path was removed: encoding/json struct decoding matches keys
+// case-insensitively and skips unconvertible unknown fields, both of which
+// silently diverged from this original algorithm.
+//
+// varString renders every JSON-decoded type identically to
+// fmt.Sprintf("%v", …): string and float64 via its typed branches (float uses
+// 'g'/-1/64, exactly what %v produces), every other type through the same fmt
+// default.
+func extractG45MetadataFallback(sc *SCClass, str string) {
+	// Read-only view over str's backing array: json.Unmarshal only reads its
+	// input, and map decoding copies out any retained bytes, so nothing
+	// aliases this view. See readOnlyBytes.
 	var meta map[string]interface{}
-	if err := json.Unmarshal([]byte(str), &meta); err != nil {
+	if err := json.Unmarshal(readOnlyBytes(str), &meta); err != nil {
 		return
 	}
 	if sc.Name == "" {
 		if v, ok := meta["name"]; ok {
-			sc.Name = fmt.Sprintf("%v", v)
+			sc.Name = varString(v)
 		}
 	}
 	if sc.Desc == "" {
 		if v, ok := meta["description"]; ok {
-			sc.Desc = fmt.Sprintf("%v", v)
+			sc.Desc = varString(v)
 		}
 	}
 	if sc.IconURL == "" {
 		if v, ok := meta["icon"]; ok {
-			sc.IconURL = fmt.Sprintf("%v", v)
+			sc.IconURL = varString(v)
 		}
 	}
 }

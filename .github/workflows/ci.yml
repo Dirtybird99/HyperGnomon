@@ -115,11 +115,19 @@ jobs:
 
       - name: Verify binary runs
         run: |
-          # Adjust this to your main package location
-          if [ -f main.go ]; then
-            go build -o app .
-            ./app --version || ./app --help || true
-          fi
+          go build -o hypergnomon ./cmd/hypergnomon/
+          ./hypergnomon --help > /dev/null 2>&1
+
+      - name: Fuzz classify scanner differential
+        run: go test ./indexer/ -run '^$' -fuzz '^FuzzG45ScanDifferential$' -fuzztime=45s
+
+      - name: Upload fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: indexer/testdata/fuzz/
+          if-no-files-found: ignore
 
   verify-signatures:
     name: Verify Commit Signatures

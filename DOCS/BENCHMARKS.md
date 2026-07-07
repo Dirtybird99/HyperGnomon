@@ -182,13 +182,44 @@ The opted-out speculative path is deliberately short-circuited — subscribers w
 ### Classifier rule walk
 
 ```
-BenchmarkClassifySC_TELAIndex   2.1 µs/op    5 allocs   (middle-of-table hit)
-BenchmarkClassifySC_TELADoc     5.1 µs/op    5 allocs
-BenchmarkClassifySC_G45NFA      550 ns/op    5 allocs   (first-rule hit)
-BenchmarkClassifySC_Miss        14.1 µs/op   4 allocs   (full-table walk + fallback)
+BenchmarkClassifySC_TELAIndex   3.0 µs/op    3 allocs / 64 B   (middle-of-table hit)
+BenchmarkClassifySC_TELADoc     5.3 µs/op    3 allocs / 64 B
+BenchmarkClassifySC_G45NFA      400 ns/op    3 allocs / 64 B   (first-rule hit)
+BenchmarkClassifySC_Miss        18.5 µs/op   3 allocs / 64 B   (full-table walk + fallback)
 ```
 
+(Re-measured July 2026 after the shared per-class Tags slices change — the
+former 4-5 allocs included a per-call Tags `make`+`append` that classification
+now avoids entirely.)
+
 `ClassifySC` runs once per new SC install; a 14 µs worst-case is invisible in scan wall-clock. This bench exists as a regression guard — if the rule table ever grows to 50+ rules or a rule's pattern becomes expensive, the Miss bench is first to show it.
+
+### G45 corpus classify (July 2026)
+
+A real-mainnet corpus is committed under `indexer/testdata/` (45,514 G45-NFT +
+75 G45-C variable snapshots, 8 distinct code bodies); every benchmark iteration
+classifies the ENTIRE corpus, so allocs/op is the exact allocation total of one
+full pass — deterministic, immune to per-op rounding.
+
+```
+BenchmarkClassifyCorpus/Full   before: 1,970,788 allocs/op   79.3 MB/op   ~365 ms
+                               after:        415 allocs/op   ~34 KB/op    ~55 ms   (−99.98% allocs)
+```
+
+Reproduce: `bash scripts/measure_classify.sh` — one JSON line with the
+median-of-5 metric plus the gates: full `indexer` `-race` suite, a golden
+snapshot pinning the full `SCClass` output for all 45,589 SCs byte-identically
+(regeneration is a deliberate human act, never part of an optimization), a
+map/slice path equivalence gate, and an allocs-determinism tripwire.
+
+What got it there: a zero-alloc hand scanner tier for simple metadata shapes
+(zero-copy substrings, tri-state verdict that skips decodes proven to set
+nothing), shared precomputed per-class Tags slices, and a differential fuzz
+gate against the stdlib decode. The residual ~415 is deliberate: unusual
+shapes (escaped values, case-fold keys) fall back to the ORIGINAL
+`map[string]interface{}` decode, kept for exact behavior parity with
+pre-optimization Gnomon (exact-case key matching, whole-blob strictness) —
+the last fraction of the win was traded for provable parity.
 
 ## TELA correctness
 
