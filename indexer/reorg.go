@@ -97,3 +97,55 @@ func (idx *Indexer) onReorgDetected(oldTip, newTip int64) {
 func (idx *Indexer) ReorgDetectedCount() int64 {
 	return idx.ReorgDetected.Load()
 }
+
+// findForkPoint locates the highest height at which the locally stored block
+// hash still agrees with the daemon's — the last common ancestor of the old and
+// new chains. Truncating storage to that height and replaying above it converges
+// the index onto the new chain.
+//
+// It walks DOWN from `suspected` (the height at/near where detection fired). For
+// each height it compares the stored hash to the daemon's; the first agreement is
+// the fork point. It is a PURE function over injected lookups (no *Indexer
+// receiver, no RPC/DB access) so the whole fork-finding decision is unit-testable
+// without a live daemon — the M2.3 wiring passes closures over Store.GetBlockHash
+// and client.GetBlockHash.
+//
+// Returns:
+//
+//	(forkH, true, nil)  — last common ancestor found.
+//	(0, false, nil)     — cannot determine: a height with no stored hash was hit
+//	                      before any agreement (the fastsync floor — FastSync never
+//	                      writes block hashes — or a scan-gap hole), or the walk
+//	                      exhausted maxDepth without agreement. The caller must
+//	                      fall back to a full ResetIndex/resync.
+//	(0, false, err)     — a lookup failed; the caller should retry, not truncate.
+//
+// maxDepth bounds the walk so a pathological state can't scan the whole chain.
+func findForkPoint(suspected int64, storedHash, daemonHash func(int64) (string, error), maxDepth int64) (int64, bool, error) {
+	if suspected < 1 {
+		return 0, false, nil
+	}
+	lo := suspected - maxDepth
+	if lo < 0 {
+		lo = 0
+	}
+	for h := suspected; h >= lo; h-- {
+		sh, err := storedHash(h)
+		if err != nil {
+			return 0, false, err
+		}
+		if sh == "" {
+			// No stored hash at h: below the fastsync floor or a scan-gap hole.
+			// We have no local history to roll back to here — fall back.
+			return 0, false, nil
+		}
+		dh, err := daemonHash(h)
+		if err != nil {
+			return 0, false, err
+		}
+		if dh != "" && sh == dh {
+			return h, true, nil
+		}
+	}
+	return 0, false, nil
+}
