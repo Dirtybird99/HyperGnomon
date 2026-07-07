@@ -45,3 +45,4 @@ segments/
 .tmp_*
 loop*.yaml
 bench_hg.*
+sandbox/
