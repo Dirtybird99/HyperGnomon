@@ -61,10 +61,11 @@ type Indexer struct {
 	// from "confirmed beyond reorg risk."
 	SafeHeight atomic.Int64
 
-	// reorgDetectedCount tallies how many times CheckReorgAt has fired a
-	// mismatch. M1 only observes; M2 will actually truncate+replay. Exposed
-	// via metrics so we can tell "chain is noisy" from "our code is broken".
-	reorgDetectedCount atomic.Int64
+	// ReorgDetected tallies how many times CheckReorgAt has fired a mismatch.
+	// M1 only observes; M2 will actually truncate+replay. Exported (like
+	// SafeHeight) so main.go can hand the API server a live *atomic.Int64
+	// pointer for /getstats — read it via the ReorgDetectedCount getter.
+	ReorgDetected atomic.Int64
 
 	// Bus is the optional event fan-out. nil => publishing is a no-op
 	// (library embeddings that don't need realtime push can pass nil).
@@ -496,17 +497,15 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 
 			// M1 reorg detection: on the FIRST successfully-parsed block of each
 			// batch, verify the block's parent tip chains onto the stored hash
-			// at h-1. DERO blocks are a DAG (Tips is a slice), but in the linear
-			// portion of the chain we care about there is exactly one tip — the
-			// direct ancestor. If Tips is empty (genesis or malformed) we skip.
-			// Cheap (one bbolt read per batch) and it runs in the fetcher so the
-			// processor never sees a bad chain. Mismatch only logs+counts in M1;
+			// at h-1 (see checkReorgForBlock for the Tips/DAG rationale). Cheap
+			// (one bbolt read per batch) and it runs in the fetcher so the
+			// processor never sees a bad chain. The len(bl.Tips) > 0 guard is
+			// kept here so firstBlockChecked latches on the first block that
+			// actually has a parent tip. Mismatch only logs+counts in M1;
 			// M2 will truncate+replay.
 			if !firstBlockChecked && len(bl.Tips) > 0 {
 				firstBlockChecked = true
-				if ok, storedAt := idx.CheckReorgAt(int64(heights[i]), bl.Tips[0].String()); !ok { // #nosec G115 -- heights derive from lastHeight+i, far below 2^62.
-					idx.onReorgDetected(storedAt, int64(heights[i]))
-				}
+				idx.checkReorgForBlock(int64(heights[i]), &bl) // #nosec G115 -- heights derive from lastHeight+i, far below 2^62.
 			}
 
 			for _, h := range bl.Tx_hashes {
@@ -574,6 +573,13 @@ func (idx *Indexer) fetchSingleBlock(result *rpc.GetBlock_Result, height uint64)
 	}
 
 	bi.blockHash = bl.GetHash().String()
+
+	// M1 reorg detection on the LIVE tip. Catch-up batches check their first
+	// block (indexer.go above); this speculative single-block path is where the
+	// indexer sits at the chain tip, which is exactly where real DERO reorgs
+	// occur — so without this call tip reorgs were invisible. Same shared helper
+	// and semantics as the batch site.
+	idx.checkReorgForBlock(int64(height), &bl) // #nosec G115 -- chain heights are 0..2^62, far below the conversion bound.
 
 	allTxHashes := make([]string, 0, len(bl.Tx_hashes))
 	for _, h := range bl.Tx_hashes {

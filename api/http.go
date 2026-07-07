@@ -30,6 +30,11 @@ type Server struct {
 	// max(LastIndexedHeight - FinalityDepth, 0). nil is tolerated (returns 0).
 	safeHeight *atomic.Int64
 
+	// reorgDetected is a pointer to the indexer's reorg-mismatch counter
+	// (indexer.Indexer.ReorgDetected). nil is tolerated (returns 0). Surfaced
+	// in /getstats the same way safeHeight is.
+	reorgDetected *atomic.Int64
+
 	// TELA content server wiring. All three are optional: if bus is nil the
 	// cache invalidator is a no-op; if tela is nil /tela/... returns 503
 	// on cache misses (but served reads from the durable bucket still work).
@@ -54,17 +59,19 @@ type Server struct {
 
 // NewServer creates a new API server.
 //
-// safeHeight may be nil; handlers treat nil as zero. bus/idx may be nil to
-// disable the /tela/... content server's on-demand refresh + invalidation.
-func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string, safeHeight *atomic.Int64, bus *eventbus.Bus, idx *indexer.Indexer, telaCacheBytes int64) *Server {
+// safeHeight and reorgDetected may be nil; handlers treat nil as zero. bus/idx
+// may be nil to disable the /tela/... content server's on-demand refresh +
+// invalidation.
+func NewServer(store storage.Storage, pool *rpc.Pool, listenAddr string, safeHeight *atomic.Int64, reorgDetected *atomic.Int64, bus *eventbus.Bus, idx *indexer.Indexer, telaCacheBytes int64) *Server {
 	return &Server{
-		store:      store,
-		pool:       pool,
-		listenAddr: listenAddr,
-		safeHeight: safeHeight,
-		bus:        bus,
-		tela:       idx,
-		telaCache:  newTELAContentCache(telaCacheBytes),
+		store:         store,
+		pool:          pool,
+		listenAddr:    listenAddr,
+		safeHeight:    safeHeight,
+		reorgDetected: reorgDetected,
+		bus:           bus,
+		tela:          idx,
+		telaCache:     newTELAContentCache(telaCacheBytes),
 	}
 }
 
@@ -80,6 +87,14 @@ func (s *Server) loadSafeHeight() int64 {
 		return 0
 	}
 	return s.safeHeight.Load()
+}
+
+// loadReorgDetected returns the current reorg-detection count, or 0 if not wired.
+func (s *Server) loadReorgDetected() int64 {
+	if s.reorgDetected == nil {
+		return 0
+	}
+	return s.reorgDetected.Load()
 }
 
 // Start registers routes and begins serving HTTP requests.
@@ -206,6 +221,7 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		"version":        structures.Version,
 		"index_height":   indexHeight,
 		"safe_height":    s.loadSafeHeight(),
+		"reorg_detected": s.loadReorgDetected(),
 		"sc_count":       scCount,
 		"reg_tx_count":   reg,
 		"burn_tx_count":  burn,

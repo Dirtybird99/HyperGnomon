@@ -354,9 +354,9 @@ func main() {
 	}()
 
 	// Start API servers (deferred until after fastsync/segment-sync complete).
-	// &idx.SafeHeight gives the api package a live read of the finality-lag
-	// height without pulling in an indexer import.
-	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress, &idx.SafeHeight, bus, idx, (*telaCacheMB)*1024*1024)
+	// &idx.SafeHeight / &idx.ReorgDetected give the api package a live read of
+	// the finality-lag height and the reorg-detection counter.
+	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress, &idx.SafeHeight, &idx.ReorgDetected, bus, idx, (*telaCacheMB)*1024*1024)
 	apiServer.SetTELAVerifySigs(*telaVerifySigs)
 	go func() {
 		if err := apiServer.Start(); err != nil {

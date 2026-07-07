@@ -1,5 +1,7 @@
 package indexer
 
+import "github.com/deroproject/derohe/block"
+
 // Reorg detection (M1 stub)
 //
 // This file contains the lightweight reorg *detection* path. It is intentionally
@@ -45,13 +47,47 @@ func (idx *Indexer) CheckReorgAt(height int64, parentHash string) (ok bool, stor
 	return false, height - 1
 }
 
+// checkReorgForBlock runs M1 reorg detection for a single parsed block at the
+// given height. Both the catch-up batch path and the live speculative
+// single-block path call this, so a reorg at the live tip — where real DERO
+// reorgs happen and where only the single-block path runs — is now visible
+// instead of slipping through undetected.
+//
+// Parent reference: DERO's block.Block has NO Prev_Hash field; its parent(s)
+// live in Tips ([]crypto.Hash), because blocks form a DAG. In the linear
+// region of the chain a block carries exactly one tip — the direct ancestor
+// at h-1 — and we compare that against the hash we stored for h-1.
+//
+// ASSUMPTION (inherited from the existing batch-path check, not independently
+// proven here): Tips[0] equals the stored GetBlockHash(h-1), i.e. a tip
+// reference is the parent block's GetHash(). This has not been traced against
+// derohe's miniblock/integrator hashing; if it turns out a tip uses a
+// different form than the block ID we persist, both call sites would need to
+// change together. Near the tip a block may carry >1 tip (DAG); we compare the
+// first (the primary parent). Empty Tips (genesis / malformed) → skip.
+func (idx *Indexer) checkReorgForBlock(height int64, bl *block.Block) {
+	if len(bl.Tips) == 0 {
+		return
+	}
+	if ok, storedAt := idx.CheckReorgAt(height, bl.Tips[0].String()); !ok {
+		idx.onReorgDetected(storedAt, height)
+	}
+}
+
 // onReorgDetected is invoked when CheckReorgAt returns a mismatch. In M1 this
 // only logs and increments a counter; the actual truncate+replay lives in M2.
 // Keeping the policy in one function means the fetcher's reorg-check site
 // stays a single line and M2 can change the response (truncate, pause,
 // re-fetch) without touching the hot loop.
 func (idx *Indexer) onReorgDetected(oldTip, newTip int64) {
-	idx.reorgDetectedCount.Add(1)
+	idx.ReorgDetected.Add(1)
 	logger.Warnf("reorg detected: stored tip=%d incoming tip=%d — TODO(M2): truncate+replay",
 		oldTip, newTip)
+}
+
+// ReorgDetectedCount returns how many reorg mismatches have been observed so
+// far. Surfaced in the API /getstats response so operators can distinguish a
+// noisy chain from a broken indexer.
+func (idx *Indexer) ReorgDetectedCount() int64 {
+	return idx.ReorgDetected.Load()
 }

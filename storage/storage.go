@@ -101,6 +101,16 @@ type Storage interface {
 	// rescans from height 0. Block-hash history is kept so reorg-detection
 	// replay still works. Intended for the `hypergnomon resync` subcommand.
 	ResetIndex() error
+
+	// TruncateToHeight removes all index state attributable to heights > h,
+	// making the store a prefix-consistent snapshot as of h. Height-keyed detail
+	// and the reversible aggregates (interaction-height counts, addr_scids,
+	// sc_count, scvars_latest) are restored to their <=h values; latest-wins
+	// entities (owner, class-meta) mutated at <=h AND again at >h retain their
+	// >h value pending replay, and the counted-and-discarded tx-count stats
+	// (reg/burn/norm) are left for replay to recount. One atomic transaction.
+	// Intended for reorg truncate+replay (DESIGN.md §6, M2).
+	TruncateToHeight(h int64) error
 }
 
 // addrSCIDKey is the flat composite key for WriteBatch.AddrSCIDs. Using a
