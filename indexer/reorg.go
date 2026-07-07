@@ -103,12 +103,19 @@ func (idx *Indexer) ReorgDetectedCount() int64 {
 // new chains. Truncating storage to that height and replaying above it converges
 // the index onto the new chain.
 //
-// It walks DOWN from `suspected` (the height at/near where detection fired). For
-// each height it compares the stored hash to the daemon's; the first agreement is
-// the fork point. It is a PURE function over injected lookups (no *Indexer
-// receiver, no RPC/DB access) so the whole fork-finding decision is unit-testable
-// without a live daemon — the M2.3 wiring passes closures over Store.GetBlockHash
-// and client.GetBlockHash.
+// It walks DOWN from `suspected`. CALLER CONTRACT: pass storedAt — the h-1 side
+// of the detection mismatch (what onReorgDetected receives as oldTip) — NOT the
+// incoming block's height. Detection fires in the fetcher before the processor
+// flushes the incoming block, so the stored hash at the incoming height is
+// typically absent and starting there returns ok=false immediately, silently
+// degrading every real reorg to a full resync.
+//
+// For each height it compares the stored hash to the daemon's; the first
+// agreement is the fork point. A daemon miss ("" hash) is treated as
+// disagreement and the walk continues. It is a PURE function over injected
+// lookups (no *Indexer receiver, no RPC/DB access) so the whole fork-finding
+// decision is unit-testable without a live daemon — the M2.3 wiring passes
+// closures over Store.GetBlockHash and client.GetBlockHash.
 //
 // Returns:
 //
@@ -120,7 +127,9 @@ func (idx *Indexer) ReorgDetectedCount() int64 {
 //	                      fall back to a full ResetIndex/resync.
 //	(0, false, err)     — a lookup failed; the caller should retry, not truncate.
 //
-// maxDepth bounds the walk so a pathological state can't scan the whole chain.
+// maxDepth bounds the walk so a pathological state can't scan the whole chain:
+// at most maxDepth+1 heights are examined (suspected down to suspected-maxDepth
+// inclusive).
 func findForkPoint(suspected int64, storedHash, daemonHash func(int64) (string, error), maxDepth int64) (int64, bool, error) {
 	if suspected < 1 {
 		return 0, false, nil

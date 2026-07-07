@@ -52,6 +52,19 @@ func TestFindForkPoint(t *testing.T) {
 			mutate: func(s, d map[int64]string) { delete(s, 103) }},
 		{name: "maxDepth exceeded", suspected: 105, maxDepth: 3, wantFork: 0, wantOK: false},
 		{name: "suspected below genesis", suspected: 0, maxDepth: 1000, wantFork: 0, wantOK: false},
+		// Pins the caller contract: the incoming block's height has no stored
+		// hash yet (detection runs before its flush), so starting the walk there
+		// bails immediately — the caller MUST pass storedAt (the h-1 side).
+		{name: "no stored hash at suspected (incoming height passed by mistake)",
+			suspected: 106, maxDepth: 1000, wantFork: 0, wantOK: false},
+		// Pins the daemon-miss rule: an empty daemon hash is disagreement, not a
+		// hole — the walk continues down and still finds the fork point.
+		{name: "daemon misses above fork", suspected: 105, maxDepth: 1000, wantFork: 100, wantOK: true,
+			mutate: func(s, d map[int64]string) {
+				for h := int64(101); h <= 105; h++ {
+					delete(d, h)
+				}
+			}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
