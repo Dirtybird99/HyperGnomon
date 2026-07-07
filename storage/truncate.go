@@ -148,18 +148,27 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		}); err != nil {
 			return err
 		}
-		if err := deleteWhere(tx.Bucket(bucketClass), func(k []byte) bool {
-			return classKeyHeight(k) > h
-		}); err != nil {
-			return err
-		}
 
 		// ---- Step 3: latest-wins / derived + aggregate stats ----
 
-		// Entities first created > h: nothing at <=h refers to them.
+		// Entities first created > h: nothing at <=h refers to them. The class
+		// prefix row is deleted targeted (via its classIdx meta) instead of by a
+		// full class-bucket scan — every class key with BE8 height > h belongs to
+		// an installed-above scid (re-classification never raises InstallHeight).
+		classPrefix := tx.Bucket(bucketClass)
+		classIdx := tx.Bucket(bucketClassIdx)
 		scidKeyedBuckets := [][]byte{bucketOwners, bucketClassIdx, bucketSCCode, bucketInvalid}
 		for scid := range installedAbove {
 			key := []byte(scid)
+			if classPrefix != nil && classIdx != nil {
+				if v := classIdx.Get(key); v != nil {
+					if meta, err := decodeClassMeta(v); err == nil && meta != nil {
+						if err := classPrefix.Delete(classKey(meta.Class, meta.InstallHeight, scid)); err != nil {
+							return err
+						}
+					}
+				}
+			}
 			for _, name := range scidKeyedBuckets {
 				if b := tx.Bucket(name); b != nil {
 					if err := b.Delete(key); err != nil {
@@ -203,15 +212,20 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		// lastindexedheight to h; leave the counted-and-discarded tx-count stats
 		// (reg/burn/norm) for replay to recount.
 		stats := tx.Bucket(bucketStats)
-		var owners int64
-		if err := tx.Bucket(bucketOwners).ForEach(func(_, _ []byte) error {
-			owners++
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := stats.Put([]byte("sc_count"), []byte(strconv.FormatInt(owners, 10))); err != nil {
-			return err
+		// sc_count: the owners bucket lost exactly len(installedAbove) entries,
+		// so decrement the stored count rather than rescan the whole bucket.
+		if n := int64(len(installedAbove)); n > 0 {
+			if v := stats.Get([]byte("sc_count")); v != nil {
+				if cur, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+					nv := cur - n
+					if nv < 0 {
+						nv = 0
+					}
+					if err := stats.Put([]byte("sc_count"), []byte(strconv.FormatInt(nv, 10))); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		// lastindexedheight: truncate only rolls back, so never raise it above
 		// the current value (truncating to a height >= tip is a no-op here).
@@ -428,16 +442,6 @@ func parseInvocationKey(k []byte) (sender string, height int64, ok bool) {
 // Legacy whole-addr blob keys (no ':') return 0 (left in place).
 func normTxHeight(k []byte) int64 {
 	i1 := bytes.IndexByte(k, ':')
-	if i1 < 0 || len(k) < i1+1+8 {
-		return 0
-	}
-	return decHeight(k[i1+1 : i1+9])
-}
-
-// classKeyHeight extracts the BE8 install height from
-// "<class>|<BE8 h>|<scid>".
-func classKeyHeight(k []byte) int64 {
-	i1 := bytes.IndexByte(k, '|')
 	if i1 < 0 || len(k) < i1+1+8 {
 		return 0
 	}
