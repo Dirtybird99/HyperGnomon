@@ -121,6 +121,14 @@ jobs:
       - name: Fuzz classify scanner differential
         run: go test ./indexer/ -run '^$' -fuzz '^FuzzG45ScanDifferential$' -fuzztime=45s
 
+      - name: Upload fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: indexer/testdata/fuzz/
+          if-no-files-found: ignore
+
   verify-signatures:
     name: Verify Commit Signatures
     runs-on: ubuntu-latest
