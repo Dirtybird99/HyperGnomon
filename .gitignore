@@ -41,6 +41,7 @@ segments/
 
 # Local agent/temp artifacts
 .claude/
+.context/
 .tmp_*
 loop*.yaml
 bench_hg.*
