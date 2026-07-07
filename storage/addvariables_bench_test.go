@@ -11,9 +11,11 @@ import (
 // snapshots (FlushBatch_VarSnapshotBurst times only the flush; its AddVariables
 // loop runs under StopTimer). Fixture: nSCIDs distinct scids × nHeights
 // snapshots each, batch.Reset() per iteration to mirror the flusher recycling
-// the batch. The nested map[scid]map[height] layout pays one inner-map
-// allocation per distinct scid per batch cycle — Reset's clear() drops every
-// inner map, so they are re-allocated each round.
+// the batch. Variables is a flat map[VarKey][]*SCIDVariable, so each snapshot is
+// a single keyed insert with no per-scid inner map; Reset's clear() retains the
+// map's buckets, so re-filling the same keys each round reuses the backing
+// storage. Measured: 0 allocs/op — this bench guards that a regression back to a
+// per-scid (or any per-insert) allocation surfaces.
 func BenchmarkAddVariables_Build(b *testing.B) {
 	const nSCIDs = 512
 	const nHeights = 2
