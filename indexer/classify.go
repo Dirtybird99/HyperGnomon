@@ -615,6 +615,32 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {
+	// Scanner tier (H9): a hand-rolled, zero-alloc top-level scan that extracts
+	// simple-string "name"/"description"/"icon" values without any encoding/json
+	// machinery. It fires only when it can prove byte-equivalence with the
+	// decoders below (see classify_g45_scan.go); on ANY deviation it returns
+	// ok=false and the untouched SCClass falls through to the unchanged
+	// RawMessage struct path -> map path. The empty-guards here mirror the
+	// struct path's g45FieldValue(cur, …) exactly (fill only when cur == "").
+	if name, desc, icon, ok := g45ScanMeta(readOnlyBytes(str)); ok {
+		if sc.Name == "" {
+			sc.Name = name
+		}
+		if sc.Desc == "" {
+			sc.Desc = desc
+		}
+		if sc.IconURL == "" {
+			sc.IconURL = icon
+		}
+		return
+	}
+	extractG45MetadataFallback(sc, str)
+}
+
+// extractG45MetadataFallback is the original RawMessage struct fast path plus
+// exact map[string]interface{} rendering, kept verbatim as the correctness
+// oracle behind the scanner tier. It is also the differential-test reference.
+func extractG45MetadataFallback(sc *SCClass, str string) {
 	// Read-only view over str's backing array: json.Unmarshal only reads its
 	// input, and both the RawMessage fast path and the map fallback copy out any
 	// retained bytes, so nothing aliases this view. See readOnlyBytes.
