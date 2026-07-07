@@ -122,6 +122,34 @@ func TestExtractG45MetadataPin(t *testing.T) {
 			meta:     `{"name":null,"description":"d"}`,
 			wantName: "HDR", wantDesc: "d",
 		},
+		// Review-regression pins (2026-07-07): the RawMessage struct fast
+		// path was removed because encoding/json struct decoding matched
+		// keys case-insensitively and skipped unconvertible unknown fields,
+		// silently diverging from the original exact-key, whole-blob-strict
+		// map decode. These pin the restored original semantics.
+		{
+			name: "fold-variant key is ignored (exact-key matching)",
+			meta: `{"Name":"x"}`,
+		},
+		{
+			name:     "exact key wins over fold variant",
+			meta:     `{"name":"Duck","Name":"Evil"}`,
+			wantName: "Duck",
+		},
+		{
+			name: "out-of-range number anywhere sets nothing (whole-blob strictness)",
+			meta: `{"supply":1e999,"name":"x"}`,
+		},
+		{
+			name:     "surrogate-pair escape decodes via stdlib",
+			meta:     `{"name":"\ud83d\ude00"}`,
+			wantName: "😀",
+		},
+		{
+			name:     "lone surrogate escape becomes U+FFFD via stdlib",
+			meta:     `{"description":"\ud800 lone"}`,
+			wantDesc: "� lone",
+		},
 	}
 
 	for _, tc := range cases {

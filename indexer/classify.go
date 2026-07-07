@@ -10,9 +10,14 @@ import (
 )
 
 // SCClass represents a classified smart contract type.
+//
+// Tags aliases a shared, package-global slice (len == cap): callers MUST NOT
+// mutate its elements in place or reorder it — doing so corrupts the tag set
+// for every subsequent classification process-wide. Appending is safe (len ==
+// cap forces a reallocation); to modify, copy first (slices.Clone).
 type SCClass struct {
 	Class   string   // e.g. "G45-NFT", "TELA-DOC-1", "NFA", "NAMESERVICE", "UNKNOWN"
-	Tags    []string // e.g. ["g45", "nfa", "tela", "all"]
+	Tags    []string // shared read-only slice, e.g. ["all", "g45"] — see struct doc
 	Name    string   // from SC variables if available
 	Desc    string   // from SC variables if available
 	IconURL string   // from SC variables if available
@@ -153,6 +158,9 @@ func classifyDEROAsset(code string) bool {
 // ClassifySC determines the class and tags of a smart contract based on its
 // SCID, code, and stored variables. Every returned SCClass includes the "all"
 // tag so callers can use it as a universal filter.
+//
+// The returned Tags slice is shared and read-only — never mutate it in place;
+// see the SCClass doc.
 func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 	// Tags alias precomputed, shared, len==cap slices instead of being built
 	// per call: UNKNOWN keeps the bare ["all"]; each matched / well-known-SCID
@@ -208,6 +216,9 @@ func ClassifySC(scid string, code string, vars map[string]interface{}) SCClass {
 // ClassifySCVars is the allocation-light variant for indexer hot paths that
 // already hold parsed SC variables as a slice. It mirrors ClassifySC without
 // first materializing a map.
+//
+// The returned Tags slice is shared and read-only — never mutate it in place;
+// see the SCClass doc.
 func ClassifySCVars(scid string, code string, vars []*structures.SCIDVariable) SCClass {
 	// Tags alias precomputed, shared, len==cap slices instead of being built
 	// per call — identical value/len/order to the old make+append, zero Tags
@@ -618,11 +629,24 @@ func extractG45MetadataString(sc *SCClass, str string) {
 	// Scanner tier (H9): a hand-rolled, zero-alloc top-level scan that extracts
 	// simple-string "name"/"description"/"icon" values without any encoding/json
 	// machinery. It fires only when it can prove byte-equivalence with the
-	// decoders below (see classify_g45_scan.go); on ANY deviation it returns
-	// ok=false and the untouched SCClass falls through to the unchanged
-	// RawMessage struct path -> map path. The empty-guards here mirror the
-	// struct path's g45FieldValue(cur, …) exactly (fill only when cur == "").
-	if name, desc, icon, ok := g45ScanMeta(readOnlyBytes(str)); ok {
+	// decoders below (see classify_g45_scan.go); on ANY deviation it hands
+	// back a non-OK verdict and the untouched SCClass either falls through to
+	// the original map decode (g45vFallback) or skips it outright when that
+	// decode provably sets nothing (g45vNoFields — bad JSON, non-object, or a
+	// number the map decode would reject; see the verdict constants). The
+	// empty-guards here mirror the map path exactly (fill only when the field
+	// is still ""). The scanner returns zero-copy substrings of str; for
+	// blobs past g45CloneThreshold the extracted fields are cloned so a tiny
+	// Name cannot pin a huge (potentially hostile) blob in ClassMeta held by
+	// eventbus queues or the seed cache. Real corpus blobs max out under 2KB,
+	// so the guard never fires on the benchmark path.
+	switch name, desc, icon, verdict := g45ScanMetaVerdict(str); verdict {
+	case g45vOK:
+		if len(str) > g45CloneThreshold {
+			name = strings.Clone(name)
+			desc = strings.Clone(desc)
+			icon = strings.Clone(icon)
+		}
 		if sc.Name == "" {
 			sc.Name = name
 		}
@@ -633,56 +657,33 @@ func extractG45MetadataString(sc *SCClass, str string) {
 			sc.IconURL = icon
 		}
 		return
+	case g45vNoFields:
+		return
 	}
 	extractG45MetadataFallback(sc, str)
 }
 
-// extractG45MetadataFallback is the original RawMessage struct fast path plus
-// exact map[string]interface{} rendering, kept verbatim as the correctness
-// oracle behind the scanner tier. It is also the differential-test reference.
+// extractG45MetadataFallback is the ORIGINAL map[string]interface{} decode,
+// kept byte-for-byte equivalent to pre-optimization Gnomon behavior: exact
+// (case-sensitive) key lookups, and whole-blob strictness — if ANY value in
+// the blob fails decoding (e.g. a number outside float64 range), nothing is
+// set. It is the correctness oracle behind the scanner tier and the
+// differential-test reference; every scanner decline lands here so unusual
+// shapes always get original semantics. A previous json.RawMessage struct
+// fast path was removed: encoding/json struct decoding matches keys
+// case-insensitively and skips unconvertible unknown fields, both of which
+// silently diverged from this original algorithm.
+//
+// varString renders every JSON-decoded type identically to
+// fmt.Sprintf("%v", …): string and float64 via its typed branches (float uses
+// 'g'/-1/64, exactly what %v produces), every other type through the same fmt
+// default.
 func extractG45MetadataFallback(sc *SCClass, str string) {
 	// Read-only view over str's backing array: json.Unmarshal only reads its
-	// input, and both the RawMessage fast path and the map fallback copy out any
-	// retained bytes, so nothing aliases this view. See readOnlyBytes.
-	b := readOnlyBytes(str)
-
-	// Fast path: capture only the three fields we consume as raw JSON, letting
-	// the decoder skip the large unknown subtrees real G45 metadata carries
-	// ("attributes" objects, "id", "image") without materializing them into a
-	// map[string]interface{}. RawMessage (vs a *string struct) is deliberate:
-	// it distinguishes an absent key (nil) from a present JSON null ("null",
-	// which the original path renders as "<nil>"), so the fast path fires even
-	// for the common name-only metadata instead of always deferring to the map.
-	var fast struct {
-		Name        json.RawMessage `json:"name"`
-		Description json.RawMessage `json:"description"`
-		Icon        json.RawMessage `json:"icon"`
-	}
-	if json.Unmarshal(b, &fast) == nil {
-		n, okN := g45FieldValue(sc.Name, fast.Name)
-		d, okD := g45FieldValue(sc.Desc, fast.Description)
-		i, okI := g45FieldValue(sc.IconURL, fast.Icon)
-		if okN && okD && okI {
-			if sc.Name == "" {
-				sc.Name = n
-			}
-			if sc.Desc == "" {
-				sc.Desc = d
-			}
-			if sc.IconURL == "" {
-				sc.IconURL = i
-			}
-			return
-		}
-	}
-
-	// Exact fallback: reproduce the original map-based rendering byte-for-byte
-	// for numeric/bool/array/object values of name/description/icon. varString
-	// renders every JSON-decoded type identically to fmt.Sprintf("%v", …):
-	// string and float64 via its typed branches (float uses 'g'/-1/64, exactly
-	// what %v produces), every other type through the same fmt default.
+	// input, and map decoding copies out any retained bytes, so nothing
+	// aliases this view. See readOnlyBytes.
 	var meta map[string]interface{}
-	if err := json.Unmarshal(b, &meta); err != nil {
+	if err := json.Unmarshal(readOnlyBytes(str), &meta); err != nil {
 		return
 	}
 	if sc.Name == "" {
@@ -700,34 +701,6 @@ func extractG45MetadataFallback(sc *SCClass, str string) {
 			sc.IconURL = varString(v)
 		}
 	}
-}
-
-// g45FieldValue reports the string the original map path would assign for a
-// captured metadata value, and whether the fast path can render it exactly.
-// The returned string is only consumed when cur == "" (the field is still
-// unfilled); callers must apply the same empty-guard. Non-string, non-null
-// composites (number/bool/array/object) return ok=false so the caller defers
-// to the exact map-based fallback rather than re-implementing fmt rendering.
-func g45FieldValue(cur string, raw json.RawMessage) (string, bool) {
-	if cur != "" {
-		return "", true // header already won; value unused, map path skips too
-	}
-	if raw == nil {
-		return "", true // key absent: fill nothing (empty is a no-op)
-	}
-	switch raw[0] {
-	case '"':
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil {
-			return "", false
-		}
-		return s, true
-	case 'n':
-		if string(raw) == "null" {
-			return "<nil>", true // matches fmt.Sprintf("%v", nil)
-		}
-	}
-	return "", false
 }
 
 func lookupVar(vars []*structures.SCIDVariable, key string) (interface{}, bool) {

@@ -128,6 +128,16 @@ var g45Adversarial = []string{
 	`{"NAME":"upper"}`,
 	`{"Name":"cap"}`,
 	`{"DESCRIPTION":"d"}`,
+	// review-regression seeds: fold-key override attempt (original semantics:
+	// exact "name" wins, "Name" ignored), whole-blob strictness (an
+	// out-of-float64-range number anywhere sets NOTHING), and backslash-u
+	// escape decoding incl. a surrogate pair and a lone surrogate (the
+	// fallback is stdlib encoding/json, the authoritative oracle).
+	`{"name":"Duck","Name":"Evil"}`,
+	`{"supply":1e999,"name":"x"}`,
+	`{"name":"x","weight":-1e999}`,
+	`{"name":"\ud83d\ude00"}`,
+	`{"description":"\ud800 lone"}`,
 	`{"Icon":"i"}`,
 	`{"naMe":"x","name":"exact"}`,
 	`{"name":"exact","NAME":"folded-after"}`,

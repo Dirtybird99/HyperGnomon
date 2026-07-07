@@ -1,33 +1,38 @@
 package indexer
 
 import (
-	"bytes"
+	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
 // This file adds a zero-alloc top-level scanner tier in front of the G45
-// metadata RawMessage/map decode (extractG45MetadataString). It exists because
-// the residual ~10 allocs/NFT in the fast path are 100% encoding/json decode
-// machinery (decodeState/scanner/reflect/unquote) spent to recover three
-// top-level string fields — "name", "description", "icon" — from a blob whose
-// bulk (attributes objects, id, image) we then throw away.
+// metadata map decode (extractG45MetadataString). It exists because the
+// pre-scanner cost was ~10+ allocs/NFT of encoding/json decode machinery
+// (decodeState/scanner/reflect/unquote) spent to recover three top-level
+// string fields — "name", "description", "icon" — from a blob whose bulk
+// (attributes objects, id, image) we then throw away.
 //
-// CORRECTNESS INVARIANT: the only bug this scanner can introduce is a false
-// ok=true. Every ok=false path leaves the SCClass untouched and defers to the
-// unchanged extractG45MetadataFallback (struct fast path -> map path), so it is
-// correct by construction. A legitimate ok=true — all three target values are
-// simple no-escape valid-UTF-8 strings AND the whole object validates cleanly —
-// provably matches encoding/json's struct-decode result. The sole failure mode
-// is therefore validation that is LOOSER than encoding/json's checkValid
-// anywhere, which is why the value/number/string/depth rules below are strict
-// (and, where in doubt, conservative: reject -> fall back, which is free
-// correctness). See the differential + fuzz gates in classify_g45_scan_test.go.
+// CORRECTNESS INVARIANT: the only bug this scanner can introduce is a wrong
+// g45vOK or a wrong g45vNoFields. Every g45vFallback path leaves the SCClass
+// untouched and defers to extractG45MetadataFallback — the ORIGINAL
+// map[string]interface{} decode, kept as the verbatim oracle — so it is
+// correct by construction. A legitimate g45vOK — all three target values are
+// simple no-escape valid-UTF-8 strings AND the whole object validates cleanly
+// (grammar + float64 number convertibility) — provably matches the original
+// map-decode result. The failure modes are therefore validation LOOSER than
+// encoding/json's checkValid + convertNumber anywhere, which is why the
+// value/number/string/depth rules below are strict (and, where in doubt,
+// conservative: defer to the fallback, which is free correctness). See the
+// differential + fuzz gates in classify_g45_scan_test.go.
 //
 // Equivalence with encoding/json, verified empirically (go1.26.0):
 //   - json.Unmarshal runs checkValid over the ENTIRE input first, so trailing
 //     garbage, malformed numbers anywhere (e.g. "01"), bad escapes, and raw
-//     control chars in any string make it set NOTHING. The scanner replicates
-//     that whole-object validation before applying any value.
+//     control chars in any string make it set NOTHING; map building then
+//     converts EVERY value, so a number outside float64 range anywhere also
+//     sets NOTHING. The scanner replicates both whole-object gates before
+//     applying any value.
 //   - A no-escape, control-free, valid-UTF-8 string decodes byte-identically to
 //     string(b[i:j]); encoding/json's unquote fast path returns the same bytes.
 //     Invalid UTF-8, by contrast, is replaced with U+FFFD by the decoder, so
@@ -37,10 +42,11 @@ import (
 //     fallback's exact fmt-rendering / replacement semantics apply.
 
 // g45 target-key identifiers. g45KeyFold flags a case/unicode-fold variant of a
-// target key (e.g. "Name", "deſcription"): encoding/json's struct decode matches
-// struct fields case-insensitively (with the ſ/K Unicode special cases), so such
-// a key WOULD populate a field. We cannot reproduce that mapping by hand safely,
-// so it forces the fallback.
+// target key (e.g. "Name", "deſcription"). The original map decode matches keys
+// exactly, so a fold variant sets nothing — but the scanner still defers these
+// to the fallback: it is pinned conservative behavior (TestG45ScanFires's
+// decline table) dating from when the fallback used a case-folding struct
+// decode, and deferring costs nothing on real corpora (zero fold keys).
 const (
 	g45KeyNone = iota
 	g45KeyName
@@ -49,12 +55,49 @@ const (
 	g45KeyFold
 )
 
-// Target field names as bytes, for zero-alloc exact and fold comparison.
-var (
-	g45bName = []byte("name")
-	g45bDesc = []byte("description")
-	g45bIcon = []byte("icon")
+// g45Verdict is the scanner's routing decision. A distinct type (not a bare
+// int) so a verdict can never be confused with a scan position or a key id
+// at compile time.
+type g45Verdict uint8
+
+// Scanner verdicts. The tri-state exists so the caller can skip the fallback
+// decode entirely when it would provably set nothing:
+//
+//   - g45vOK: the whole object validated (grammar AND float64-convertibility
+//     of every number, mirroring the map decode) and every target value was a
+//     simple string — the extracted values are authoritative.
+//   - g45vNoFields: the fallback map decode provably sets nothing, so the
+//     caller skips it. Three proven cases: the input violates JSON grammar in
+//     a way encoding/json's checkValid also rejects (the scanner's
+//     string/number/literal/structure rules mirror it exactly); its first
+//     non-WS byte is not '{' (a valid non-object type-errors into the map —
+//     null succeeds but fills nothing); or a skipped number is outside
+//     float64 range, which makes the whole map decode error exactly like the
+//     original algorithm (strconv.ParseFloat is the same call encoding/json's
+//     convertNumber makes).
+//   - g45vFallback: not provably either of the above — escaped/fold keys,
+//     escaped or non-string or invalid-UTF-8 target values, depth past
+//     g45MaxDepth. The fallback MUST run; it may set fields.
+//
+// The load-bearing distinction is g45vNoFields vs g45vFallback: a wrong
+// g45vNoFields silently drops fields the fallback would have set. That is
+// exactly what FuzzG45ScanDifferential asserts against (scanner-routed
+// extractG45MetadataString vs the original-map-decode oracle), and the golden
+// gate pins every real corpus blob.
+const (
+	g45vOK g45Verdict = iota
+	g45vNoFields
+	g45vFallback
 )
+
+// g45CloneThreshold is the metadata-blob size above which
+// extractG45MetadataString clones the scanner's zero-copy substrings before
+// storing them in SCClass, so a few-byte Name cannot pin an arbitrarily large
+// (potentially hostile) blob inside long-lived ClassMeta holders (eventbus
+// queues, the classify seed cache). Real mainnet corpus blobs top out under
+// 2KB, so the clone never fires on the benchmark path; retention per ClassMeta
+// is capped at this many bytes.
+const g45CloneThreshold = 4096
 
 // g45MaxDepth caps nesting the scanner will validate. It sits far below
 // encoding/json's maxNestingDepth (10000) on purpose: real G45 metadata nests
@@ -66,123 +109,149 @@ const g45MaxDepth = 1000
 // g45TargetKey maps a raw (no-escape) top-level key to a target id. Exact
 // matches fire the fast path; case/unicode-fold variants return g45KeyFold so
 // the caller falls back (encoding/json would still map them to the field, and
-// bytes.EqualFold is a proven superset of encoding/json's fold rules, so bailing
-// on any fold-match is safe). All comparisons are zero-alloc.
-func g45TargetKey(key []byte) int {
-	if bytes.Equal(key, g45bName) {
+// strings.EqualFold — the same simple-fold algorithm as bytes.EqualFold — is a
+// proven superset of encoding/json's fold rules, so bailing on any fold-match
+// is safe). All comparisons are zero-alloc.
+func g45TargetKey(key string) int {
+	switch key {
+	case "name":
 		return g45KeyName
-	}
-	if bytes.Equal(key, g45bDesc) {
+	case "description":
 		return g45KeyDesc
-	}
-	if bytes.Equal(key, g45bIcon) {
+	case "icon":
 		return g45KeyIcon
 	}
-	if bytes.EqualFold(key, g45bName) || bytes.EqualFold(key, g45bDesc) || bytes.EqualFold(key, g45bIcon) {
+	if strings.EqualFold(key, "name") || strings.EqualFold(key, "description") || strings.EqualFold(key, "icon") {
 		return g45KeyFold
 	}
 	return g45KeyNone
 }
 
-// g45ScanMeta walks the top-level JSON object in b, returning the last-seen
-// string values of "name"/"description"/"icon" (each defaulting to "") and
-// ok=true ONLY when the entire object validated cleanly AND every target value
-// encountered was a simple no-escape valid-UTF-8 string. On any deviation it
-// returns ok=false, signalling the caller to run the unchanged fallback.
-//
-// The returned strings are fresh copies (string(b[i:j])) and never alias b
-// (which may be an unsafe read-only view of the source string).
+// g45ScanMeta is the []byte compatibility entry point (differential and fuzz
+// gates drive it). It copies b into a string once so the substrings the core
+// scanner returns never alias a caller-mutable byte slice. ok collapses the
+// tri-state verdict: true only for a clean fire.
 func g45ScanMeta(b []byte) (name, desc, icon string, ok bool) {
-	i := g45skipWS(b, 0)
-	if i >= len(b) || b[i] != '{' {
-		return "", "", "", false
+	name, desc, icon, v := g45ScanMetaVerdict(string(b))
+	return name, desc, icon, v == g45vOK
+}
+
+// g45ScanMetaVerdict walks the top-level JSON object in s, returning the
+// last-seen string values of "name"/"description"/"icon" (each defaulting to
+// "") and g45vOK ONLY when the entire object validated cleanly AND every
+// target value encountered was a simple no-escape valid-UTF-8 string. On any
+// deviation it returns g45vFallback (fallback must run) or g45vNoFields
+// (fallback provably sets nothing — see the verdict constants).
+//
+// The returned values are zero-copy substrings of s (s[i:j]) — safe because
+// Go strings are immutable. They pin s's backing array for as long as the
+// caller retains them; extractG45MetadataString clones them for blobs larger
+// than g45CloneThreshold so ClassMeta held in eventbus queues or the seed
+// cache never pins more than that per entry.
+func g45ScanMetaVerdict(s string) (name, desc, icon string, verdict g45Verdict) {
+	i := g45skipWS(s, 0)
+	if i >= len(s) || s[i] != '{' {
+		// Not an object. Whether the rest is valid JSON or garbage, neither
+		// fallback decode can set a field (see g45vNoFields).
+		return "", "", "", g45vNoFields
 	}
 	i++
-	i = g45skipWS(b, i)
-	if i < len(b) && b[i] == '}' { // empty object: valid, fills nothing
-		i = g45skipWS(b, i+1)
-		if i != len(b) {
-			return "", "", "", false
+	i = g45skipWS(s, i)
+	if i < len(s) && s[i] == '}' { // empty object: valid, fills nothing
+		i = g45skipWS(s, i+1)
+		if i != len(s) {
+			return "", "", "", g45vNoFields // trailing garbage
 		}
-		return "", "", "", true
+		return "", "", "", g45vOK
 	}
 	for {
-		i = g45skipWS(b, i)
-		if i >= len(b) || b[i] != '"' {
-			return "", "", "", false
+		i = g45skipWS(s, i)
+		if i >= len(s) || s[i] != '"' {
+			return "", "", "", g45vNoFields // object key must be a string
 		}
-		cs, ce, keyEsc, ni, sok := g45scanString(b, i)
-		if !sok || keyEsc {
+		cs, ce, keyEsc, ni, sok := g45scanString(s, i)
+		if !sok {
+			return "", "", "", g45vNoFields // malformed key string
+		}
+		if keyEsc {
 			// A top-level key with any backslash escape decodes to something
 			// we don't want to reproduce by hand; defer to the fallback.
-			return "", "", "", false
+			return "", "", "", g45vFallback
 		}
-		t := g45TargetKey(b[cs:ce])
+		t := g45TargetKey(s[cs:ce])
 		if t == g45KeyFold {
-			return "", "", "", false // case-fold variant of a target: fall back
+			// Case-fold variant of a target: encoding/json would still map it
+			// to the field, so the fallback must run.
+			return "", "", "", g45vFallback
 		}
-		i = g45skipWS(b, ni)
-		if i >= len(b) || b[i] != ':' {
-			return "", "", "", false
+		i = g45skipWS(s, ni)
+		if i >= len(s) || s[i] != ':' {
+			return "", "", "", g45vNoFields
 		}
-		i = g45skipWS(b, i+1)
-		if i >= len(b) {
-			return "", "", "", false
+		i = g45skipWS(s, i+1)
+		if i >= len(s) {
+			return "", "", "", g45vNoFields // truncated
 		}
 		if t != g45KeyNone {
-			if b[i] != '"' {
-				return "", "", "", false // non-string target value: fall back
+			if s[i] != '"' {
+				// Non-string target value. If it is valid JSON the map path
+				// renders it (fmt semantics), so the fallback must run; we
+				// have not validated the rest, so this is NOT provably
+				// invalid either.
+				return "", "", "", g45vFallback
 			}
-			vcs, vce, vEsc, vni, vok := g45scanString(b, i)
-			if !vok || vEsc {
-				return "", "", "", false // escaped target string: fall back
+			vcs, vce, vEsc, vni, vok := g45scanString(s, i)
+			if !vok {
+				return "", "", "", g45vNoFields // malformed target string
 			}
-			val := b[vcs:vce]
-			if !utf8.Valid(val) {
+			if vEsc {
+				return "", "", "", g45vFallback // escaped target string
+			}
+			val := s[vcs:vce] // zero-copy substring; no alloc
+			if !utf8.ValidString(val) {
 				// encoding/json would replace invalid UTF-8 with U+FFFD; only
 				// the fallback reproduces that, so defer.
-				return "", "", "", false
+				return "", "", "", g45vFallback
 			}
-			s := string(val) // 1 alloc: copies out of the read-only view
 			switch t {
 			case g45KeyName:
-				name = s
+				name = val
 			case g45KeyDesc:
-				desc = s
+				desc = val
 			case g45KeyIcon:
-				icon = s
+				icon = val
 			}
 			i = vni
 		} else {
-			ni2, vok := g45skipValue(b, i, 1)
-			if !vok {
-				return "", "", "", false
+			ni2, v := g45skipValue(s, i, 1)
+			if v != g45vOK {
+				return "", "", "", v
 			}
 			i = ni2
 		}
-		i = g45skipWS(b, i)
-		if i >= len(b) {
-			return "", "", "", false
+		i = g45skipWS(s, i)
+		if i >= len(s) {
+			return "", "", "", g45vNoFields // truncated
 		}
-		switch b[i] {
+		switch s[i] {
 		case ',':
 			i++
 		case '}':
-			i = g45skipWS(b, i+1)
-			if i != len(b) {
-				return "", "", "", false // trailing garbage: encoding/json rejects
+			i = g45skipWS(s, i+1)
+			if i != len(s) {
+				return "", "", "", g45vNoFields // trailing garbage: encoding/json rejects
 			}
-			return name, desc, icon, true
+			return name, desc, icon, g45vOK
 		default:
-			return "", "", "", false
+			return "", "", "", g45vNoFields
 		}
 	}
 }
 
 // g45skipWS advances past JSON whitespace (space, tab, LF, CR) per the spec.
-func g45skipWS(b []byte, i int) int {
-	for i < len(b) {
-		switch b[i] {
+func g45skipWS(s string, i int) int {
+	for i < len(s) {
+		switch s[i] {
 		case ' ', '\t', '\n', '\r':
 			i++
 		default:
@@ -192,33 +261,33 @@ func g45skipWS(b []byte, i int) int {
 	return i
 }
 
-// g45scanString validates the JSON string starting at b[i] (b[i] == '"') using
+// g45scanString validates the JSON string starting at s[i] (s[i] == '"') using
 // exactly encoding/json's scanner rules and returns the content span [cs:ce)
 // (between the quotes), whether it contained any backslash escape, and the
 // index just past the closing quote. ok=false on any malformed string.
-func g45scanString(b []byte, i int) (cs, ce int, hasEsc bool, next int, ok bool) {
+func g45scanString(s string, i int) (cs, ce int, hasEsc bool, next int, ok bool) {
 	cs = i + 1
 	j := i + 1
-	for j < len(b) {
-		c := b[j]
+	for j < len(s) {
+		c := s[j]
 		switch {
 		case c == '"':
 			return cs, j, hasEsc, j + 1, true
 		case c == '\\':
 			hasEsc = true
 			j++
-			if j >= len(b) {
+			if j >= len(s) {
 				return 0, 0, false, 0, false
 			}
-			switch b[j] {
+			switch s[j] {
 			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 				j++
 			case 'u':
-				if j+4 >= len(b) {
+				if j+4 >= len(s) {
 					return 0, 0, false, 0, false
 				}
 				for k := 1; k <= 4; k++ {
-					if !g45isHex(b[j+k]) {
+					if !hexTable[s[j+k]] { // shared hex LUT (fastsync.go)
 						return 0, 0, false, 0, false
 					}
 				}
@@ -235,171 +304,171 @@ func g45scanString(b []byte, i int) (cs, ce int, hasEsc bool, next int, ok bool)
 	return 0, 0, false, 0, false // unterminated
 }
 
-// g45skipValue validates and skips exactly one JSON value beginning at b[i]
+// g45skipValue validates and skips exactly one JSON value beginning at s[i]
 // (already positioned on its first non-whitespace byte), returning the index
-// just past it. Validation matches encoding/json's checkValid; depth guards
-// against runaway nesting (bailing well before encoding/json's own limit).
-func g45skipValue(b []byte, i, depth int) (int, bool) {
+// just past it plus a verdict. Validation matches encoding/json's checkValid
+// plus the map decode's float64 conversion (see g45skipNumber), so
+// g45vNoFields means the original map decode provably errors; the ONE
+// deliberate divergence is the g45MaxDepth cap (far below encoding/json's
+// 10000), which returns g45vFallback because such input may still be valid to
+// encoding/json.
+func g45skipValue(s string, i, depth int) (int, g45Verdict) {
 	if depth > g45MaxDepth {
-		return 0, false
+		return 0, g45vFallback
 	}
-	if i >= len(b) {
-		return 0, false
+	if i >= len(s) {
+		return 0, g45vNoFields
 	}
-	switch c := b[i]; {
+	switch c := s[i]; {
 	case c == '"':
-		_, _, _, next, ok := g45scanString(b, i)
-		return next, ok
+		_, _, _, next, ok := g45scanString(s, i)
+		if !ok {
+			return 0, g45vNoFields
+		}
+		return next, g45vOK
 	case c == '-' || (c >= '0' && c <= '9'):
-		return g45skipNumber(b, i)
+		return g45skipNumber(s, i)
 	case c == 't':
-		if g45matchLit(b, i, "true") {
-			return i + 4, true
+		if strings.HasPrefix(s[i:], "true") {
+			return i + 4, g45vOK
 		}
-		return 0, false
+		return 0, g45vNoFields
 	case c == 'f':
-		if g45matchLit(b, i, "false") {
-			return i + 5, true
+		if strings.HasPrefix(s[i:], "false") {
+			return i + 5, g45vOK
 		}
-		return 0, false
+		return 0, g45vNoFields
 	case c == 'n':
-		if g45matchLit(b, i, "null") {
-			return i + 4, true
+		if strings.HasPrefix(s[i:], "null") {
+			return i + 4, g45vOK
 		}
-		return 0, false
+		return 0, g45vNoFields
 	case c == '{':
-		return g45skipObject(b, i, depth)
+		return g45skipObject(s, i, depth)
 	case c == '[':
-		return g45skipArray(b, i, depth)
+		return g45skipArray(s, i, depth)
 	default:
-		return 0, false
+		return 0, g45vNoFields
 	}
 }
 
-func g45skipObject(b []byte, i, depth int) (int, bool) {
+func g45skipObject(s string, i, depth int) (int, g45Verdict) {
 	i++ // past '{'
-	i = g45skipWS(b, i)
-	if i < len(b) && b[i] == '}' {
-		return i + 1, true
+	i = g45skipWS(s, i)
+	if i < len(s) && s[i] == '}' {
+		return i + 1, g45vOK
 	}
 	for {
-		i = g45skipWS(b, i)
-		if i >= len(b) || b[i] != '"' {
-			return 0, false
+		i = g45skipWS(s, i)
+		if i >= len(s) || s[i] != '"' {
+			return 0, g45vNoFields
 		}
-		_, _, _, ni, ok := g45scanString(b, i)
+		_, _, _, ni, ok := g45scanString(s, i)
 		if !ok {
-			return 0, false
+			return 0, g45vNoFields
 		}
-		i = g45skipWS(b, ni)
-		if i >= len(b) || b[i] != ':' {
-			return 0, false
+		i = g45skipWS(s, ni)
+		if i >= len(s) || s[i] != ':' {
+			return 0, g45vNoFields
 		}
-		i = g45skipWS(b, i+1)
-		ni, ok = g45skipValue(b, i, depth+1)
-		if !ok {
-			return 0, false
+		i = g45skipWS(s, i+1)
+		ni, v := g45skipValue(s, i, depth+1)
+		if v != g45vOK {
+			return 0, v
 		}
-		i = g45skipWS(b, ni)
-		if i >= len(b) {
-			return 0, false
+		i = g45skipWS(s, ni)
+		if i >= len(s) {
+			return 0, g45vNoFields
 		}
-		switch b[i] {
+		switch s[i] {
 		case ',':
 			i++
 		case '}':
-			return i + 1, true
+			return i + 1, g45vOK
 		default:
-			return 0, false
+			return 0, g45vNoFields
 		}
 	}
 }
 
-func g45skipArray(b []byte, i, depth int) (int, bool) {
+func g45skipArray(s string, i, depth int) (int, g45Verdict) {
 	i++ // past '['
-	i = g45skipWS(b, i)
-	if i < len(b) && b[i] == ']' {
-		return i + 1, true
+	i = g45skipWS(s, i)
+	if i < len(s) && s[i] == ']' {
+		return i + 1, g45vOK
 	}
 	for {
-		i = g45skipWS(b, i)
-		ni, ok := g45skipValue(b, i, depth+1)
-		if !ok {
-			return 0, false
+		i = g45skipWS(s, i)
+		ni, v := g45skipValue(s, i, depth+1)
+		if v != g45vOK {
+			return 0, v
 		}
-		i = g45skipWS(b, ni)
-		if i >= len(b) {
-			return 0, false
+		i = g45skipWS(s, ni)
+		if i >= len(s) {
+			return 0, g45vNoFields
 		}
-		switch b[i] {
+		switch s[i] {
 		case ',':
 			i++
 		case ']':
-			return i + 1, true
+			return i + 1, g45vOK
 		default:
-			return 0, false
+			return 0, g45vNoFields
 		}
 	}
 }
 
-// g45skipNumber validates and skips a JSON number starting at b[i] using the
+// g45skipNumber validates and skips a JSON number starting at s[i] using the
 // strict RFC 8259 grammar encoding/json enforces (no leading zeros, a digit
-// required after '.', a digit required after the exponent sign).
-func g45skipNumber(b []byte, i int) (int, bool) {
-	n := len(b)
-	if i < n && b[i] == '-' {
+// required after '.', a digit required after the exponent sign), then checks
+// float64 convertibility with the same strconv.ParseFloat call encoding/json's
+// convertNumber makes. A grammar-valid but unconvertible number (e.g. 1e999)
+// makes the original whole-blob map decode error and set nothing, so it
+// returns g45vNoFields rather than letting the scanner fire on a blob the
+// original algorithm rejected.
+func g45skipNumber(s string, i int) (int, g45Verdict) {
+	start := i
+	n := len(s)
+	if i < n && s[i] == '-' {
 		i++
 	}
 	if i >= n {
-		return 0, false
+		return 0, g45vNoFields
 	}
 	switch {
-	case b[i] == '0':
+	case s[i] == '0':
 		i++
-	case b[i] >= '1' && b[i] <= '9':
+	case s[i] >= '1' && s[i] <= '9':
 		i++
-		for i < n && b[i] >= '0' && b[i] <= '9' {
+		for i < n && s[i] >= '0' && s[i] <= '9' {
 			i++
 		}
 	default:
-		return 0, false
+		return 0, g45vNoFields
 	}
-	if i < n && b[i] == '.' {
+	if i < n && s[i] == '.' {
 		i++
-		if i >= n || b[i] < '0' || b[i] > '9' {
-			return 0, false
+		if i >= n || s[i] < '0' || s[i] > '9' {
+			return 0, g45vNoFields
 		}
-		for i < n && b[i] >= '0' && b[i] <= '9' {
+		for i < n && s[i] >= '0' && s[i] <= '9' {
 			i++
 		}
 	}
-	if i < n && (b[i] == 'e' || b[i] == 'E') {
+	if i < n && (s[i] == 'e' || s[i] == 'E') {
 		i++
-		if i < n && (b[i] == '+' || b[i] == '-') {
+		if i < n && (s[i] == '+' || s[i] == '-') {
 			i++
 		}
-		if i >= n || b[i] < '0' || b[i] > '9' {
-			return 0, false
+		if i >= n || s[i] < '0' || s[i] > '9' {
+			return 0, g45vNoFields
 		}
-		for i < n && b[i] >= '0' && b[i] <= '9' {
+		for i < n && s[i] >= '0' && s[i] <= '9' {
 			i++
 		}
 	}
-	return i, true
-}
-
-func g45matchLit(b []byte, i int, lit string) bool {
-	if i+len(lit) > len(b) {
-		return false
+	if _, err := strconv.ParseFloat(s[start:i], 64); err != nil {
+		return 0, g45vNoFields // out of float64 range: map decode errors too
 	}
-	for k := 0; k < len(lit); k++ {
-		if b[i+k] != lit[k] {
-			return false
-		}
-	}
-	return true
-}
-
-func g45isHex(c byte) bool {
-	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+	return i, g45vOK
 }
