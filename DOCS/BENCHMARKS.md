@@ -190,6 +190,33 @@ BenchmarkClassifySC_Miss        14.1 µs/op   4 allocs   (full-table walk + fall
 
 `ClassifySC` runs once per new SC install; a 14 µs worst-case is invisible in scan wall-clock. This bench exists as a regression guard — if the rule table ever grows to 50+ rules or a rule's pattern becomes expensive, the Miss bench is first to show it.
 
+### G45 corpus classify (July 2026)
+
+A real-mainnet corpus is committed under `indexer/testdata/` (45,514 G45-NFT +
+75 G45-C variable snapshots, 8 distinct code bodies); every benchmark iteration
+classifies the ENTIRE corpus, so allocs/op is the exact allocation total of one
+full pass — deterministic, immune to per-op rounding.
+
+```
+BenchmarkClassifyCorpus/Full   before: 1,970,788 allocs/op   79.3 MB/op   ~365 ms
+                               after:        415 allocs/op   ~34 KB/op    ~55 ms   (−99.98% allocs)
+```
+
+Reproduce: `bash scripts/measure_classify.sh` — one JSON line with the
+median-of-5 metric plus the gates: full `indexer` `-race` suite, a golden
+snapshot pinning the full `SCClass` output for all 45,589 SCs byte-identically
+(regeneration is a deliberate human act, never part of an optimization), a
+map/slice path equivalence gate, and an allocs-determinism tripwire.
+
+What got it there: a zero-alloc hand scanner tier for simple metadata shapes
+(zero-copy substrings, tri-state verdict that skips decodes proven to set
+nothing), shared precomputed per-class Tags slices, and a differential fuzz
+gate against the stdlib decode. The residual ~415 is deliberate: unusual
+shapes (escaped values, case-fold keys) fall back to the ORIGINAL
+`map[string]interface{}` decode, kept for exact behavior parity with
+pre-optimization Gnomon (exact-case key matching, whole-blob strictness) —
+the last fraction of the win was traded for provable parity.
+
 ## TELA correctness
 
 Not a perf bench — a correctness gate. The content server's output must be byte-identical (SHA256) to civilware/tela's `parseDocCode` on every live mainnet TELA contract we can reach.
