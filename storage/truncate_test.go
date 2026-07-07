@@ -53,10 +53,10 @@ func buildReorgChain(t *testing.T, store *BboltStore, maxH int64) {
 		b.RegTxCount = 1
 		b.NormTxCount = 1
 
-		switch {
-		case h == 2:
+		switch h {
+		case 2:
 			installSC(b, trScidX, trAddrA, h, "TELA-INDEX-1", "AppX", "appx.tela")
-		case h == 4:
+		case 4:
 			installSC(b, trScidY, trAddrB, h, "TELA-DOC-1", "DocY", "doc.tela")
 		}
 		if h >= 3 {
