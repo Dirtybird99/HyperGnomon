@@ -403,3 +403,71 @@ BenchmarkSCTXParse_Turbo_Unmarshal_Msgpack-24    	  395754	      1502 ns/op	    
 BenchmarkSCTXParse_Turbo_Unmarshal_Msgpack-24    	  389920	      1520 ns/op	     408 B/op	       6 allocs/op
 PASS
 ok  	github.com/hypergnomon/hypergnomon/structures	40.047s
+
+--- TruncateToHeight sweep (July 2026, -benchtime=3x -count=6; see DOCS/BENCHMARKS.md "TruncateToHeight reorg rollback") ---
+goos: windows
+goarch: amd64
+pkg: github.com/hypergnomon/hypergnomon/storage
+cpu: 13th Gen Intel(R) Core(TM) i7-13700HX
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1706167 ns/op	        10.00 affectedSCs	 1029053 B/op	   13520 allocs/op
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1615500 ns/op	        10.00 affectedSCs	 1028557 B/op	   13517 allocs/op
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1677300 ns/op	        10.00 affectedSCs	 1028237 B/op	   13514 allocs/op
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1691400 ns/op	        10.00 affectedSCs	 1027992 B/op	   13510 allocs/op
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1627867 ns/op	        10.00 affectedSCs	 1028290 B/op	   13516 allocs/op
+BenchmarkTruncateToHeight/scids=2000/addrs=512/depth=10/S=10-24         	       3	   1684933 ns/op	        10.00 affectedSCs	 1028504 B/op	   13515 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   4304933 ns/op	        10.00 affectedSCs	 2077618 B/op	   31574 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   4552200 ns/op	        10.00 affectedSCs	 2078528 B/op	   31570 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   5504067 ns/op	        10.00 affectedSCs	 2079189 B/op	   31573 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   7261633 ns/op	        10.00 affectedSCs	 2076552 B/op	   31568 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   8264233 ns/op	        10.00 affectedSCs	 2076344 B/op	   31570 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=10/S=10-24         	       3	   7400267 ns/op	        10.00 affectedSCs	 2075960 B/op	   31566 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  37298967 ns/op	        10.00 affectedSCs	 6744514 B/op	  104237 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  26440567 ns/op	        10.00 affectedSCs	 6738648 B/op	  104228 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  24542933 ns/op	        10.00 affectedSCs	 6741584 B/op	  104232 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  33309267 ns/op	        10.00 affectedSCs	 6743730 B/op	  104234 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  33578133 ns/op	        10.00 affectedSCs	 6743869 B/op	  104235 allocs/op
+BenchmarkTruncateToHeight/scids=32000/addrs=512/depth=10/S=10-24        	       3	  26302567 ns/op	        10.00 affectedSCs	 6744642 B/op	  104238 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	  11667200 ns/op	        10.00 affectedSCs	 1676960 B/op	   25286 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	   9918933 ns/op	        10.00 affectedSCs	 1673570 B/op	   25276 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	   9832300 ns/op	        10.00 affectedSCs	 1673240 B/op	   25276 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	  10378567 ns/op	        10.00 affectedSCs	 1676410 B/op	   25282 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	   9905233 ns/op	        10.00 affectedSCs	 1674360 B/op	   25277 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=1/depth=10/S=10-24           	       3	  10118267 ns/op	        10.00 affectedSCs	 1673869 B/op	   25278 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  26291800 ns/op	        10.00 affectedSCs	 8723197 B/op	  121473 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  21150833 ns/op	        10.00 affectedSCs	 8678493 B/op	  121449 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  20910033 ns/op	        10.00 affectedSCs	 8678242 B/op	  121450 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  20778367 ns/op	        10.00 affectedSCs	 8680752 B/op	  121454 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  19097267 ns/op	        10.00 affectedSCs	 8680688 B/op	  121453 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=8192/depth=10/S=10-24        	       3	  20588633 ns/op	        10.00 affectedSCs	 8713408 B/op	  121470 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   6782700 ns/op	         1.000 affectedSCs	 2016965 B/op	   31044 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   7826800 ns/op	         1.000 affectedSCs	 2018920 B/op	   31045 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   9021367 ns/op	         1.000 affectedSCs	 2016240 B/op	   31040 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   7553600 ns/op	         1.000 affectedSCs	 2019106 B/op	   31046 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   6981833 ns/op	         1.000 affectedSCs	 2028912 B/op	   31043 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1-24         	       3	   7407467 ns/op	         1.000 affectedSCs	 2028549 B/op	   31041 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  10800567 ns/op	       100.0 affectedSCs	 3067184 B/op	   41075 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  10719267 ns/op	       100.0 affectedSCs	 3061880 B/op	   41037 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  11376167 ns/op	       100.0 affectedSCs	 3063701 B/op	   41019 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  10518667 ns/op	       100.0 affectedSCs	 3056658 B/op	   40958 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  12843267 ns/op	       100.0 affectedSCs	 3064962 B/op	   41008 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=100-24       	       3	  13625567 ns/op	       100.0 affectedSCs	 3070728 B/op	   41093 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  51799233 ns/op	      1000 affectedSCs	11026984 B/op	  123196 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  37421900 ns/op	      1000 affectedSCs	10977594 B/op	  122959 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  46675900 ns/op	      1000 affectedSCs	10986266 B/op	  123384 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  36945833 ns/op	      1000 affectedSCs	10912685 B/op	  122602 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  35146700 ns/op	      1000 affectedSCs	10978565 B/op	  122921 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=100/S=1000-24      	       3	  33452733 ns/op	      1000 affectedSCs	11038805 B/op	  123102 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   6872467 ns/op	         1.000 affectedSCs	 1986050 B/op	   30630 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   7419500 ns/op	         1.000 affectedSCs	 1985858 B/op	   30628 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   8395933 ns/op	         1.000 affectedSCs	 1985496 B/op	   30626 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   6401633 ns/op	         1.000 affectedSCs	 1985560 B/op	   30626 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   8027800 ns/op	         1.000 affectedSCs	 1985864 B/op	   30628 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1/S=1-24           	       3	   7095000 ns/op	         1.000 affectedSCs	 1988114 B/op	   30630 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   7649100 ns/op	         1.000 affectedSCs	 2300040 B/op	   34735 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   8901300 ns/op	         1.000 affectedSCs	 2300466 B/op	   34738 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   8762533 ns/op	         1.000 affectedSCs	 2303400 B/op	   34744 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   8422833 ns/op	         1.000 affectedSCs	 2300402 B/op	   34737 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   7843267 ns/op	         1.000 affectedSCs	 2300480 B/op	   34738 allocs/op
+BenchmarkTruncateToHeight/scids=8000/addrs=512/depth=1000/S=1-24        	       3	   7490667 ns/op	         1.000 affectedSCs	 2300104 B/op	   34735 allocs/op
+PASS
+ok  	github.com/hypergnomon/hypergnomon/storage	86.212s
