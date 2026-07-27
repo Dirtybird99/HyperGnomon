@@ -916,9 +916,16 @@ func (idx *Indexer) postScanVariableFetch() {
 						// empty. Same shape as refreshClassMetaOnInvoke: keep
 						// the code-derived class, refresh the var-derived
 						// fields, preserve InstallHeight.
-						meta := idx.reclassifyFromVars(scid, vars)
+						// One height for BOTH writes. ClassMeta.LastHeight is
+						// the key readers use to locate the matching snapshot,
+						// and GetSCIDVariableDetailsAtHeight builds an EXACT
+						// "<scid>:<height>" key with no floor scan — so a
+						// LastHeight that disagrees with the height the vars
+						// were written at silently resolves to nothing.
+						h := idx.ChainHeight.Load()
+						meta := idx.reclassifyFromVars(scid, vars, h)
 						mu.Lock()
-						batch.AddVariables(scid, idx.ChainHeight.Load(), vars)
+						batch.AddVariables(scid, h, vars)
 						if meta != nil {
 							batch.AddClass(scid, meta)
 						}
@@ -950,13 +957,17 @@ func (idx *Indexer) postScanVariableFetch() {
 // install-time class permanently — the same trap documented on
 // refreshClassMetaOnInvoke. So a read error or a missing prior record means
 // "skip", never "reclassify from scratch".
-func (idx *Indexer) reclassifyFromVars(scid string, vars []*structures.SCIDVariable) *structures.ClassMeta {
+// height must be the SAME height the caller writes the variable snapshot at —
+// it becomes ClassMeta.LastHeight, which is how readers find that snapshot.
+// Only InstallHeight is carried forward; this is a refresh, not an install.
+// Matches refreshClassMetaOnInvoke and the fastsync/tela_refresher sites.
+func (idx *Indexer) reclassifyFromVars(scid string, vars []*structures.SCIDVariable, height int64) *structures.ClassMeta {
 	existing, err := idx.Store.GetSCIDClass(scid)
 	if err != nil || existing == nil {
 		return nil
 	}
 	sc := ClassifySCVarsWithClass(scid, existing.Class, vars)
-	return classMetaFrom(&sc, existing.InstallHeight, existing.LastHeight)
+	return classMetaFrom(&sc, existing.InstallHeight, height)
 }
 
 // processSCTx handles a smart contract transaction.

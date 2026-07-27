@@ -440,12 +440,12 @@ type assetCatalogCacheEntry struct {
 }
 
 type assetEntry struct {
-	SCID             string   `json:"scid"`
-	Class            string   `json:"class"`
-	Tags             []string `json:"tags"`
-	Name             string   `json:"name"`
-	Description      string   `json:"description"`
-	IconURL          string   `json:"icon_url"`
+	SCID        string   `json:"scid"`
+	Class       string   `json:"class"`
+	Tags        []string `json:"tags"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	IconURL     string   `json:"icon_url"`
 	// Media URLs from the asset's on-chain metadata. Omitted when empty so
 	// existing consumers see an unchanged response shape for assets that carry
 	// none. G45 assets populate Image (from `image`, or `backdropImage` on a
@@ -454,17 +454,17 @@ type assetEntry struct {
 	// These are URLs, not content: HyperGnomon does not fetch, cache, or proxy
 	// the bytes behind them. Almost all are `ipfs://` and need a gateway or
 	// local node to resolve.
-	Image            string   `json:"image,omitempty"`
-	AltImage         string   `json:"alt_image,omitempty"`
-	Audio            string   `json:"audio,omitempty"`
-	Video            string   `json:"video,omitempty"`
-	ImagesJSON       string   `json:"images,omitempty"`
-	Owner            string   `json:"owner"`
-	InstallHeight    int64    `json:"install_height"`
-	LastHeight       int64    `json:"last_height"`
-	FirstTouchHeight int64    `json:"first_touch_height,omitempty"`
-	LastTouchHeight  int64    `json:"last_touch_height,omitempty"`
-	TouchCount       int64    `json:"touch_count,omitempty"`
+	Image            string `json:"image,omitempty"`
+	AltImage         string `json:"alt_image,omitempty"`
+	Audio            string `json:"audio,omitempty"`
+	Video            string `json:"video,omitempty"`
+	ImagesJSON       string `json:"images,omitempty"`
+	Owner            string `json:"owner"`
+	InstallHeight    int64  `json:"install_height"`
+	LastHeight       int64  `json:"last_height"`
+	FirstTouchHeight int64  `json:"first_touch_height,omitempty"`
+	LastTouchHeight  int64  `json:"last_touch_height,omitempty"`
+	TouchCount       int64  `json:"touch_count,omitempty"`
 }
 
 func assetClassesForParam(class string) ([]string, bool) {
