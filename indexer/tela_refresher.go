@@ -128,8 +128,6 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 		poolSize = 8
 	}
 
-	classTags := tagsForClass(class)
-
 	// Fast-path keys: when the class has a known manifest and we're not due
 	// for a full refresh, ask the daemon for only those keys (Variables=false
 	// + KeysString). Daemon skips its cursor scan; response is O(|keys|).
@@ -182,17 +180,7 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 							// refreshing, so seed it and let extractClassVars pull
 							// DURL/Version in the same walk (audit #8).
 							sc := ClassifySCVarsWithClass(chunk[i], class, vars)
-							meta := &structures.ClassMeta{
-								Class:         class,
-								Tags:          classTags,
-								Name:          sc.Name,
-								Desc:          sc.Desc,
-								IconURL:       sc.IconURL,
-								DURL:          sc.DURL,
-								Version:       sc.Version,
-								InstallHeight: chainHeight,
-								LastHeight:    chainHeight,
-							}
+							meta := classMetaFrom(&sc, chainHeight, chainHeight)
 							batchMu.Lock()
 							batch.AddVariables(chunk[i], chainHeight, vars)
 							batch.AddClass(chunk[i], meta)

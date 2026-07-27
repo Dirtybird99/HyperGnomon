@@ -132,8 +132,8 @@ GET /api/scidprivtx?address=A     Normal (non-SC-invoke) TXs carrying SCID paylo
 GET /api/tela                     All TELA apps with metadata
 GET /api/tela/count               TELA app count (lightweight polling)
 GET /api/tela/{scid}/ratings      On-chain TELA ratings for one SCID (per-rater scores, count, average)
-GET /api/assets                   Asset/NFT catalog (NFA, G45, legacy DERO assets)
-GET /api/assets/{scid}            Asset/NFT metadata for one SCID
+GET /api/assets                   Asset/NFT catalog (NFA, G45 incl. collections, legacy DERO assets)
+GET /api/assets/{scid}            Asset/NFT metadata for one SCID (incl. media URLs)
 GET /api/address/{addr}/created-assets  Asset contracts deployed by address
 GET /api/address/{addr}/touched-assets  Asset contracts the address interacted with
 GET /api/address/{addr}/scs       All SCIDs the address interacted with
@@ -145,6 +145,12 @@ GET /tela/{scid}/{path…}          TELA content server (INDEX routing, DOC body
 The `/tela/{scid}/…` endpoint is the content server. It resolves TELA-INDEX routes, fetches referenced TELA-DOC source, strips the `/* … */` body, decompresses `.gz` assets (base64→gunzip), and dispatches DocShard strict parsing when the dURL suffix is `.shard`/`.shards`. With `--tela-verify-sigs`, every response carries `X-TELA-Verify: disabled|unsigned|signed-unverified|passed|failed`.
 
 Asset endpoints are catalog and activity views. True "my held assets" should be wallet-assisted: fetch candidate asset SCIDs from `/api/assets`, then have the wallet check decrypted balances for each SCID at the latest topoheight. `/created-assets` means deployer/registry ownership; `/touched-assets` means interaction history. Neither endpoint claims current wallet balance.
+
+Asset entries carry the media URLs declared in the contract's `metadata` blob — `image` (an NFT's artwork, or a collection's `backdropImage`), `alt_image`, `audio`, `video`, and `images` (the raw JSON object of named secondary artwork). Each is omitted when empty. Note that G45 metadata does not use the `icon` key, so `icon_url` is empty for G45 assets and `image` is the field to render.
+
+**These are URLs, not content.** HyperGnomon never fetches, caches, or proxies the bytes behind them — it is an indexer, not a CDN. On current mainnet 45,347 of them are `ipfs://` and 52 are `https`, so a consumer needs a gateway or a local IPFS node to resolve them.
+
+Populating them requires the contract's variables, which turbo mode skips during scan. Run with `--postscan-vars=all`, or call `RefreshClassVars("G45-NFT")` from the Go library, to fill asset metadata; under the default `--postscan-vars=lazy` the class bucket holds the class name alone. This is pre-existing behavior for `Name`/`Desc` too, not specific to media.
 
 ## 7. WebSocket API
 

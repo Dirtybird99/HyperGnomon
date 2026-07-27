@@ -4,6 +4,34 @@ All notable changes to HyperGnomon. Dates in UTC.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to [SemVer](https://semver.org/) from v1.0 onward.
 
+## [Unreleased]
+
+### Added
+
+- G45 media URLs on the asset API. `ClassifySC` now lifts `image`, `backdropImage`, `alt-image`, `alt-backdropImage`, `audio`, `video`, and `images` out of the G45 `metadata` blob into new `ClassMeta` fields, surfaced as `image` / `alt_image` / `audio` / `video` / `images` on `/api/assets` and `/api/assets/{scid}` (omitted when empty). These are **URLs only** — HyperGnomon does not fetch, cache, or proxy the bytes, and 99.9% of them are `ipfs://`.
+
+  Motivation: the extractor only ever read `icon`, which appears **zero times** across the 45,589-SC mainnet corpus, so `ClassMeta.IconURL` — the only media-ish field the asset API exposed — was empty for every G45 asset. `image` is present on 45,399 of 45,514 NFTs and `backdropImage` on 64 of 74 collections.
+
+  `ImagesJSON` carries the `images` object as **verbatim on-chain JSON text**, not re-encoded: key order and spacing are whatever the minter wrote.
+
+- `G45-C` (collections) added to the `/api/assets` catalog and to `isAssetClass`, so a collection's `backdropImage` is reachable. This grows the default `/api/assets` response by the ~75 collection contracts on mainnet.
+
+- The new fields ride the `/ws` class-assignment event automatically — `publishBatchEvents` sends the whole `ClassMeta` as the event payload.
+
+### Changed
+
+- `ClassMeta` typed v1 encoding gained an optional five-string media tail, appended after `Version` with **no tag bump**. Forward-compat: the v1 reader always discarded trailing bytes, so a pre-media binary reads a media record. Backward-compat: a truncated or absent tail now decodes as empty rather than `ErrInvalidClassMeta`. Records without media encode byte-identically to before, so stored records and size benchmarks are untouched.
+
+- Turbo's post-scan variable sweep (`--postscan-vars=all`) now re-classifies from the variables it fetches instead of discarding them. Turbo's scan-time classify runs with nil vars (code only), so previously the sweep paid for every `GetSC` and still left `Name`/`Desc`/`IconURL` empty for non-TELA classes. Fixes pre-existing empty G45/NFA metadata, not just the new media fields.
+
+### Fixed
+
+- Every `ClassMeta` construction site now funnels through one `classMetaFrom` projection. The projection had been copy-pasted across seven sites in `indexer.go`, `fastsync.go`, and `tela_refresher.go`, so adding a field to `SCClass` populated it only on the paths the author remembered — with no failing test, because each path belongs to a different sync mode.
+
+### Performance
+
+- No change: `BenchmarkClassifyCorpus/Full` holds at 415 allocs/op and 34,368 B/op, byte-for-byte the pre-change figures, with wall-clock inside run-to-run noise. Getting there required routing `images` through the scanner's skip branch rather than making it a target key — its value is an object, and a non-string target value forces the whole blob down the fallback map decode (measured: +1,111 allocs, +62 KB over the corpus, for the 23 blobs that carry it). The skip branch has already walked the value's extent, so capturing the raw text is free.
+
 ## [1.1.0] — 2026-06-29
 
 Pluggable storage backends + a large allocation-reduction pass, with a true civilware/Gnomon drop-in for HOLOGRAM.

@@ -579,17 +579,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 							// probe, so seed it and let extractClassVars pull DURL/
 							// Version/DocType/Mods in the same walk (audit #8).
 							sc := ClassifySCVarsWithClass(item.scids[i], item.class, vars)
-							meta := &structures.ClassMeta{
-								Class:         sc.Class,
-								Tags:          sc.Tags,
-								Name:          sc.Name,
-								Desc:          sc.Desc,
-								IconURL:       sc.IconURL,
-								DURL:          sc.DURL,
-								Version:       sc.Version,
-								InstallHeight: chainHeight,
-								LastHeight:    chainHeight,
-							}
+							meta := classMetaFrom(&sc, chainHeight, chainHeight)
 							phase2ClassifyNanos.Add(time.Since(tClassify).Nanoseconds())
 
 							varMu.Lock()

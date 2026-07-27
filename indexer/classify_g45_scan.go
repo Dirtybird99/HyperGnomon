@@ -52,8 +52,52 @@ const (
 	g45KeyName
 	g45KeyDesc
 	g45KeyIcon
+	// Media keys. G45 assets never use `icon` — not once in the 45,589-SC
+	// mainnet corpus — so these are what actually carries artwork: `image` on
+	// NFTs, `backdropImage` on collections, with `alt-` variants of each.
+	// g45KeyImagesRaw is `images`, the one media key whose value is an object
+	// rather than a string. It is routed to the SKIP branch, not the target
+	// branch: a non-string target value forces the whole blob down the
+	// fallback map decode, measured at +1,111 allocs and +62 KB over the
+	// corpus (a 4x ClassifyCorpus regression) for the 23 blobs carrying it.
+	// The skip branch has already walked the value's extent, so capturing the
+	// raw text there is free — see the capture in g45ScanMetaVerdict.
+	g45KeyImage
+	g45KeyBackdropImage
+	g45KeyAltImage
+	g45KeyAltBackdropImage
+	g45KeyAudio
+	g45KeyVideo
+	g45KeyImagesRaw
 	g45KeyFold
 )
+
+// g45Fields carries the scanner's extracted values. A struct rather than a
+// growing list of named returns: ten strings positionally is a transposition
+// bug waiting to happen, and by-value it costs no allocation.
+//
+// These are RAW per-key values. Precedence between them (image → backdropImage
+// and alt-image → alt-backdropImage) is policy and lives in
+// extractG45MetadataString, keeping this file a pure JSON reader whose output
+// can be compared field-for-field against the map-decode oracle.
+type g45Fields struct {
+	name, desc, icon           string
+	image, backdropImage       string
+	altImage, altBackdropImage string
+	audio, video               string
+	// images is the RAW JSON text of the `images` value (an object), not a
+	// decoded string like the fields above. See the skip-branch capture in
+	// g45ScanMetaVerdict.
+	images string
+}
+
+// g45TargetNames are the exact keys g45TargetKey matches, in key-id order
+// after g45KeyNone. Used for the fold-variant sweep below.
+var g45TargetNames = [...]string{
+	"name", "description", "icon",
+	"image", "backdropImage", "alt-image", "alt-backdropImage",
+	"audio", "video",
+}
 
 // g45Verdict is the scanner's routing decision. A distinct type (not a bare
 // int) so a verdict can never be confused with a scan position or a key id
@@ -127,118 +171,262 @@ func g45TargetKey(key string) int {
 		return g45KeyDesc
 	case "icon":
 		return g45KeyIcon
+	case "image":
+		return g45KeyImage
+	case "backdropImage":
+		return g45KeyBackdropImage
+	case "alt-image":
+		return g45KeyAltImage
+	case "alt-backdropImage":
+		return g45KeyAltBackdropImage
+	case "audio":
+		return g45KeyAudio
+	case "video":
+		return g45KeyVideo
+	case "images":
+		return g45KeyImagesRaw
 	}
-	if strings.EqualFold(key, "name") || strings.EqualFold(key, "description") || strings.EqualFold(key, "icon") {
-		return g45KeyFold
+	// Fold sweep. This runs for every NON-target top-level key of every blob —
+	// `attributes`, `id`, `score` — so it is the hottest miss path in the
+	// classifier, and it grew from 3 targets to 9 with the media keys.
+	//
+	// The filter is a length check, which is only sound because it is gated on
+	// the key being pure ASCII. Simple folding is NOT length-preserving in
+	// general — "deſcription" (U+017F, 12 bytes) folds to "description" (11)
+	// and is pinned as a must-defer case in TestG45ScanFires — but it IS
+	// length-preserving within ASCII, and a fold variant that changes byte
+	// length must contain a non-ASCII byte. So: ASCII keys can only fold-match
+	// a same-length target; anything else takes the unfiltered sweep.
+	ascii := g45IsASCII(key)
+	for _, t := range g45TargetNames {
+		if ascii && len(t) != len(key) {
+			continue
+		}
+		if strings.EqualFold(key, t) {
+			return g45KeyFold
+		}
 	}
 	return g45KeyNone
+}
+
+// g45IsASCII reports whether s contains only bytes < 0x80.
+func g45IsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// g45ImagesKey is the quoted top-level key g45ScanImagesRaw looks for. Used
+// verbatim as a Contains pre-filter: a blob with a top-level "images" key
+// necessarily contains these bytes, so the filter has no false negatives, and
+// a false positive (the sequence appearing inside a nested value) only costs
+// one scan that finds nothing.
+const g45ImagesKey = `"images"`
+
+// g45ScanImagesRaw returns the raw JSON text of the top-level "images" value —
+// a zero-copy substring of s — or ("", false) when there is no such key.
+//
+// WHY A SEPARATE PASS: "images" is the only media key whose value is an object
+// rather than a string. Making it a scanner target would push every blob
+// carrying it through the fallback map decode (a non-string target value is an
+// automatic g45vFallback), which measured at +1,111 allocs / +62 KB over the
+// corpus — a 4x ClassifyCorpus regression bought by 23 blobs. Scanning for it
+// separately keeps the main scanner's "targets are simple strings" invariant
+// intact and costs a Contains check on blobs that lack the key.
+//
+// PRECONDITION: s is valid JSON. Both call sites have already established
+// that — the g45vOK path because the scanner validated the whole object, the
+// fallback path because json.Unmarshal returned nil. This function therefore
+// does not re-validate; it only locates. On anything it cannot walk cleanly it
+// returns ("", false), so a violated precondition degrades to "absent" rather
+// than to a wrong value.
+//
+// Last-wins on duplicate keys, matching both encoding/json and the main
+// scanner. The returned text is verbatim on-chain bytes, NOT re-encoded: key
+// order and inner spacing are whatever the minter wrote. That is what makes it
+// reproducible from both call sites — canonicalizing would require a decode,
+// which is the cost this exists to avoid.
+func g45ScanImagesRaw(s string) (string, bool) {
+	if !strings.Contains(s, g45ImagesKey) {
+		return "", false
+	}
+	i := g45skipWS(s, 0)
+	if i >= len(s) || s[i] != '{' {
+		return "", false
+	}
+	i++
+	var out string
+	var found bool
+	for {
+		i = g45skipWS(s, i)
+		if i >= len(s) {
+			return out, found
+		}
+		if s[i] == '}' {
+			return out, found
+		}
+		if s[i] != '"' {
+			return out, found
+		}
+		cs, ce, keyEsc, ni, ok := g45scanString(s, i)
+		if !ok {
+			return out, found
+		}
+		i = g45skipWS(s, ni)
+		if i >= len(s) || s[i] != ':' {
+			return out, found
+		}
+		i = g45skipWS(s, i+1)
+		vs := i
+		next, verdict := g45skipValue(s, i, 1)
+		if verdict != g45vOK {
+			return out, found
+		}
+		// An escaped key never matches: the map decode compares the DECODED
+		// key, but "images" decoding to "images" is a shape we decline
+		// rather than reproduce by hand — same rule the main scanner applies.
+		if !keyEsc && s[cs:ce] == "images" {
+			out, found = s[vs:next], true // zero-copy; last occurrence wins
+		}
+		i = g45skipWS(s, next)
+		if i >= len(s) {
+			return out, found
+		}
+		if s[i] != ',' {
+			return out, found
+		}
+		i++
+	}
 }
 
 // g45ScanMeta is the []byte compatibility entry point (differential and fuzz
 // gates drive it). It copies b into a string once so the substrings the core
 // scanner returns never alias a caller-mutable byte slice. ok collapses the
 // tri-state verdict: true only for a clean fire.
-func g45ScanMeta(b []byte) (name, desc, icon string, ok bool) {
-	name, desc, icon, v := g45ScanMetaVerdict(string(b))
-	return name, desc, icon, v == g45vOK
+func g45ScanMeta(b []byte) (f g45Fields, ok bool) {
+	f, v := g45ScanMetaVerdict(string(b))
+	return f, v == g45vOK
 }
 
 // g45ScanMetaVerdict walks the top-level JSON object in s, returning the
-// last-seen string values of "name"/"description"/"icon" (each defaulting to
-// "") and g45vOK ONLY when the entire object validated cleanly AND every
-// target value encountered was a simple no-escape valid-UTF-8 string. On any
-// deviation it returns g45vFallback (fallback must run) or g45vNoFields
-// (fallback provably sets nothing — see the verdict constants).
+// last-seen string value of every target key (each defaulting to "") and
+// g45vOK ONLY when the entire object validated cleanly AND every target value
+// encountered was a simple no-escape valid-UTF-8 string. On any deviation it
+// returns g45vFallback (fallback must run) or g45vNoFields (fallback provably
+// sets nothing — see the verdict constants).
 //
 // The returned values are zero-copy substrings of s (s[i:j]) — safe because
 // Go strings are immutable. They pin s's backing array for as long as the
 // caller retains them; extractG45MetadataString clones them for blobs larger
 // than g45CloneThreshold so ClassMeta held in eventbus queues or the seed
 // cache never pins more than that per entry.
-func g45ScanMetaVerdict(s string) (name, desc, icon string, verdict g45Verdict) {
+func g45ScanMetaVerdict(s string) (f g45Fields, verdict g45Verdict) {
 	i := g45skipWS(s, 0)
 	if i >= len(s) || s[i] != '{' {
 		// Not an object. Whether the rest is valid JSON or garbage, neither
 		// fallback decode can set a field (see g45vNoFields).
-		return "", "", "", g45vNoFields
+		return g45Fields{}, g45vNoFields
 	}
 	i++
 	i = g45skipWS(s, i)
 	if i < len(s) && s[i] == '}' { // empty object: valid, fills nothing
 		i = g45skipWS(s, i+1)
 		if i != len(s) {
-			return "", "", "", g45vNoFields // trailing garbage
+			return g45Fields{}, g45vNoFields // trailing garbage
 		}
-		return "", "", "", g45vOK
+		return g45Fields{}, g45vOK
 	}
 	for {
 		i = g45skipWS(s, i)
 		if i >= len(s) || s[i] != '"' {
-			return "", "", "", g45vNoFields // object key must be a string
+			return g45Fields{}, g45vNoFields // object key must be a string
 		}
 		cs, ce, keyEsc, ni, sok := g45scanString(s, i)
 		if !sok {
-			return "", "", "", g45vNoFields // malformed key string
+			return g45Fields{}, g45vNoFields // malformed key string
 		}
 		if keyEsc {
 			// A top-level key with any backslash escape decodes to something
 			// we don't want to reproduce by hand; defer to the fallback.
-			return "", "", "", g45vFallback
+			return g45Fields{}, g45vFallback
 		}
 		t := g45TargetKey(s[cs:ce])
 		if t == g45KeyFold {
 			// Case-fold variant of a target: encoding/json would still map it
 			// to the field, so the fallback must run.
-			return "", "", "", g45vFallback
+			return g45Fields{}, g45vFallback
 		}
 		i = g45skipWS(s, ni)
 		if i >= len(s) || s[i] != ':' {
-			return "", "", "", g45vNoFields
+			return g45Fields{}, g45vNoFields
 		}
 		i = g45skipWS(s, i+1)
 		if i >= len(s) {
-			return "", "", "", g45vNoFields // truncated
+			return g45Fields{}, g45vNoFields // truncated
 		}
-		if t != g45KeyNone {
+		if t != g45KeyNone && t != g45KeyImagesRaw {
 			if s[i] != '"' {
 				// Non-string target value. If it is valid JSON the map path
 				// renders it (fmt semantics), so the fallback must run; we
 				// have not validated the rest, so this is NOT provably
 				// invalid either.
-				return "", "", "", g45vFallback
+				return g45Fields{}, g45vFallback
 			}
 			vcs, vce, vEsc, vni, vok := g45scanString(s, i)
 			if !vok {
-				return "", "", "", g45vNoFields // malformed target string
+				return g45Fields{}, g45vNoFields // malformed target string
 			}
 			if vEsc {
-				return "", "", "", g45vFallback // escaped target string
+				return g45Fields{}, g45vFallback // escaped target string
 			}
 			val := s[vcs:vce] // zero-copy substring; no alloc
 			if !utf8.ValidString(val) {
 				// encoding/json would replace invalid UTF-8 with U+FFFD; only
 				// the fallback reproduces that, so defer.
-				return "", "", "", g45vFallback
+				return g45Fields{}, g45vFallback
 			}
 			switch t {
 			case g45KeyName:
-				name = val
+				f.name = val
 			case g45KeyDesc:
-				desc = val
+				f.desc = val
 			case g45KeyIcon:
-				icon = val
+				f.icon = val
+			case g45KeyImage:
+				f.image = val
+			case g45KeyBackdropImage:
+				f.backdropImage = val
+			case g45KeyAltImage:
+				f.altImage = val
+			case g45KeyAltBackdropImage:
+				f.altBackdropImage = val
+			case g45KeyAudio:
+				f.audio = val
+			case g45KeyVideo:
+				f.video = val
 			}
 			i = vni
 		} else {
 			ni2, v := g45skipValue(s, i, 1)
 			if v != g45vOK {
-				return "", "", "", v
+				return g45Fields{}, v
+			}
+			// `images` rides the skip branch rather than the target branch:
+			// its value is an object, and the target branch would force the
+			// whole blob to the fallback. The extent g45skipValue just walked
+			// IS the value, so capturing it is free — no second pass, no
+			// Contains pre-filter over every blob.
+			if t == g45KeyImagesRaw {
+				f.images = s[i:ni2] // zero-copy; last occurrence wins
 			}
 			i = ni2
 		}
 		i = g45skipWS(s, i)
 		if i >= len(s) {
-			return "", "", "", g45vNoFields // truncated
+			return g45Fields{}, g45vNoFields // truncated
 		}
 		switch s[i] {
 		case ',':
@@ -246,11 +434,11 @@ func g45ScanMetaVerdict(s string) (name, desc, icon string, verdict g45Verdict) 
 		case '}':
 			i = g45skipWS(s, i+1)
 			if i != len(s) {
-				return "", "", "", g45vNoFields // trailing garbage: encoding/json rejects
+				return g45Fields{}, g45vNoFields // trailing garbage: encoding/json rejects
 			}
-			return name, desc, icon, g45vOK
+			return f, g45vOK
 		default:
-			return "", "", "", g45vNoFields
+			return g45Fields{}, g45vNoFields
 		}
 	}
 }

@@ -125,6 +125,23 @@ type ClassMeta struct {
 	Version       string   `msgpack:"version,omitempty"`
 	InstallHeight int64    `msgpack:"install_h"`
 	LastHeight    int64    `msgpack:"last_h"`
+
+	// Media URLs lifted from the G45 `metadata` JSON blob. G45 assets do not
+	// use the `icon` key IconURL was built for — not once across the 45,589-SC
+	// mainnet corpus under indexer/testdata — so without these the only
+	// media-ish field on /api/assets is empty for every G45 asset.
+	//
+	// These are URLs only (overwhelmingly `ipfs://`); HyperGnomon never fetches
+	// the bytes behind them. Resolving them is the consumer's job.
+	//
+	// The msgpack tags are load-bearing, not decoration: the classify seed
+	// cache still round-trips ClassMeta through msgpack even though the
+	// class/class_scid buckets are on the typed v1 encoding.
+	Image      string `msgpack:"image,omitempty"`     // `image`, else `backdropImage`
+	AltImage   string `msgpack:"alt_image,omitempty"` // `alt-image`, else `alt-backdropImage`
+	Audio      string `msgpack:"audio,omitempty"`
+	Video      string `msgpack:"video,omitempty"`
+	ImagesJSON string `msgpack:"images,omitempty"` // `images` object, canonical JSON
 }
 
 // InstallRecord is stored in the installs bucket under key
