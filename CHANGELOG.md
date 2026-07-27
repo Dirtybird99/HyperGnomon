@@ -26,7 +26,22 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) a
 
 ### Fixed
 
+- **The G45 `metadata` variable is now hex-decoded before parsing.** derod returns `STORE`'d strings hex-encoded, and every other string var in `extractClassVars` goes through `decodeHexIfPrintable` — `metadata` did not, at either read site. The JSON extractors were handed hex, parsed nothing, and left `Name`/`Desc`/`IconURL` empty for every G45 asset on a live chain. This was invisible to the entire suite because `indexer/testdata/nfts.json.gz` holds `metadata` already decoded, a shape the daemon never sends; only a live sync exposed it.
+
 - Every `ClassMeta` construction site now funnels through one `classMetaFrom` projection. The projection had been copy-pasted across seven sites in `indexer.go`, `fastsync.go`, and `tela_refresher.go`, so adding a field to `SCClass` populated it only on the paths the author remembered — with no failing test, because each path belongs to a different sync mode.
+
+- `reclassifyFromVars` wrote a `ClassMeta.LastHeight` that disagreed with the height its paired `AddVariables` used. `GetSCIDVariableDetailsAtHeight` builds an exact `"<scid>:<height>"` key with no floor scan, so the snapshot the post-scan sweep had just written was unreachable.
+
+### Verified
+
+Against a DERO mainnet daemon at height 7,389,740 (`--fastsync --turbo --postscan-vars=all`, 50,245 SCIDs, 77s sweep), both on a fresh DB and on a DB written by the previous binary (the mixed-version upgrade path):
+
+| | `name` | `icon_url` | `image` | `alt_image` | `audio` | `video` | `images` |
+|---|---|---|---|---|---|---|---|
+| G45-NFT (45,516) | 45,503 | **0** | 45,401 | 239 | 295 | 148 | 23 |
+| G45-C (112) | 88 | **0** | 87 | 2 | 0 | 0 | 0 |
+
+`icon_url` is zero across all 45,628 G45 assets — the premise of the change. The media counts match the independently-derived corpus oracle exactly (`image` differs by the 2 NFTs minted since the corpus snapshot).
 
 ### Performance
 
