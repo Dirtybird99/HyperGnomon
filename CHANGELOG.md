@@ -8,6 +8,10 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) a
 
 ### Added
 
+- **`GET /api/media/{scid}` — asset media served from a local fetch-once cache.** New `media` package: deterministic URL→path mapping (the filesystem is the index), hedged multi-gateway race (local kubo first via `--ipfs-gateway`, then the surviving public gateways, 800 ms hedging, 429 cooldown, 50 MB cap, atomic temp+rename writes), immutable/`nosniff`/CSP-sandboxed responses. On-demand fetching is opt-in (`--media-fetch`); default serves pre-cached bytes only, so the API cannot be used as an open proxy. Non-`ipfs`/`https` schemes in on-chain metadata are refused — those URLs are attacker-controlled strings.
+
+- **`cmd/mediawarm`** — bulk archival warm + availability census. Groups all media URLs by root CID (most-referenced first), probes each root via gateways, consults the local kubo DHT (`routing/findprovs`, bounded) when gateways miss, fetches everything reachable into the shared cache, and writes `media-census.json`. Motivated by measurement, not hypothetical rot: as of 2026-07-27, 7 of the top 10 corpus roots (~19k images) had **no live public-gateway copy**, and spot-checked gateway-MISS roots had **zero DHT providers** — content cached today may be unobtainable tomorrow.
+
 - G45 media URLs on the asset API. `ClassifySC` now lifts `image`, `backdropImage`, `alt-image`, `alt-backdropImage`, `audio`, `video`, and `images` out of the G45 `metadata` blob into new `ClassMeta` fields, surfaced as `image` / `alt_image` / `audio` / `video` / `images` on `/api/assets` and `/api/assets/{scid}` (omitted when empty). These are **URLs only** — HyperGnomon does not fetch, cache, or proxy the bytes, and 99.9% of them are `ipfs://`.
 
   Motivation: the extractor only ever read `icon`, which appears **zero times** across the 45,651-SC mainnet corpus, so `ClassMeta.IconURL` — the only media-ish field the asset API exposed — was empty for every G45 asset. `image` is present on 45,414 of 45,539 NFT-class contracts and `backdropImage` on 87 of 112 collections.
@@ -25,6 +29,8 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) a
 - Turbo's post-scan variable sweep (`--postscan-vars=all`) now re-classifies from the variables it fetches instead of discarding them. Turbo's scan-time classify runs with nil vars (code only), so previously the sweep paid for every `GetSC` and still left `Name`/`Desc`/`IconURL` empty for non-TELA classes. Fixes pre-existing empty G45/NFA metadata, not just the new media fields.
 
 ### Fixed
+
+- **Fastsync no longer wipes populated asset metadata on restart.** Fastsync's "other classes" path blind-wrote a bare ClassMeta (class + tags only) over every non-TELA record on every startup, and the classify seed cache's store-seeding did the same with cached (usually bare) snapshots — so a `--postscan-vars=all` sweep or an operator's `RefreshClassVars` was silently undone by the next restart. Caught live: a restarted node served an asset catalog whose every `name` and media field had reverted to empty. Both sites are now populate-only — they write a record only when none exists, since an existing record is always at least as good as the bare placeholder.
 
 - **The G45 `metadata` variable is now hex-decoded before parsing.** derod returns `STORE`'d strings hex-encoded, and every other string var in `extractClassVars` goes through `decodeHexIfPrintable` — `metadata` did not, at either read site. The JSON extractors were handed hex, parsed nothing, and left `Name`/`Desc`/`IconURL` empty for every G45 asset on a live chain. This was invisible to the entire suite because `indexer/testdata/nfts.json.gz` holds `metadata` already decoded, a shape the daemon never sends; only a live sync exposed it.
 

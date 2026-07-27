@@ -134,6 +134,7 @@ GET /api/tela/count               TELA app count (lightweight polling)
 GET /api/tela/{scid}/ratings      On-chain TELA ratings for one SCID (per-rater scores, count, average)
 GET /api/assets                   Asset/NFT catalog (NFA, G45 incl. collections, legacy DERO assets)
 GET /api/assets/{scid}            Asset/NFT metadata for one SCID (incl. media URLs)
+GET /api/media/{scid}             Asset media bytes from the local cache (?kind=image|alt|audio|video)
 GET /api/address/{addr}/created-assets  Asset contracts deployed by address
 GET /api/address/{addr}/touched-assets  Asset contracts the address interacted with
 GET /api/address/{addr}/scs       All SCIDs the address interacted with
@@ -151,6 +152,10 @@ Asset entries carry the media URLs declared in the contract's `metadata` blob �
 **These are URLs, not content.** HyperGnomon never fetches, caches, or proxies the bytes behind them — it is an indexer, not a CDN. On current mainnet 45,347 of them are `ipfs://` and 52 are `https`, so a consumer needs a gateway or a local IPFS node to resolve them.
 
 Populating them requires the contract's variables, which turbo mode skips during scan. Run with `--postscan-vars=all`, or call `RefreshClassVars("G45-NFT")` from the Go library, to fill asset metadata; under the default `--postscan-vars=lazy` the class bucket holds the class name alone. This is pre-existing behavior for `Name`/`Desc` too, not specific to media.
+
+**Serving the bytes**: `GET /api/media/{scid}?kind=image|alt|audio|video` serves media from a local fetch-once cache (`--media-dir`). A cache miss returns 404 with the on-chain URL unless `--media-fetch` is enabled, in which case the bytes are fetched via a hedged race — local kubo gateway first (`--ipfs-gateway`), then the surviving public gateways — cached forever (content-addressed = immutable), and served with `immutable` cache headers, `nosniff`, and a CSP sandbox (metadata URLs are attacker-controlled; the proxy refuses non-`ipfs`/`https` schemes outright).
+
+Bulk-archive with `cmd/mediawarm`: it fills the same cache and writes `media-census.json` — a per-root-CID account of what is still retrievable. That census matters: as measured July 2026, most G45 root CIDs have **no** remaining public-gateway copy and many have no DHT provider either. A local [kubo](https://github.com/ipfs/kubo) node is the only route to the non-gateway remainder, and content cached today may be unobtainable tomorrow.
 
 ## 7. WebSocket API
 

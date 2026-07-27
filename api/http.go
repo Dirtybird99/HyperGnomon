@@ -13,8 +13,11 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/hypergnomon/hypergnomon/eventbus"
 	"github.com/hypergnomon/hypergnomon/indexer"
+	"github.com/hypergnomon/hypergnomon/media"
 	"github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/storage"
 	"github.com/hypergnomon/hypergnomon/structures"
@@ -55,6 +58,14 @@ type Server struct {
 	assetCatalogs        map[string]assetCatalogCacheEntry
 	assetCatalogTTL      time.Duration
 	assetCatalogEmptyTTL time.Duration
+
+	// Media cache wiring (see api/media.go). mediaDir empty disables the
+	// endpoint; mediaFetch gates on-demand network retrieval; mediaSF
+	// coalesces concurrent misses on the same file.
+	mediaDir     string
+	mediaFetch   bool
+	mediaFetcher *media.Fetcher
+	mediaSF      singleflight.Group
 }
 
 // NewServer creates a new API server.
@@ -114,6 +125,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/tela/count", s.handleGetTELACount).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela/{scid}/ratings", s.handleGetTELARatings).Methods(http.MethodGet)
 	r.HandleFunc("/api/assets", s.handleGetAssets).Methods(http.MethodGet)
+	r.HandleFunc("/api/media/{scid}", s.handleGetMedia).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/api/assets/{scid}", s.handleGetAsset).Methods(http.MethodGet)
 	r.HandleFunc("/api/initialscidcode", s.handleGetInitialSCIDCode).Methods(http.MethodGet)
 	r.HandleFunc("/api/address/{address}/created-assets", s.handleGetAddressCreatedAssets).Methods(http.MethodGet)

@@ -129,6 +129,31 @@ The header surface is stable. Operators can already use `signed-unverified` vs `
 
 In-memory cap for the TELA content 2-tier cache. Second tier is disk-backed and uncapped.
 
+## Asset media
+
+### `--media-dir` (default `<db-dir>/media`)
+
+On-disk cache for asset media bytes (`GET /api/media/{scid}`). The directory
+layout is the index — `media/ipfs/<cid>/<path>` and `media/https/<sha256>` —
+so the cache can be shared with `cmd/mediawarm`, moved, or rsynced freely.
+Content-addressed and immutable: nothing in it is ever revalidated.
+
+### `--media-fetch` (default `false`)
+
+Allow `/api/media` to fetch uncached media on demand (hedged race: local
+kubo gateway first if configured, then public gateways). **Off by default**
+so a public deployment cannot be used as an open fetch proxy; when off, the
+endpoint serves only what `cmd/mediawarm` pre-cached and never touches the
+network.
+
+### `--ipfs-gateway` (default empty)
+
+Base URL of a local kubo gateway (e.g. `http://127.0.0.1:18080`). Strongly
+recommended: measured 2026-07-27, most G45 root CIDs have **no** live
+public-gateway copy — patient DHT retrieval through a local node is the only
+route to them, when providers exist at all. Empty = public gateways only,
+which caps media coverage at roughly a third of the corpus.
+
 ## Servers
 
 ### `--api-address` (default `127.0.0.1:8082`)

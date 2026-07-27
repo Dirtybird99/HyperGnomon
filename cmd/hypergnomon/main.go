@@ -60,6 +60,9 @@ func main() {
 	apiAddress := flag.String("api-address", "127.0.0.1:8082", "HTTP API listen address")
 	wsAddress := flag.String("ws-address", "127.0.0.1:9190", "WebSocket server address")
 	telaCacheMB := flag.Int64("tela-cache-mb", 128, "TELA content in-memory cache cap (MB)")
+	mediaFetch := flag.Bool("media-fetch", false, "Enable on-demand fetching of asset media (images/audio/video) into the local cache; off = /api/media serves only what cmd/mediawarm pre-cached")
+	mediaDir := flag.String("media-dir", "", "Asset media cache directory (empty = <db-dir>/media)")
+	ipfsGateway := flag.String("ipfs-gateway", "", "Local IPFS (kubo) gateway base URL for media fetches, e.g. http://127.0.0.1:18080 (empty = public gateways only)")
 	telaVerifySigs := flag.Bool("tela-verify-sigs", false, "Enable X-TELA-Verify response header on /tela/... endpoints (v1.0 reports signature presence only; cryptographic verification ships in v1.2)")
 	// --persist-install-code: which SC classes get their install-time code
 	// persisted to the sccode bucket. "tela" (default) persists only
@@ -358,6 +361,11 @@ func main() {
 	// the finality-lag height and the reorg-detection counter.
 	apiServer := api.NewServer(idx.Store, idx.RPCPool, *apiAddress, &idx.SafeHeight, &idx.ReorgDetected, bus, idx, (*telaCacheMB)*1024*1024)
 	apiServer.SetTELAVerifySigs(*telaVerifySigs)
+	mDir := *mediaDir
+	if mDir == "" {
+		mDir = filepath.Join(*dbDir, "media")
+	}
+	apiServer.SetMediaOptions(mDir, *mediaFetch, *ipfsGateway)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			structures.Logger.Errorf("HTTP API server error: %v", err)
