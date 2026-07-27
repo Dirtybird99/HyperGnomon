@@ -571,7 +571,10 @@ func decodeHexIfPrintable(s string) string {
 	if !looksLikePrintableUTF8(decoded) {
 		return s
 	}
-	return string(decoded)
+	// `decoded` was allocated here, filled once, and is referenced by nothing
+	// else — hand it over as a string rather than copying it a second time.
+	// See ownedBytesToString for the ownership contract this relies on.
+	return ownedBytesToString(decoded)
 }
 
 func hexNibbleByte(c byte) byte {
