@@ -20,25 +20,26 @@ import (
 // truth. The golden then records the bug instead of catching it.
 //
 // The counts below are therefore NOT derived from this package's output. They
-// come from an independent scan of the raw testdata JSON (decode `metadata`,
-// count top-level keys) performed outside Go. They are the external ruler; if
-// the classifier disagrees, the classifier is wrong.
+// come from an independent scan of the raw testdata JSON — hex-decode
+// `metadata`, parse it as JSON, count top-level keys — performed outside Go.
+// They are the external ruler; if the classifier disagrees, the classifier is
+// wrong.
 //
-// Derivation, over testdata/ with the ""-placeholder entry excluded:
+// Derivation, over the corpus captured at topoheight 7,389,814
+// (see testdata/corpus_manifest.json):
 //
-//	nfts.json.gz        45,514 entries; 1 has no `metadata` var, 12 fail to
-//	                    decode as a JSON object → 13 yield nothing.
-//	collections.json.gz     74 entries; 3 no `metadata`, 5 undecodable.
+//	nfts.json.gz        45,539 entries; 9 have no `metadata`, 14 do not decode
+//	                    to a JSON object → 23 yield nothing.
+//	collections.json.gz    112 entries; 2 no `metadata`, 21 undecodable.
 //
-// Every media value present in the corpus is a non-empty string (there are no
-// empty-string media values to disambiguate), except `images`, which is always
-// a JSON object.
+// Every media value present in the corpus is a non-empty string, except
+// `images`, which is always a JSON object.
 const (
 	// NFTs carry `image`; no NFT blob in the corpus has `backdropImage`.
-	wantNFTImage = 45399
+	wantNFTImage = 45414
 	// Collections carry `backdropImage`; Image holds it via the
 	// image → backdropImage precedence in extractG45MetadataString.
-	wantCollectionImage = 64
+	wantCollectionImage = 87
 
 	wantNFTAltImage        = 239
 	wantCollectionAltImage = 2 // `alt-backdropImage`
@@ -187,11 +188,16 @@ func TestG45ImagesRawMatchesMapDecode(t *testing.T) {
 		for _, v := range all[i].Vars {
 			if k, ok := v.Key.(string); ok && k == "metadata" {
 				if s, ok := v.Value.(string); ok {
+					// The corpus holds the daemon's raw hex, so decode exactly
+					// as the extractors do before asserting anything about JSON
+					// structure. Feeding hex straight in is the mistake this
+					// whole fixture regeneration exists to make impossible.
+					blob := decodeHexIfPrintable(s)
 					blobs++
-					if _, ok := g45ScanImagesRaw(s); ok {
+					if _, ok := g45ScanImagesRaw(blob); ok {
 						found++
 					}
-					check(t, s)
+					check(t, blob)
 				}
 			}
 		}

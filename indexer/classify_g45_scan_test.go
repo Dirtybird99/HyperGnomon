@@ -227,8 +227,13 @@ func TestG45ScanDifferentialCorpus(t *testing.T) {
 		for _, v := range all[i].Vars {
 			if k, ok := v.Key.(string); ok && k == "metadata" {
 				if s, ok := v.Value.(string); ok {
+					// Decode first: the corpus holds derod's raw hex, and the
+					// extractors decode before parsing. Passing hex straight in
+					// makes this gate VACUOUS — both paths see non-JSON, both
+					// set nothing, and they agree on nothing. That is precisely
+					// what TestG45ScanCorpusFireRate exists to catch.
 					blobs++
-					g45DiffCheck(t, s)
+					g45DiffCheck(t, decodeHexIfPrintable(s))
 				}
 			}
 		}
@@ -323,8 +328,9 @@ func TestG45ScanCorpusFireRate(t *testing.T) {
 		for _, v := range all[i].Vars {
 			if k, ok := v.Key.(string); ok && k == "metadata" {
 				if s, ok := v.Value.(string); ok {
+					blob := decodeHexIfPrintable(s) // corpus holds raw hex
 					total++
-					if _, ok := g45ScanMeta(readOnlyBytes(s)); ok {
+					if _, ok := g45ScanMeta(readOnlyBytes(blob)); ok {
 						fired++
 					}
 				}
