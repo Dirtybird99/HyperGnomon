@@ -333,7 +333,18 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 		case "mods":
 			mods = decodeHexIfPrintable(varString(v.Value))
 		case "metadata":
-			metadata = varString(v.Value)
+			// decodeHexIfPrintable, same as every sibling string var above.
+			// derod returns STORE'd strings hex-encoded, so the raw value is
+			// hex of the JSON blob — feeding that to the JSON extractors
+			// yields nothing. The committed testdata corpus happens to hold
+			// `metadata` already decoded, which is why the unit gates passed
+			// while live extraction produced empty Name/Desc/media. Verified
+			// against a mainnet daemon at height 7,389,724.
+			//
+			// The guard makes this safe for both shapes: JSON starts with '{',
+			// which is not a hex digit, so an already-decoded blob fails the
+			// hex-charset test and passes through untouched.
+			metadata = decodeHexIfPrintable(varString(v.Value))
 		}
 	}
 
@@ -637,7 +648,9 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 	if !ok {
 		return
 	}
-	extractG45MetadataString(sc, str)
+	// See the "metadata" case in extractClassVars: derod hex-encodes STORE'd
+	// strings, and the guard is a no-op on an already-decoded blob.
+	extractG45MetadataString(sc, decodeHexIfPrintable(str))
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {

@@ -1,10 +1,13 @@
 package indexer
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/hypergnomon/hypergnomon/structures"
 )
 
 // G45 media extraction — external-oracle gate.
@@ -198,6 +201,62 @@ func TestG45ImagesRawMatchesMapDecode(t *testing.T) {
 	}
 	if found != wantNFTImagesJSON {
 		t.Errorf("scan found images on %d corpus blobs, want %d", found, wantNFTImagesJSON)
+	}
+}
+
+// TestG45MetadataHexDecoded is the gate the committed corpus cannot provide.
+//
+// derod returns STORE'd strings hex-encoded, so a live `metadata` variable is
+// hex of the JSON blob. testdata/nfts.json.gz happens to hold it ALREADY
+// DECODED, so every other gate in this package passes against a shape the
+// daemon never actually sends — and live extraction silently produced empty
+// Name/Desc/media for every G45 asset. Caught against a mainnet daemon at
+// height 7,389,724; this pins both shapes so it cannot regress.
+//
+// The blob below is the verbatim on-chain value of SCID 800036707d…7fb9
+// (Dero Duck #1801), truncated to the fields under test.
+func TestG45MetadataHexDecoded(t *testing.T) {
+	const plain = `{"attributes":{"Background":"White"},"id":1801,` +
+		`"image":"ipfs://bafy/low/1801.png","name":"Dero Duck #1801"}`
+
+	hexed := hex.EncodeToString([]byte(plain))
+
+	for _, tc := range []struct{ name, value string }{
+		{"hex-encoded, as derod returns it", hexed},
+		{"already decoded, as testdata holds it", plain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Both entry points must handle both shapes: extractClassVars
+			// (single-pass, used by every refresh path) and extractG45Metadata
+			// (map-based, used by ClassifySCVars).
+			var viaVars SCClass
+			viaVars.Tags = []string{"all", "g45"}
+			extractClassVars(&viaVars, []*structures.SCIDVariable{
+				{Key: "metadata", Value: tc.value},
+			})
+
+			var viaMap SCClass
+			viaMap.Tags = []string{"all", "g45"}
+			extractG45Metadata(&viaMap, map[string]interface{}{"metadata": tc.value})
+
+			for label, got := range map[string]SCClass{"extractClassVars": viaVars, "extractG45Metadata": viaMap} {
+				if got.Name != "Dero Duck #1801" {
+					t.Errorf("%s: Name = %q, want %q", label, got.Name, "Dero Duck #1801")
+				}
+				if got.Image != "ipfs://bafy/low/1801.png" {
+					t.Errorf("%s: Image = %q, want %q", label, got.Image, "ipfs://bafy/low/1801.png")
+				}
+			}
+		})
+	}
+
+	// A blob that is valid hex but decodes to garbage must be left alone
+	// rather than mangled into a false negative.
+	var sc SCClass
+	sc.Tags = []string{"all", "g45"}
+	extractClassVars(&sc, []*structures.SCIDVariable{{Key: "metadata", Value: "deadbeef"}})
+	if sc.Name != "" || sc.Image != "" {
+		t.Errorf("non-JSON hex should set nothing, got %+v", sc)
 	}
 }
 
