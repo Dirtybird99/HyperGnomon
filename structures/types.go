@@ -127,7 +127,7 @@ type ClassMeta struct {
 	LastHeight    int64    `msgpack:"last_h"`
 
 	// Media URLs lifted from the G45 `metadata` JSON blob. G45 assets do not
-	// use the `icon` key IconURL was built for — not once across the 45,589-SC
+	// use the `icon` key IconURL was built for — not once across the 45,651-SC
 	// mainnet corpus under indexer/testdata — so without these the only
 	// media-ish field on /api/assets is empty for every G45 asset.
 	//
@@ -141,7 +141,7 @@ type ClassMeta struct {
 	AltImage   string `msgpack:"alt_image,omitempty"` // `alt-image`, else `alt-backdropImage`
 	Audio      string `msgpack:"audio,omitempty"`
 	Video      string `msgpack:"video,omitempty"`
-	ImagesJSON string `msgpack:"images,omitempty"` // `images` object, canonical JSON
+	ImagesJSON string `msgpack:"images,omitempty"` // `images` object, verbatim on-chain JSON
 }
 
 // InstallRecord is stored in the installs bucket under key

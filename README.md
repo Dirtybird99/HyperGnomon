@@ -228,9 +228,18 @@ Every number below has a reproducible harness. Hardware, date, daemon endpoint, 
 | `WorkItem_Pool` vs `New` | 2,300 ns / 5.7 KB | 18 ns / 0 B | **127×** |
 | `FlushBatch_100` vs individual writes | 88 µs/record | 6.1 µs/record | **14×** |
 | `FlushBatch` vs 100k-interaction history (heights) | 5,684 µs (blob layout) | 118 µs (composite keys) | **48×, flat in history size** |
-| `ClassifyCorpus/Full` — 45,589 real mainnet G45 SCs, golden-gated (July 2026) | 1,970,788 allocs / 79.3 MB | 415 allocs / 34 KB | **4,749× fewer allocs** |
+| `ClassifyCorpus/Full` — 45,651 real mainnet G45 SCs, golden-gated (July 2026) | 91,759 allocs / 24.7 MB | 46,123 allocs / 12.4 MB | **2× fewer allocs, at the floor** |
 
 Full table with reproduction command, hardware, and methodology: [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
+
+The `ClassifyCorpus` row was restated on 2026-07-27 and no longer matches
+earlier releases. It previously read `1,970,788 → 415 allocs`, measured against
+a corpus whose `metadata` had been hex-decoded before it was committed. derod
+hex-encodes every DVM `STORE` string, so that figure was never reachable in
+production — and the unrepresentative fixture concealed a live bug in which G45
+metadata extraction silently produced nothing. The corpus is now captured raw
+via `cmd/corpusdump`; 46,123 allocations over 45,651 SCs is ~1.01 per SC, which
+is the floor for hex input.
 
 **TELA correctness**: content server output is byte-identical (SHA256) to civilware/tela `parseDocCode` for `.html`, `.js`, `.css`, `.gz`, and DocShard paths. Live-fixture test: `api/tela_content_test.go`.
 

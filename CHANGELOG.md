@@ -10,7 +10,7 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) a
 
 - G45 media URLs on the asset API. `ClassifySC` now lifts `image`, `backdropImage`, `alt-image`, `alt-backdropImage`, `audio`, `video`, and `images` out of the G45 `metadata` blob into new `ClassMeta` fields, surfaced as `image` / `alt_image` / `audio` / `video` / `images` on `/api/assets` and `/api/assets/{scid}` (omitted when empty). These are **URLs only** — HyperGnomon does not fetch, cache, or proxy the bytes, and 99.9% of them are `ipfs://`.
 
-  Motivation: the extractor only ever read `icon`, which appears **zero times** across the 45,589-SC mainnet corpus, so `ClassMeta.IconURL` — the only media-ish field the asset API exposed — was empty for every G45 asset. `image` is present on 45,399 of 45,514 NFTs and `backdropImage` on 64 of 74 collections.
+  Motivation: the extractor only ever read `icon`, which appears **zero times** across the 45,651-SC mainnet corpus, so `ClassMeta.IconURL` — the only media-ish field the asset API exposed — was empty for every G45 asset. `image` is present on 45,414 of 45,539 NFT-class contracts and `backdropImage` on 87 of 112 collections.
 
   `ImagesJSON` carries the `images` object as **verbatim on-chain JSON text**, not re-encoded: key order and spacing are whatever the minter wrote.
 
@@ -32,6 +32,16 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) a
 
 - `reclassifyFromVars` wrote a `ClassMeta.LastHeight` that disagreed with the height its paired `AddVariables` used. `GetSCIDVariableDetailsAtHeight` builds an exact `"<scid>:<height>"` key with no floor scan, so the snapshot the post-scan sweep had just written was unreachable.
 
+- **The classify corpus is regenerated from raw `GetSC` output** and no longer holds decoded values. New `cmd/corpusdump` enumerates G45 SCIDs from a synced DB and captures every variable verbatim at one pinned topoheight (7,389,814: 45,539 NFT-class + 112 G45-C, recorded in `indexer/testdata/corpus_manifest.json`). The previous fixture held `metadata` decoded in both files and `type` decoded in `nfts.json.gz` — a shape derod never sends, which is why the hex bug above passed every gate.
+
+  The re-capture is verified faithful rather than merely different: across all 45,586 SCIDs present in both the old and new corpora, `ClassifySCVars` output is **identical**. `TestCorpusHoldsRawDaemonShape` now pins the hex shape so the fixture cannot drift back.
+
+  Three corpus-iterating tests had to start decoding before parsing. `TestG45ScanDifferentialCorpus` in particular was **vacuous** on hex input — both paths saw non-JSON, set nothing, and agreed on nothing; `TestG45ScanCorpusFireRate` is what caught it.
+
+### Changed (benchmarks)
+
+- **`BenchmarkClassifyCorpus/Full` is rebased and is not comparable to earlier releases.** The published `1,970,788 → 415 allocs` was measured on the decoded fixture, where the scanner could return zero-copy substrings of text the daemon never sends in that form; 415 was never reachable in production. Against the raw corpus the honest figures are **91,759 allocs / 24.7 MB**, cut to **46,123 allocs / 12.4 MB** by handing the hex-decode buffer over via `unsafe.String` instead of copying it (`ownedBytesToString`). That is ~1.01 allocations per SC — the floor, since hex input cannot be aliased.
+
 ### Verified
 
 Against a DERO mainnet daemon at height 7,389,740 (`--fastsync --turbo --postscan-vars=all`, 50,245 SCIDs, 77s sweep), both on a fresh DB and on a DB written by the previous binary (the mixed-version upgrade path):
@@ -45,7 +55,7 @@ Against a DERO mainnet daemon at height 7,389,740 (`--fastsync --turbo --postsca
 
 ### Performance
 
-- No change: `BenchmarkClassifyCorpus/Full` holds at 415 allocs/op and 34,368 B/op, byte-for-byte the pre-change figures, with wall-clock inside run-to-run noise. Getting there required routing `images` through the scanner's skip branch rather than making it a target key — its value is an object, and a non-string target value forces the whole blob down the fallback map decode (measured: +1,111 allocs, +62 KB over the corpus, for the 23 blobs that carry it). The skip branch has already walked the value's extent, so capturing the raw text is free.
+- Adding the media fields costs nothing on the classify path. `images` is routed through the scanner's **skip** branch rather than made a target key — its value is an object, and a non-string target value forces the whole blob down the fallback map decode (measured on the pre-regeneration fixture: +1,111 allocs, +62 KB, for the 23 blobs that carry it). The skip branch has already walked the value's extent, so capturing the raw text is free. Absolute figures for this benchmark moved when the corpus was regenerated — see *Changed (benchmarks)* above; the media fields are not what moved them.
 
 ## [1.1.0] — 2026-06-29
 

@@ -52,7 +52,7 @@ const (
 	g45KeyName
 	g45KeyDesc
 	g45KeyIcon
-	// Media keys. G45 assets never use `icon` — not once in the 45,589-SC
+	// Media keys. G45 assets never use `icon` — not once in the 45,651-SC
 	// mainnet corpus — so these are what actually carries artwork: `image` on
 	// NFTs, `backdropImage` on collections, with `alt-` variants of each.
 	// g45KeyImagesRaw is `images`, the one media key whose value is an object
