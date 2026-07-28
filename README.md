@@ -147,7 +147,7 @@ The `/tela/{scid}/…` endpoint is the content server. It resolves TELA-INDEX ro
 
 Asset endpoints are catalog and activity views. True "my held assets" should be wallet-assisted: fetch candidate asset SCIDs from `/api/assets`, then have the wallet check decrypted balances for each SCID at the latest topoheight. `/created-assets` means deployer/registry ownership; `/touched-assets` means interaction history. Neither endpoint claims current wallet balance.
 
-Asset entries carry the media URLs declared in the contract's `metadata` blob — `image` (an NFT's artwork, or a collection's `backdropImage`), `alt_image`, `audio`, `video`, and `images` (the raw JSON object of named secondary artwork). Each is omitted when empty. Note that G45 metadata does not use the `icon` key, so `icon_url` is empty for G45 assets and `image` is the field to render.
+Asset entries carry the media URLs declared on the contract — for G45, from the `metadata` blob — `image` (an NFT's artwork, or a collection's `backdropImage`), `alt_image`, `audio`, `video`, and `images` (the raw JSON object of named secondary artwork). Each is omitted when empty. Note that G45 metadata does not use the `icon` key, so `icon_url` is empty for G45 assets and `image` is the field to render. NFA contracts publish their media as plain variables instead (`fileURL`/`coverURL`), which map to the same `image`/`alt_image` fields.
 
 **These are URLs, not content.** HyperGnomon never fetches, caches, or proxies the bytes behind them — it is an indexer, not a CDN. On current mainnet 45,347 of them are `ipfs://` and 52 are `https`, so a consumer needs a gateway or a local IPFS node to resolve them.
 

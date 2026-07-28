@@ -235,3 +235,22 @@ func TestFetchHTTPSDirect(t *testing.T) {
 		t.Fatalf("Fetch = %+v, %v", res, err)
 	}
 }
+
+func TestRewriteGitHubBlob(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{
+			"https://github.com/High-Strangeness/High-Strangeness/blob/main/HighStrangeness255.jpg",
+			"https://raw.githubusercontent.com/High-Strangeness/High-Strangeness/main/HighStrangeness255.jpg",
+		},
+		// Already-raw URLs and non-GitHub URLs pass through untouched.
+		{"https://raw.githubusercontent.com/o/r/main/x.png", "https://raw.githubusercontent.com/o/r/main/x.png"},
+		{"https://example.com/blob/main/x.png", "https://example.com/blob/main/x.png"},
+		// A repo page without /blob/ is not a file reference.
+		{"https://github.com/o/r", "https://github.com/o/r"},
+	}
+	for _, tt := range tests {
+		if got := rewriteGitHubBlob(tt.in); got != tt.want {
+			t.Errorf("rewriteGitHubBlob(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

@@ -295,6 +295,7 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 	var headerDesc, legacyDesc, freeDesc string
 	var headerIcon, legacyIcon string
 	var durl, telaVersion, docVersion, docType, mods, metadata string
+	var fileURL, coverURL, imageURL string
 
 	// Stringify ONLY inside matched cases: a live TELA INDEX carries dozens
 	// of non-matching vars (rating-address keys with uint64 values, DOC
@@ -345,6 +346,19 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 			// which is not a hex digit, so an already-decoded blob fails the
 			// hex-charset test and passes through untouched.
 			metadata = decodeHexIfPrintable(varString(v.Value))
+		case "fileURL":
+			// NFA (Artificer NFA Market Standard) artwork. Live-sampled
+			// 2026-07-27: 21/21 NFAs carry it, e.g.
+			// raw.githubusercontent.com/DeroDesperados/…/Desperado750.png.
+			// NFAs put media URLs straight on the SC — no metadata blob.
+			fileURL = decodeHexIfPrintable(varString(v.Value))
+		case "coverURL":
+			// NFA cover art (21/21 in the same sample).
+			coverURL = decodeHexIfPrintable(varString(v.Value))
+		case "image_url":
+			// Free-form token logo (8 G45-classified bridged-token contracts
+			// in the corpus carry it and nothing else image-shaped).
+			imageURL = decodeHexIfPrintable(varString(v.Value))
 		}
 	}
 
@@ -369,6 +383,15 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 		sc.IconURL = headerIcon
 	case legacyIcon != "":
 		sc.IconURL = legacyIcon
+	}
+	// Direct media vars (NFA fileURL/coverURL, free-form image_url) fill
+	// first; for G45 SCs these keys don't occur, so the metadata-blob
+	// extraction below still owns the G45 fields via its empty-guards.
+	if sc.Image == "" {
+		sc.Image = firstNonEmpty(fileURL, imageURL)
+	}
+	if sc.AltImage == "" {
+		sc.AltImage = coverURL
 	}
 
 	if len(sc.Tags) > 1 && sc.Tags[1] == "g45" && metadata != "" {
@@ -535,6 +558,24 @@ func extractHeaders(sc *SCClass, vars map[string]interface{}) {
 	if sc.Desc == "" {
 		if v, ok := vars["description"]; ok {
 			sc.Desc = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	// Direct media vars — NFA fileURL/coverURL (Artificer NFA standard) and
+	// the free-form image_url token logo. Mirrors extractClassVars; keys are
+	// absent on G45 SCs, whose media comes from the metadata blob instead.
+	if sc.Image == "" {
+		if v, ok := vars["fileURL"]; ok {
+			sc.Image = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	if sc.Image == "" {
+		if v, ok := vars["image_url"]; ok {
+			sc.Image = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	if sc.AltImage == "" {
+		if v, ok := vars["coverURL"]; ok {
+			sc.AltImage = decodeHexIfPrintable(fmt.Sprintf("%v", v))
 		}
 	}
 }

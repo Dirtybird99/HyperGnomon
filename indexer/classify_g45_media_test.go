@@ -35,8 +35,11 @@ import (
 // Every media value present in the corpus is a non-empty string, except
 // `images`, which is always a JSON object.
 const (
-	// NFTs carry `image`; no NFT blob in the corpus has `backdropImage`.
-	wantNFTImage = 45414
+	// NFTs carry `image` in the metadata blob (45,414); no NFT blob has
+	// `backdropImage`. 8 more entries are bridged-token contracts whose only
+	// image is a bare `image_url` VAR, extracted since the NFA/fileURL work —
+	// zero overlap between the two sources, re-derived externally.
+	wantNFTImage = 45422
 	// Collections carry `backdropImage`; Image holds it via the
 	// image → backdropImage precedence in extractG45MetadataString.
 	wantCollectionImage = 87

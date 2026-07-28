@@ -34,6 +34,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -46,6 +47,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hypergnomon/hypergnomon/media"
 	"github.com/hypergnomon/hypergnomon/storage"
@@ -61,6 +63,7 @@ type rootReport struct {
 	Fetched int    `json:"fetched"`
 	Failed  int    `json:"failed"`
 	Bytes   int64  `json:"bytes"`
+	Wayback int    `json:"wayback,omitempty"` // files recovered from the Internet Archive
 }
 
 type census struct {
@@ -69,6 +72,16 @@ type census struct {
 	MediaDir   string       `json:"media_dir"`
 	Totals     totals       `json:"totals"`
 	Roots      []rootReport `json:"roots"`
+	// CollectionLinks inventories every G45-C collection's off-chain links
+	// (project sites, socials) — the manual follow-up list for content no
+	// automated source still serves.
+	CollectionLinks []collectionLink `json:"collection_links,omitempty"`
+}
+
+type collectionLink struct {
+	SCID  string            `json:"scid"`
+	Name  string            `json:"name,omitempty"`
+	Links map[string]string `json:"links"`
 }
 
 type totals struct {
@@ -79,6 +92,7 @@ type totals struct {
 	Failed       int   `json:"failed"`
 	MissingRoots int   `json:"missing_roots"`
 	BytesFetched int64 `json:"bytes_fetched"`
+	Wayback      int   `json:"wayback_recovered"`
 }
 
 func main() {
@@ -91,7 +105,9 @@ func main() {
 	includeAV := flag.Bool("include-av", false, "also fetch audio/video URLs (can be large)")
 	rootWorkers := flag.Int("root-workers", 4, "roots processed concurrently")
 	fileWorkers := flag.Int("file-workers", 8, "files fetched concurrently within a root")
-	classesFlag := flag.String("classes", "G45-NFT,G45-FAT,G45-AT,G45-C", "asset classes to warm")
+	classesFlag := flag.String("classes", "G45-NFT,G45-FAT,G45-AT,G45-C,NFA", "asset classes to warm")
+	waybackOn := flag.Bool("wayback", true, "recover lost roots from the Internet Archive (serial, politely paced)")
+	waybackHosts := flag.String("wayback-hosts", "ipfs.deronfts.com", "historical gateway hosts to look up in the Wayback Machine")
 	flag.Parse()
 	if *dbDir == "" || *mediaDir == "" {
 		fmt.Fprintln(os.Stderr, "--db-dir and --media-dir are required")
@@ -194,6 +210,52 @@ func main() {
 		c.Roots = append(c.Roots, rep)
 	}
 
+	// Wayback phase: for roots the live pass could not (fully) serve, ask the
+	// Internet Archive. Serial and politely paced — see wayback.go.
+	if *waybackOn {
+		hosts := strings.Split(*waybackHosts, ",")
+		wbClient := &http.Client{}
+		lost := 0
+		for i := range c.Roots {
+			if c.Roots[i].Status != "ok" && c.Roots[i].CID != "https-direct" {
+				lost++
+			}
+		}
+		fmt.Printf("wayback phase: %d lost/partial roots against %v\n", lost, hosts)
+		done := 0
+		for i := range c.Roots {
+			rep := &c.Roots[i]
+			if rep.Status == "ok" || rep.CID == "https-direct" {
+				continue
+			}
+			done++
+			// wanted: normalized ipfs path -> on-chain URL, uncached only.
+			wanted := map[string]string{}
+			for _, u := range byRoot[rep.CID] {
+				cp, err := media.CachePath(*mediaDir, u)
+				if err != nil || fileExists(cp) {
+					continue
+				}
+				wanted[normalizeIPFSPath(media.IPFSPath(u))] = u
+			}
+			if len(wanted) == 0 {
+				continue
+			}
+			n, bytes := waybackRecoverRoot(wbClient, *mediaDir, hosts, rep.CID, wanted, *maxFileMB<<20)
+			if n > 0 {
+				rep.Wayback = n
+				rep.Bytes += bytes
+				if rep.Status == "miss" {
+					rep.Status = "partial"
+				}
+				fmt.Printf("  [wb %d/%d] %s: recovered %d files (%.1f MB) from the archive\n", done, lost, rep.CID, n, float64(bytes)/1e6)
+			}
+		}
+	}
+
+	// Inventory every collection's off-chain links for manual follow-up.
+	c.CollectionLinks = collectLinks(store)
+
 	sort.Slice(c.Roots, func(i, j int) bool { return c.Roots[i].Files > c.Roots[j].Files })
 	for _, r := range c.Roots {
 		c.Totals.Roots++
@@ -202,6 +264,7 @@ func main() {
 		c.Totals.Fetched += r.Fetched
 		c.Totals.Failed += r.Failed
 		c.Totals.BytesFetched += r.Bytes
+		c.Totals.Wayback += r.Wayback
 		if r.Status == "miss" {
 			c.Totals.MissingRoots++
 		}
@@ -216,8 +279,8 @@ func main() {
 	if err := os.WriteFile(out, append(buf, '\n'), 0o644); err != nil {
 		fatal("write census: %v", err)
 	}
-	fmt.Printf("\ncensus: %d roots, %d files | cached %d + fetched %d, failed %d, %d roots MISS | %.1f MB fetched | %s\n",
-		c.Totals.Roots, c.Totals.Files, c.Totals.Cached, c.Totals.Fetched, c.Totals.Failed,
+	fmt.Printf("\ncensus: %d roots, %d files | cached %d + fetched %d + wayback %d, failed %d, %d roots MISS | %.1f MB fetched | %s\n",
+		c.Totals.Roots, c.Totals.Files, c.Totals.Cached, c.Totals.Fetched, c.Totals.Wayback, c.Totals.Failed,
 		c.Totals.MissingRoots, float64(c.Totals.BytesFetched)/1e6, out)
 }
 
@@ -381,4 +444,73 @@ func fileExists(p string) bool {
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// collectLinks decodes every G45-C collection's metadata and returns the
+// off-chain links minters published (project sites, socials). For content no
+// automated source still serves, these are the user's manual follow-up leads
+// — a project's website may host the artwork its IPFS pins lost.
+func collectLinks(store storage.Storage) []collectionLink {
+	installs, err := store.GetClassInstalls("G45-C", 0)
+	if err != nil {
+		return nil
+	}
+	var out []collectionLink
+	for _, inst := range installs {
+		if inst.Meta == nil {
+			continue
+		}
+		vars, err := store.GetSCIDVariableDetailsAtHeight(inst.SCID, inst.Meta.LastHeight)
+		if err != nil {
+			continue
+		}
+		for _, v := range vars {
+			k, ok := v.Key.(string)
+			if !ok || k != "metadata" {
+				continue
+			}
+			raw, ok := v.Value.(string)
+			if !ok {
+				continue
+			}
+			var meta struct {
+				Name  string            `json:"name"`
+				Links map[string]string `json:"links"`
+			}
+			if err := json.Unmarshal([]byte(hexDecodePrintable(raw)), &meta); err != nil || len(meta.Links) == 0 {
+				continue
+			}
+			out = append(out, collectionLink{SCID: inst.SCID, Name: meta.Name, Links: meta.Links})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SCID < out[j].SCID })
+	return out
+}
+
+// hexDecodePrintable mirrors the indexer's decodeHexIfPrintable for the one
+// variable this tool reads raw: derod hex-encodes STORE'd strings, and an
+// already-decoded value passes through untouched ('{' is not a hex digit).
+func hexDecodePrintable(s string) string {
+	if len(s) < 2 || len(s)%2 != 0 {
+		return s
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return s
+		}
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return s
+	}
+	if !utf8.Valid(b) {
+		return s
+	}
+	for _, r := range string(b) {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			return s
+		}
+	}
+	return string(b)
 }

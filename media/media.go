@@ -236,7 +236,26 @@ func (f *Fetcher) sources(rawURL string) []source {
 	if perTry <= 0 {
 		perTry = DefaultPerTryTimeout
 	}
-	return []source{{name: "direct", httpURL: rawURL, timeout: perTry}}
+	return []source{{name: "direct", httpURL: rewriteGitHubBlob(rawURL), timeout: perTry}}
+}
+
+// rewriteGitHubBlob converts a github.com HTML page URL into its raw-content
+// form. Several NFA minters stored `github.com/<o>/<r>/blob/<branch>/<path>`
+// as their fileURL — that URL serves the repository web PAGE, not the image.
+// The rewrite is the documented, stable mapping to raw.githubusercontent.com;
+// non-matching URLs pass through untouched. The cache path stays keyed on the
+// ORIGINAL on-chain URL, so the rewrite is invisible to /api/media lookups.
+func rewriteGitHubBlob(rawURL string) string {
+	const prefix = "https://github.com/"
+	rest, ok := strings.CutPrefix(rawURL, prefix)
+	if !ok {
+		return rawURL
+	}
+	parts := strings.SplitN(rest, "/", 4) // owner / repo / "blob" / branch+path
+	if len(parts) != 4 || parts[2] != "blob" {
+		return rawURL
+	}
+	return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/" + parts[3]
 }
 
 // Result reports a completed fetch.
