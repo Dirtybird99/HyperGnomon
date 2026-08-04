@@ -26,42 +26,42 @@ func TestDivergence(t *testing.T) {
 		wantFork     int64
 	}{
 		{
-			name: "no divergence stops at first agreement",
+			name:  "no divergence stops at first agreement",
 			start: 100, limit: 16,
 			recorded:    map[int64]string{100: "a"},
 			daemon:      map[int64]string{100: "a"},
 			wantChanged: 0, wantFork: 100,
 		},
 		{
-			name: "two-deep rewrite finds fork below",
+			name:  "two-deep rewrite finds fork below",
 			start: 100, limit: 16,
 			recorded:    map[int64]string{100: "a", 99: "b", 98: "c"},
 			daemon:      map[int64]string{100: "A", 99: "B", 98: "c"},
 			wantChanged: 2, wantFork: 98,
 		},
 		{
-			name: "daemon miss is disagreement, walk continues, not recorded",
+			name:  "daemon miss is disagreement, walk continues, not recorded",
 			start: 100, limit: 16,
 			recorded:    map[int64]string{100: "a", 99: "b", 98: "c"},
 			daemon:      map[int64]string{100: "A", 99: "", 98: "c"},
 			wantChanged: 1, wantFork: 98, // 99's "" walked past but not recorded
 		},
 		{
-			name: "recorded miss below window is unknowable",
+			name:  "recorded miss below window is unknowable",
 			start: 100, limit: 16,
 			recorded:    map[int64]string{100: "a", 99: "b"}, // nothing at 98
 			daemon:      map[int64]string{100: "A", 99: "B", 98: "c"},
 			wantChanged: 2, wantFork: -1,
 		},
 		{
-			name: "limit exhausted without agreement",
+			name:  "limit exhausted without agreement",
 			start: 100, limit: 2,
 			recorded:    map[int64]string{100: "a", 99: "b", 98: "c"},
 			daemon:      map[int64]string{100: "A", 99: "B", 98: "C"},
 			wantChanged: 2, wantFork: -1,
 		},
 		{
-			name: "topo floor is unknowable",
+			name:  "topo floor is unknowable",
 			start: 1, limit: 16,
 			recorded:    map[int64]string{1: "a", 0: "x"},
 			daemon:      map[int64]string{1: "A"},

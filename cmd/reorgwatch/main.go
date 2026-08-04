@@ -140,7 +140,7 @@ func runScan(c *hgrpc.Client, n int64) error {
 		"scanned": scanned, "span_days": round2(days),
 		"avg_block_time_s": info.AverageBlockTime50,
 		"sideblocks":       side, "multi_tip_blocks": multiTip,
-		"height_ne_topo": heightNeTopo,
+		"height_ne_topo":     heightNeTopo,
 		"sideblocks_per_day": round2(perDay(side, days)),
 		"sideblock_topos":    sideTopos,
 		"elapsed_s":          round2(time.Since(start).Seconds()),
