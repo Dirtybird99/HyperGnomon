@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -53,14 +55,18 @@ type Server struct {
 	cachedInfo *structures.GetInfoResult
 
 	// srv is the *http.Server created by Start; retained so Stop can release
-	// the listener and unblock Start's ListenAndServe.
+	// the listener and unblock Start's Serve. Guarded by mu.
 	srv *http.Server
 
-	// stopCh is closed by Stop to signal the background loops to exit.
+	// stopCh is created by Start and closed by Stop to signal the background
+	// loops to exit. Guarded by mu.
 	stopCh chan struct{}
-	// stopOnce makes Stop idempotent: the first call shuts down, later
-	// calls are no-ops.
-	stopOnce sync.Once
+	// stopped is set by Stop and never cleared: a stopped Server refuses
+	// Start. Guarded by mu.
+	stopped bool
+	// wg counts the background loops; Stop waits on it so no loop outlives
+	// Stop's return.
+	wg sync.WaitGroup
 
 	assetCatalogMu       sync.RWMutex
 	assetCatalogs        map[string]assetCatalogCacheEntry
@@ -109,7 +115,9 @@ func (s *Server) loadReorgDetected() int64 {
 }
 
 // Start registers routes and begins serving HTTP requests.
-// Blocks until the server exits.
+// Blocks until the server exits: it returns nil after a clean Stop,
+// http.ErrServerClosed without serving if Stop already ran, and the
+// bind or serve error otherwise. A Server serves at most once.
 func (s *Server) Start() error {
 	r := mux.NewRouter()
 
@@ -135,19 +143,13 @@ func (s *Server) Start() error {
 	// forward multi-segment paths like "app/js/main.js" intact.
 	r.HandleFunc("/tela/{scid}/{path:.*}", s.handleGetTELAContent).Methods(http.MethodGet, http.MethodHead)
 
-	// Start background info caching + TELA cache invalidator. Both exit
-	// when stopCh is closed by Stop.
-	s.mu.Lock()
-	if s.stopCh == nil {
-		s.stopCh = make(chan struct{})
+	// Bind before spawning anything so a bind failure leaves no goroutines
+	// behind and the error reaches the caller first.
+	ln, err := net.Listen("tcp", s.listenAddr)
+	if err != nil {
+		return err
 	}
-	stopCh := s.stopCh
-	s.mu.Unlock()
 
-	go s.refreshInfoLoop(stopCh)
-	go s.runTELAInvalidator(stopCh)
-
-	logger.Infof("HTTP API listening on %s", s.listenAddr)
 	srv := &http.Server{
 		Addr:         s.listenAddr,
 		Handler:      r,
@@ -155,41 +157,80 @@ func (s *Server) Start() error {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+
+	// Publish stopCh, srv, and the loop count in one critical section so
+	// Stop either observes the fully-published server or Start observes
+	// stopped and refuses — there is no half-started window.
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return http.ErrServerClosed
+	}
+	if s.srv != nil {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return errors.New("api: server already started")
+	}
+	s.stopCh = make(chan struct{})
+	stopCh := s.stopCh
 	s.srv = srv
+	s.wg.Add(2)
 	s.mu.Unlock()
-	return srv.ListenAndServe()
+
+	// Background info caching + TELA cache invalidator. Both exit when
+	// stopCh is closed by Stop, which waits for them via wg.
+	go s.refreshInfoLoop(stopCh)
+	go s.runTELAInvalidator(stopCh)
+
+	logger.Infof("HTTP API listening on %s", ln.Addr())
+	err = srv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
-// Stop gracefully shuts down the HTTP server and its background loops.
-// Safe to call before Start (no-op) and safe to call multiple times.
-func (s *Server) Stop() {
-	s.stopOnce.Do(func() {
-		// Stop the background loops first so they don't wake up mid-shutdown.
-		s.mu.Lock()
-		if s.stopCh != nil {
-			close(s.stopCh)
-		}
-		srv := s.srv
-		s.srv = nil
+// Stop shuts down the HTTP server and waits for its background loops to
+// exit. In-flight requests drain until ctx expires; remaining connections
+// are then force-closed and ctx's error is returned. Idempotent: later
+// calls return nil. Safe to call before Start — a subsequent Start returns
+// http.ErrServerClosed without serving. A stopped Server cannot be
+// restarted; construct a new Server instead.
+func (s *Server) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	if s.stopped {
 		s.mu.Unlock()
-		if srv == nil {
-			return
-		}
+		return nil
+	}
+	s.stopped = true
+	if s.stopCh != nil {
+		close(s.stopCh)
+	}
+	srv := s.srv
+	s.srv = nil
+	s.mu.Unlock()
 
-		// Graceful: stop accepting new connections and let in-flight requests
-		// finish, with a deadline as a backstop. If the deadline expires,
-		// force-close whatever remains.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
+	var err error
+	if srv != nil {
+		if err = srv.Shutdown(ctx); err != nil {
 			_ = srv.Close()
 		}
-	})
+	}
+	// Block until both loops have exited so nothing touches the pool or
+	// store after Stop returns; the wait is bounded by one in-flight RPC
+	// or DB operation.
+	s.wg.Wait()
+	return err
 }
 
 // refreshInfoLoop periodically fetches daemon info and caches it.
+// Exits when stopCh is closed by Stop; no-op when no RPC pool is wired.
 func (s *Server) refreshInfoLoop(stopCh <-chan struct{}) {
+	defer s.wg.Done()
+	if s.pool == nil {
+		return
+	}
 	s.refreshInfo()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
