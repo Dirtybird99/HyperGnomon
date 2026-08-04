@@ -271,9 +271,10 @@ func (c *telaContentCache) InvalidatePrefix(scid string) {
 }
 
 // runTELAInvalidator subscribes to EventInstall/EventVarChange and drops
-// cache entries whose SCID was touched. Exits when the bus closes the
-// subscription channel.
+// cache entries whose SCID was touched. Exits when stopCh is closed by
+// Stop or when the bus closes the subscription channel.
 func (s *Server) runTELAInvalidator(stopCh <-chan struct{}) {
+	defer s.wg.Done()
 	if s.bus == nil || s.telaCache == nil {
 		return
 	}
