@@ -20,7 +20,7 @@ jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # MUST-HAVE #3: Job timeout
+    timeout-minutes: 45  # MUST-HAVE #3: Job timeout; push runs use -count=5 (~27 min), PR runs -count=1 (~6 min)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
