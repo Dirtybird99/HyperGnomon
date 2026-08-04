@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -50,6 +51,16 @@ type Server struct {
 
 	mu         sync.RWMutex
 	cachedInfo *structures.GetInfoResult
+
+	// srv is the *http.Server created by Start; retained so Stop can release
+	// the listener and unblock Start's ListenAndServe.
+	srv *http.Server
+
+	// stopCh is closed by Stop to signal the background loops to exit.
+	stopCh chan struct{}
+	// stopOnce makes Stop idempotent: the first call shuts down, later
+	// calls are no-ops.
+	stopOnce sync.Once
 
 	assetCatalogMu       sync.RWMutex
 	assetCatalogs        map[string]assetCatalogCacheEntry
@@ -124,9 +135,17 @@ func (s *Server) Start() error {
 	// forward multi-segment paths like "app/js/main.js" intact.
 	r.HandleFunc("/tela/{scid}/{path:.*}", s.handleGetTELAContent).Methods(http.MethodGet, http.MethodHead)
 
-	// Start background info caching + TELA cache invalidator
-	go s.refreshInfoLoop()
-	go s.runTELAInvalidator()
+	// Start background info caching + TELA cache invalidator. Both exit
+	// when stopCh is closed by Stop.
+	s.mu.Lock()
+	if s.stopCh == nil {
+		s.stopCh = make(chan struct{})
+	}
+	stopCh := s.stopCh
+	s.mu.Unlock()
+
+	go s.refreshInfoLoop(stopCh)
+	go s.runTELAInvalidator(stopCh)
 
 	logger.Infof("HTTP API listening on %s", s.listenAddr)
 	srv := &http.Server{
@@ -136,16 +155,51 @@ func (s *Server) Start() error {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
 	return srv.ListenAndServe()
 }
 
+// Stop gracefully shuts down the HTTP server and its background loops.
+// Safe to call before Start (no-op) and safe to call multiple times.
+func (s *Server) Stop() {
+	s.stopOnce.Do(func() {
+		// Stop the background loops first so they don't wake up mid-shutdown.
+		s.mu.Lock()
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		srv := s.srv
+		s.srv = nil
+		s.mu.Unlock()
+		if srv == nil {
+			return
+		}
+
+		// Graceful: stop accepting new connections and let in-flight requests
+		// finish, with a deadline as a backstop. If the deadline expires,
+		// force-close whatever remains.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			_ = srv.Close()
+		}
+	})
+}
+
 // refreshInfoLoop periodically fetches daemon info and caches it.
-func (s *Server) refreshInfoLoop() {
+func (s *Server) refreshInfoLoop(stopCh <-chan struct{}) {
 	s.refreshInfo()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.refreshInfo()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			s.refreshInfo()
+		}
 	}
 }
 
