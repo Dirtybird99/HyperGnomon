@@ -26,6 +26,41 @@ Every numeric claim in the README links back here. Each entry names the harness,
 
 Baseline is the v0.7 release against the same daemon. Re-run against a remote daemon (e.g. `node.derofoundation.org:11012`) is expected to roughly double these numbers from round-trip latency alone — use LAN for comparability.
 
+## DERO mainnet reorg frequency and depth (July 2026)
+
+Measured with `cmd/reorgwatch` against `192.168.2.251:10102` (LAN, mainnet, at tip,
+daemon `3.5.5-142.DEROHE.STARGATE`), July 20 2026, tip ≈ 7,357,000. This is the
+number that gates truncate scan-cost work and validates M2.3 wiring assumptions.
+
+| Measurement | Result |
+|---|---|
+| Protocol depth bound (`topoheight − stableheight`) | **8 blocks** (~2.5 min at 18–20 s/block) |
+| Historical scan: 99,992 headers (**23.3 days** of chain) | **0** sideblocks, **0** multi-tip blocks, **0** height≠topoheight |
+| Live watch (first 2.2 h): topo-order rewrites | **4 reorg events, all depth 2** (~1 per 100 blocks, ≈1.8/h) |
+
+Reproduce: `./reorgwatch -daemon=<host:port> -scan 100000` (one JSON line, ~50 min at
+~30 ms/header over WS) and `./reorgwatch -daemon=<host:port> -watch -out=reorgwatch.jsonl`
+(JSONL events + hourly heartbeats; leave running for days).
+
+Two findings worth stating plainly:
+
+1. **Reorgs are shallow but NOT rare.** Every observed event rewrote a single topo
+   1–2 below the tip (depth 2, well inside the STABLE_LIMIT=8 bound), but at ~1.8/hour
+   — roughly one per 100 blocks — not the "rare" of earlier doc claims. M2.3's
+   truncate+replay wiring will be a *routine hourly* path, not an exceptional one:
+   correctness and idempotence matter more than its cost. The cost itself is settled —
+   with depth ≤ 2 and truncate at ~30 ms even on a 32k-SC store (see the truncate cost
+   model in `storage/truncate.go`), ~44 events/day ≈ 1.3 s/day total.
+2. **The canonical DAG hides these events entirely.** The same 2.2 h window that
+   produced 4 live rewrites shows **zero** sideblocks — and so does the whole 23-day
+   history. Displaced tip blocks vanish rather than being absorbed as sideblocks, so
+   the chain's own record is a *false negative* for reorg frequency. Only live
+   observation (the `blockhashes`-bucket comparison hypergnomon already does, which
+   `reorgwatch -watch` replicates) sees them.
+
+The watcher stays running; its JSONL accumulates the long-run rate. Depth events
+> 8 would be protocol-anomalous and worth investigation on sight.
+
 ## Microbenchmarks
 
 Run from repo root:

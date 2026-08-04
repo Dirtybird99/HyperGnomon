@@ -271,9 +271,10 @@ func (c *telaContentCache) InvalidatePrefix(scid string) {
 }
 
 // runTELAInvalidator subscribes to EventInstall/EventVarChange and drops
-// cache entries whose SCID was touched. Exits when the bus closes the
-// subscription channel.
-func (s *Server) runTELAInvalidator() {
+// cache entries whose SCID was touched. Exits when stopCh is closed by
+// Stop or when the bus closes the subscription channel.
+func (s *Server) runTELAInvalidator(stopCh <-chan struct{}) {
+	defer s.wg.Done()
 	if s.bus == nil || s.telaCache == nil {
 		return
 	}
@@ -284,13 +285,21 @@ func (s *Server) runTELAInvalidator() {
 		},
 	})
 	defer cancel()
-	for e := range ch {
-		if e.SCID == "" {
-			continue
-		}
-		s.telaCache.InvalidatePrefix(e.SCID)
-		if err := s.store.DeleteTELAContentForSCID(e.SCID); err != nil {
-			logger.Debugf("tela content invalidate %s: %v", e.SCID, err)
+	for {
+		select {
+		case <-stopCh:
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			if e.SCID == "" {
+				continue
+			}
+			s.telaCache.InvalidatePrefix(e.SCID)
+			if err := s.store.DeleteTELAContentForSCID(e.SCID); err != nil {
+				logger.Debugf("tela content invalidate %s: %v", e.SCID, err)
+			}
 		}
 	}
 }

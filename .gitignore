@@ -23,6 +23,9 @@ gnomondb/
 coverage.html
 *.prof
 
+# Long-running measurement output (cmd/reorgwatch -watch)
+reorgwatch.jsonl
+
 # IDE
 .idea/
 .vscode/
