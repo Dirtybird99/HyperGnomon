@@ -44,6 +44,34 @@ import (
 //     is left in place; replay re-adds it idempotently if still on the new chain.
 //   - owners / class_scid re-mutated above the fork (owner transfer, class-meta
 //     bump on a <= h scid) keep their > h value pending replay.
+//   - UPGRADED DBs: legacy whole-SCID height blobs and whole-addr normtx blobs
+//     (splitHeightKey / normTxHeight return not-ok / 0 for them) are invisible
+//     to affected-scid discovery, so their > h state survives truncate. Fresh
+//     DBs never write these layouts; if reorg wiring is ever pointed at an
+//     upgraded DB, migrate the blobs first or discovery misses exactly the SCs
+//     with the longest history.
+//
+// COST MODEL (measured; BenchmarkTruncateToHeight, medians of -count=6): the
+// dominant terms scale with TOTAL DB SIZE, not reorg depth — discovery and
+// rollback full-scan height, scvars, normtx, installs, addr_scids (every addr
+// sub-bucket), and owner_scids, because all but installs are entity-major and
+// carry no height-ordered access path. allocs/op fits
+//
+//	~3.0·(total SCs) + ~12·(distinct addrs) + ~92·(affected SCs) + ~4·(depth)
+//
+// so a 1-block reorg pays within ~13% of a 1000-block one (8k-SC fixture:
+// 30.6k vs 34.7k allocs). Deliberate tradeoff: reorgs are rare and even the
+// 32k-SC fixture truncates in ~30 ms — orders of magnitude cheaper than a
+// resync — and the alternatives were rejected: a height->scids index taxes
+// the alloc-tuned flush path for a cold operation, and a max-height watermark
+// early-return would skip the unconditional lastindexedheight rollback below
+// (permanent index gap under the fastsync default). Bounding discovery to
+// O(reorg depth) is the M2.3 orchestrator's job: it re-fetches the orphaned
+// blocks and can pass the touched-scid set in, skipping discovery entirely.
+// NOTE the scvars DECIMAL height suffix ("<scid>:<decimal h>") is NOT a
+// correctness issue — every consumer parses numerically (splitScVarsKey,
+// maxSurvivingScVarsHeight, latestSCVarsHeightTx); it merely forecloses
+// seek-by-height there.
 func (s *BboltStore) TruncateToHeight(h int64) error {
 	if h < 0 {
 		h = 0

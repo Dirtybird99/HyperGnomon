@@ -256,6 +256,45 @@ shapes (escaped values, case-fold keys) fall back to the ORIGINAL
 pre-optimization Gnomon (exact-case key matching, whole-blob strictness) —
 the last fraction of the win was traded for provable parity.
 
+### TruncateToHeight reorg rollback (July 2026)
+
+`TruncateToHeight` self-discovers affected SCIDs by scanning entity-major
+buckets, so its cost scales with **total DB size, not reorg depth** — a
+deliberate tradeoff pinned by these numbers (commit `7910a26` cut the avoidable
+scans and rejected a height→scids index as a tax on the hot flush path; the
+O(reorg-depth) fix is M2.3's orchestrator passing the touched-SCID set in).
+The bench sweeps each cost axis with the others pinned; allocs/op leads (the
+discovery scans allocate ~1 string per key parsed, so allocs track keys-touched
+deterministically), ns/op is advisory.
+
+```
+axis            config (scids/addrs/depth/S)      ns/op (median)   allocs/op
+DB size         2000/512/10/10                        1.68 ms         13,516
+                8000/512/10/10                        6.4  ms         31,570
+                32000/512/10/10                      29.9  ms        104,234
+addr count      8000/1/10/10                         10.0  ms         25,278
+                8000/8192/10/10                      20.9  ms        121,453
+affected SCs    8000/512/100/S=1                      7.5  ms         31,043
+                8000/512/100/S=1000                  37.2  ms        123,031
+reorg depth     8000/512/depth=1/S=1                  7.3  ms         30,628
+                8000/512/depth=1000/S=1               8.1  ms         34,737
+```
+
+allocs/op fits `~3.0·scids + ~12·addrs + ~92·affectedSCs + ~4·depth` (the
+DB-size fit predicts 103.8k at 32k SCs; measured 104.2k). Read: a 1000× deeper
+reorg costs +13%; DB size, address cardinality, and affected-SC count set the
+bill. Even the 32k-SC fixture truncates in ~30 ms — orders of magnitude cheaper
+than the resync alternative — which is why the residual O(N) is accepted until
+M2.3 wiring lands.
+
+Reproduce (the bounded `-benchtime` matters — setup rebuilds the whole DB per
+iteration in the untimed region, so the default 1s target would rebuild the
+32k fixture for minutes):
+
+```bash
+go test ./storage/ -run=^$ -bench=BenchmarkTruncateToHeight -benchmem -benchtime=3x -count=6
+```
+
 ## TELA correctness
 
 Not a perf bench — a correctness gate. The content server's output must be byte-identical (SHA256) to civilware/tela's `parseDocCode` on every live mainnet TELA contract we can reach.
