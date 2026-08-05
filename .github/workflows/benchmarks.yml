@@ -20,14 +20,14 @@ jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # MUST-HAVE #3: Job timeout
+    timeout-minutes: 45  # MUST-HAVE #3: Job timeout; push runs use -count=5 (~27 min), PR runs -count=1 (~6 min)
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # MUST-HAVE #1: Caching
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           cache: true
@@ -48,7 +48,7 @@ jobs:
           retention-days: 30
 
       - name: Download previous benchmark
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ./cache
           key: benchmark-${{ runner.os }}-${{ hashFiles('go.sum') }}

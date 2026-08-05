@@ -56,6 +56,22 @@ var (
 	bucketOwnerSCIDs  = []byte("owner_scids")  // "<owner>|<scid>" -> "" (prefix-scan owner → [scid])
 )
 
+// namedBuckets is the complete list of statically-named top-level buckets.
+// NewBboltStore creates them and ResetIndex recreates them; it is the single
+// source of truth so the two paths can't drift. NOT exhaustive of top-level
+// buckets on disk: per-SCID invocation buckets (StoreInvokeDetails and the
+// FlushBatch invocation loop, named by raw 64-hex SCID) are dynamic —
+// ResetIndex discovers those by enumeration.
+var namedBuckets = [][]byte{
+	bucketStats, bucketOwners, bucketHeaders,
+	bucketClass, bucketTags, bucketHeight,
+	bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
+	// Route B M0
+	bucketBlockHash, bucketInstalls, bucketClassIdx,
+	bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
+	bucketOwnerSCIDs,
+}
+
 // Key layout helpers: keep binary big-endian so bbolt's byte-order cursor
 // walk matches numeric order. Height 0..2^63-1 packs into 8 bytes.
 
@@ -262,16 +278,7 @@ func NewBboltStoreWithMmap(dbDir string, searchFilter string, initialMmapSize in
 
 	// Create all buckets
 	err = db.Update(func(tx *bolt.Tx) error {
-		buckets := [][]byte{
-			bucketStats, bucketOwners, bucketHeaders,
-			bucketClass, bucketTags, bucketHeight,
-			bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
-			// Route B M0
-			bucketBlockHash, bucketInstalls, bucketClassIdx,
-			bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
-			bucketOwnerSCIDs,
-		}
-		for _, b := range buckets {
+		for _, b := range namedBuckets {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -1649,27 +1656,35 @@ func hexNibble(c byte) byte {
 	return 0
 }
 
-// ResetIndex drops every data bucket then recreates them empty. The block
-// hash bucket is preserved so reorg-detection has history to compare against
-// when the next scan reaches those heights again. Safe to call on an open
-// DB; callers should ensure no scan is running.
+// ResetIndex drops every data bucket then recreates the named ones empty. The
+// block hash bucket is preserved so reorg-detection has history to compare
+// against when the next scan reaches those heights again. Drops are discovered
+// by enumeration rather than a fixed list so the dynamic per-SCID invocation
+// buckets (named by raw 64-hex SCID) go too — a fixed list silently leaked
+// every one of them across a resync. Safe to call on an open DB; callers
+// should ensure no scan is running.
 func (s *BboltStore) ResetIndex() error {
-	toDrop := [][]byte{
-		bucketStats, bucketOwners, bucketHeaders,
-		bucketClass, bucketTags, bucketHeight,
-		bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
-		bucketInstalls, bucketClassIdx,
-		bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
-		bucketOwnerSCIDs,
-	}
 	return s.DB.Update(func(tx *bolt.Tx) error {
-		for _, name := range toDrop {
-			if tx.Bucket(name) != nil {
-				if err := tx.DeleteBucket(name); err != nil {
-					return fmt.Errorf("drop bucket %s: %w", name, err)
-				}
+		// Collect first: deleting while ForEach iterates is undefined in bbolt.
+		var toDrop [][]byte
+		err := tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+			if !bytes.Equal(name, bucketBlockHash) {
+				toDrop = append(toDrop, append([]byte(nil), name...))
 			}
-			if _, err := tx.CreateBucket(name); err != nil {
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, name := range toDrop {
+			if err := tx.DeleteBucket(name); err != nil {
+				return fmt.Errorf("drop bucket %s: %w", name, err)
+			}
+		}
+		// IfNotExists: blockhashes was kept, and the enumeration above may
+		// legitimately have found nothing on a fresh store.
+		for _, name := range namedBuckets {
+			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("recreate bucket %s: %w", name, err)
 			}
 		}

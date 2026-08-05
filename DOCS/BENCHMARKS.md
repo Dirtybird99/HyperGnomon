@@ -26,6 +26,41 @@ Every numeric claim in the README links back here. Each entry names the harness,
 
 Baseline is the v0.7 release against the same daemon. Re-run against a remote daemon (e.g. `node.derofoundation.org:11012`) is expected to roughly double these numbers from round-trip latency alone — use LAN for comparability.
 
+## DERO mainnet reorg frequency and depth (July 2026)
+
+Measured with `cmd/reorgwatch` against `192.168.2.251:10102` (LAN, mainnet, at tip,
+daemon `3.5.5-142.DEROHE.STARGATE`), July 20 2026, tip ≈ 7,357,000. This is the
+number that gates truncate scan-cost work and validates M2.3 wiring assumptions.
+
+| Measurement | Result |
+|---|---|
+| Protocol depth bound (`topoheight − stableheight`) | **8 blocks** (~2.5 min at 18–20 s/block) |
+| Historical scan: 99,992 headers (**23.3 days** of chain) | **0** sideblocks, **0** multi-tip blocks, **0** height≠topoheight |
+| Live watch (first 2.2 h): topo-order rewrites | **4 reorg events, all depth 2** (~1 per 100 blocks, ≈1.8/h) |
+
+Reproduce: `./reorgwatch -daemon=<host:port> -scan 100000` (one JSON line, ~50 min at
+~30 ms/header over WS) and `./reorgwatch -daemon=<host:port> -watch -out=reorgwatch.jsonl`
+(JSONL events + hourly heartbeats; leave running for days).
+
+Two findings worth stating plainly:
+
+1. **Reorgs are shallow but NOT rare.** Every observed event rewrote a single topo
+   1–2 below the tip (depth 2, well inside the STABLE_LIMIT=8 bound), but at ~1.8/hour
+   — roughly one per 100 blocks — not the "rare" of earlier doc claims. M2.3's
+   truncate+replay wiring will be a *routine hourly* path, not an exceptional one:
+   correctness and idempotence matter more than its cost. The cost itself is settled —
+   with depth ≤ 2 and truncate at ~30 ms even on a 32k-SC store (see the truncate cost
+   model in `storage/truncate.go`), ~44 events/day ≈ 1.3 s/day total.
+2. **The canonical DAG hides these events entirely.** The same 2.2 h window that
+   produced 4 live rewrites shows **zero** sideblocks — and so does the whole 23-day
+   history. Displaced tip blocks vanish rather than being absorbed as sideblocks, so
+   the chain's own record is a *false negative* for reorg frequency. Only live
+   observation (the `blockhashes`-bucket comparison hypergnomon already does, which
+   `reorgwatch -watch` replicates) sees them.
+
+The watcher stays running; its JSONL accumulates the long-run rate. Depth events
+> 8 would be protocol-anomalous and worth investigation on sight.
+
 ## Microbenchmarks
 
 Run from repo root:
@@ -240,6 +275,45 @@ gate against the stdlib decode. Unusual shapes (escaped values, case-fold keys)
 still fall back to the ORIGINAL `map[string]interface{}` decode, kept for exact
 behavior parity with pre-optimization Gnomon (exact-case key matching,
 whole-blob strictness).
+
+### TruncateToHeight reorg rollback (July 2026)
+
+`TruncateToHeight` self-discovers affected SCIDs by scanning entity-major
+buckets, so its cost scales with **total DB size, not reorg depth** — a
+deliberate tradeoff pinned by these numbers (commit `7910a26` cut the avoidable
+scans and rejected a height→scids index as a tax on the hot flush path; the
+O(reorg-depth) fix is M2.3's orchestrator passing the touched-SCID set in).
+The bench sweeps each cost axis with the others pinned; allocs/op leads (the
+discovery scans allocate ~1 string per key parsed, so allocs track keys-touched
+deterministically), ns/op is advisory.
+
+```
+axis            config (scids/addrs/depth/S)      ns/op (median)   allocs/op
+DB size         2000/512/10/10                        1.68 ms         13,516
+                8000/512/10/10                        6.4  ms         31,570
+                32000/512/10/10                      29.9  ms        104,234
+addr count      8000/1/10/10                         10.0  ms         25,278
+                8000/8192/10/10                      20.9  ms        121,453
+affected SCs    8000/512/100/S=1                      7.5  ms         31,043
+                8000/512/100/S=1000                  37.2  ms        123,031
+reorg depth     8000/512/depth=1/S=1                  7.3  ms         30,628
+                8000/512/depth=1000/S=1               8.1  ms         34,737
+```
+
+allocs/op fits `~3.0·scids + ~12·addrs + ~92·affectedSCs + ~4·depth` (the
+DB-size fit predicts 103.8k at 32k SCs; measured 104.2k). Read: a 1000× deeper
+reorg costs +13%; DB size, address cardinality, and affected-SC count set the
+bill. Even the 32k-SC fixture truncates in ~30 ms — orders of magnitude cheaper
+than the resync alternative — which is why the residual O(N) is accepted until
+M2.3 wiring lands.
+
+Reproduce (the bounded `-benchtime` matters — setup rebuilds the whole DB per
+iteration in the untimed region, so the default 1s target would rebuild the
+32k fixture for minutes):
+
+```bash
+go test ./storage/ -run=^$ -bench=BenchmarkTruncateToHeight -benchmem -benchtime=3x -count=6
+```
 
 ## TELA correctness
 
