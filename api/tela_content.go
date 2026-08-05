@@ -34,7 +34,6 @@ type telaContentCache struct {
 	// allocations per entry (the Element plus the boxed item Value) and an
 	// interface assertion on every Get.
 	root  telaCacheNode // sentinel: root.next = front (MRU), root.prev = back (LRU)
-	count int
 	items map[string]*telaCacheNode
 	// free: capped singly-linked recycle list (via .next) of nodes released
 	// by evict/InvalidatePrefix, so a Put after churn allocates no node.
@@ -162,7 +161,6 @@ func (c *telaContentCache) Put(key string, entry *structures.TELAContentEntry) {
 	}
 	n := c.newNodeLocked(key, scid, entry)
 	c.pushFrontLocked(n)
-	c.count++
 	c.items[key] = n
 	c.size += int64(len(entry.Body))
 	c.indexAddLocked(scid, key)
@@ -227,13 +225,12 @@ func (c *telaContentCache) indexRemoveLocked(scid, key string) {
 }
 
 func (c *telaContentCache) evictLocked() {
-	for c.size > c.maxBytes && c.count > 0 {
+	for c.size > c.maxBytes && len(c.items) > 0 {
 		back := c.root.prev
 		if back == &c.root {
 			return
 		}
 		c.unlinkLocked(back)
-		c.count--
 		delete(c.items, back.key)
 		c.indexRemoveLocked(back.scid, back.key)
 		c.size -= int64(len(back.entry.Body))
@@ -261,7 +258,6 @@ func (c *telaContentCache) InvalidatePrefix(scid string) {
 			continue
 		}
 		c.unlinkLocked(n)
-		c.count--
 		delete(c.items, key)
 		c.size -= int64(len(n.entry.Body))
 		c.freeNodeLocked(n)

@@ -358,7 +358,7 @@ func (s *Server) handleIndexedSCs(w http.ResponseWriter, r *http.Request) {
 
 // handleIndexBySCID returns invocation details for a given SCID.
 func (s *Server) handleIndexBySCID(w http.ResponseWriter, r *http.Request) {
-	scid := r.URL.Query().Get("scid")
+	scid := queryParam(r, "scid")
 	if scid == "" {
 		writeError(w, http.StatusBadRequest, "missing required parameter: scid")
 		return
@@ -380,13 +380,13 @@ func (s *Server) handleIndexBySCID(w http.ResponseWriter, r *http.Request) {
 
 // handleSCVarsByHeight returns SC variables at a specific height.
 func (s *Server) handleSCVarsByHeight(w http.ResponseWriter, r *http.Request) {
-	scid := r.URL.Query().Get("scid")
+	scid := queryParam(r, "scid")
 	if scid == "" {
 		writeError(w, http.StatusBadRequest, "missing required parameter: scid")
 		return
 	}
 
-	heightStr := r.URL.Query().Get("height")
+	heightStr := queryParam(r, "height")
 	if heightStr == "" {
 		writeError(w, http.StatusBadRequest, "missing required parameter: height")
 		return
@@ -430,7 +430,7 @@ func (s *Server) handleInvalidSCIDs(w http.ResponseWriter, r *http.Request) {
 
 // handleSCIDPrivTx returns normal TXs with SCID payload for a given address.
 func (s *Server) handleSCIDPrivTx(w http.ResponseWriter, r *http.Request) {
-	addr := r.URL.Query().Get("address")
+	addr := queryParam(r, "address")
 	if addr == "" {
 		writeError(w, http.StatusBadRequest, "missing required parameter: address")
 		return
@@ -455,7 +455,7 @@ func (s *Server) handleSCIDPrivTx(w http.ResponseWriter, r *http.Request) {
 // O(N * 3-reads) iteration over every SCID. Accepts an optional ?class= query
 // param (defaults to "TELA-INDEX-1"; "TELA-DOC-1" is the other common value).
 func (s *Server) handleGetTELA(w http.ResponseWriter, r *http.Request) {
-	class := r.URL.Query().Get("class")
+	class := queryParam(r, "class")
 	if class == "" {
 		class = "TELA-INDEX-1"
 	}
@@ -981,7 +981,7 @@ func (s *Server) handleGetTELARatings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var height int64
-	if h := r.URL.Query().Get("height"); h != "" {
+	if h := queryParam(r, "height"); h != "" {
 		parsed, err := strconv.ParseInt(h, 10, 64)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid height: "+err.Error())
