@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
@@ -24,6 +25,11 @@ import (
 	"github.com/hypergnomon/hypergnomon/storage"
 	"github.com/hypergnomon/hypergnomon/structures"
 )
+
+// apiDrainTimeout caps how long in-flight HTTP requests get to finish during
+// shutdown. It does not cap the whole teardown: Stop still joins its
+// background loops afterwards so the pool and store outlive their last reader.
+const apiDrainTimeout = 10 * time.Second
 
 func main() {
 	// Operator subcommands run before flag parsing so `hypergnomon resync`
@@ -146,12 +152,22 @@ func main() {
 		structures.Logger.Fatalf("--tela-only requires --fastsync: TELA discovery runs from the GnomonSC registry probe")
 	}
 
+	// A non-zero indexer exit has to travel past main's cleanup defers, so it
+	// goes through a variable rather than a Fatalf that would skip them.
+	// Registered first, hence run last: everything else has already flushed.
+	exitCode := 0
+	defer func() {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
+
 	// Whole-run CPU profile (the PGO refresh source for default.pgo). Flushed
 	// by the deferred stop on every clean exit path: --tela-only's return and
 	// the normal daemon shutdown (Ctrl+C flips Closing, scanLoop exits, main
-	// returns). Fatalf/os.Exit paths skip defers and lose the profile — all
-	// such sites currently run before the daemon starts, so at most an
-	// almost-empty file is lost.
+	// returns). Fatalf/os.Exit paths skip defers and lose the profile: the
+	// startup ones cost at most an almost-empty file, but abandoning the
+	// drain with a second signal discards a whole run's profile.
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)
 		if err != nil {
@@ -347,13 +363,19 @@ func main() {
 		}
 	}
 
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
+	// Graceful shutdown. The signal only flips Closing, which drains the scan
+	// pipeline; releasing the RPC pool and store is left to the deferred
+	// teardown below, which runs once the API server can no longer touch
+	// them. A second signal abandons the drain.
+	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		structures.Logger.Info("Shutting down...")
-		idx.Close()
+		structures.Logger.Info("Shutting down... (signal again to exit without draining)")
+		idx.Closing.Store(true)
+		<-sigChan
+		structures.Logger.Warn("Second signal: exiting without draining")
+		os.Exit(1)
 	}()
 
 	// Start API servers (deferred until after fastsync/segment-sync complete).
@@ -366,6 +388,20 @@ func main() {
 		mDir = filepath.Join(*dbDir, "media")
 	}
 	apiServer.SetMediaOptions(mDir, *mediaFetch, *ipfsGateway)
+
+	// Teardown runs in dependency order: drain HTTP and join its background
+	// loops first, then release the pool and store those loops and handlers
+	// read, then the bus. Registered after `defer bus.Close()`, so LIFO puts
+	// it ahead of the bus.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), apiDrainTimeout)
+		defer cancel()
+		if err := apiServer.Stop(ctx); err != nil {
+			structures.Logger.Warnf("HTTP API shutdown: %v", err)
+		}
+		idx.Close()
+	}()
+
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			structures.Logger.Errorf("HTTP API server error: %v", err)
@@ -394,7 +430,8 @@ func main() {
 	// Start indexing
 	structures.Logger.Infof("Startup complete in %s", time.Since(startTime).Round(time.Millisecond))
 	if err := idx.StartDaemonMode(); err != nil {
-		structures.Logger.Fatalf("Indexer error: %v", err)
+		structures.Logger.Errorf("Indexer error: %v", err)
+		exitCode = 1
 	}
 }
 

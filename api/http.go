@@ -204,11 +204,30 @@ func (s *Server) Start() error {
 }
 
 // Stop shuts down the HTTP server and waits for its background loops to
-// exit. In-flight requests drain until ctx expires; remaining connections
-// are then force-closed and ctx's error is returned. Idempotent: later
-// calls return nil. Safe to call before Start — a subsequent Start returns
-// http.ErrServerClosed without serving. A stopped Server cannot be
-// restarted; construct a new Server instead.
+// exit.
+//
+// ctx bounds request draining only: in-flight requests finish until it
+// expires, after which remaining connections are force-closed. It does not
+// bound Stop itself. Stop returns only once both background loops have
+// exited, so on return neither loop will touch the store or the RPC pool
+// again — that is what makes it safe to close them next. The join costs at
+// most one in-flight RPC or DB operation.
+//
+// That join covers the loops, not request handlers. Draining that finishes
+// within ctx leaves no handler running, but if ctx expires first, closing
+// the connections does not stop a handler already executing: it can briefly
+// outlive Stop and still read the store. Give ctx room to drain before
+// closing anything a handler touches.
+//
+// Returns the shutdown error if request draining did not complete cleanly
+// (ctx's error when it expired), otherwise nil.
+//
+// Idempotent: later calls return nil. Safe to call before Start — a
+// subsequent Start returns http.ErrServerClosed without serving. A Server
+// stopped concurrently with its own Start may return before that Start has
+// released the listening socket; the port is free on return for a Server
+// that was already serving. A stopped Server cannot be restarted; construct
+// a new Server instead.
 func (s *Server) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.stopped {
@@ -229,9 +248,9 @@ func (s *Server) Stop(ctx context.Context) error {
 			_ = srv.Close()
 		}
 	}
-	// Block until both loops have exited so nothing touches the pool or
-	// store after Stop returns; the wait is bounded by one in-flight RPC
-	// or DB operation.
+	// Deliberately not bounded by ctx: callers close the store and pool
+	// immediately after this returns, so the join has to be unconditional
+	// for that to be safe.
 	s.wg.Wait()
 	return err
 }
@@ -242,6 +261,13 @@ func (s *Server) refreshInfoLoop(stopCh <-chan struct{}) {
 	defer s.wg.Done()
 	if s.pool == nil {
 		return
+	}
+	// A Stop that lands before this goroutine is scheduled would otherwise
+	// still pay for the eager fetch.
+	select {
+	case <-stopCh:
+		return
+	default:
 	}
 	s.refreshInfo()
 	ticker := time.NewTicker(10 * time.Second)
