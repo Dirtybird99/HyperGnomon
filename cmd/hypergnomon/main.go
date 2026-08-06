@@ -165,9 +165,9 @@ func main() {
 	// Whole-run CPU profile (the PGO refresh source for default.pgo). Flushed
 	// by the deferred stop on every clean exit path: --tela-only's return and
 	// the normal daemon shutdown (Ctrl+C flips Closing, scanLoop exits, main
-	// returns). Fatalf/os.Exit paths skip defers and lose the profile — all
-	// such sites run before the daemon starts, so at most an almost-empty
-	// file is lost.
+	// returns). Fatalf/os.Exit paths skip defers and lose the profile: the
+	// startup ones cost at most an almost-empty file, but abandoning the
+	// drain with a second signal discards a whole run's profile.
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)
 		if err != nil {
@@ -371,7 +371,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		structures.Logger.Info("Shutting down...")
+		structures.Logger.Info("Shutting down... (signal again to exit without draining)")
 		idx.Closing.Store(true)
 		<-sigChan
 		structures.Logger.Warn("Second signal: exiting without draining")

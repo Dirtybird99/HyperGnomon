@@ -209,9 +209,15 @@ func (s *Server) Start() error {
 // ctx bounds request draining only: in-flight requests finish until it
 // expires, after which remaining connections are force-closed. It does not
 // bound Stop itself. Stop returns only once both background loops have
-// exited, so on return nothing the Server owns will touch the store or the
-// RPC pool again — that is what makes it safe to close them next. The join
-// costs at most one in-flight RPC or DB operation.
+// exited, so on return neither loop will touch the store or the RPC pool
+// again — that is what makes it safe to close them next. The join costs at
+// most one in-flight RPC or DB operation.
+//
+// That join covers the loops, not request handlers. Draining that finishes
+// within ctx leaves no handler running, but if ctx expires first, closing
+// the connections does not stop a handler already executing: it can briefly
+// outlive Stop and still read the store. Give ctx room to drain before
+// closing anything a handler touches.
 //
 // Returns the shutdown error if request draining did not complete cleanly
 // (ctx's error when it expired), otherwise nil.
