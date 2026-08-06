@@ -241,6 +241,42 @@ func TestWSUnsubscribe_StopsEventDelivery(t *testing.T) {
 // TestWSSubscribe_MaxSubsRejected validates the -32099 cap response when a
 // connection asks for more than maxSubsPerConn subscriptions. Each request
 // goes on a fresh JSON-RPC id so responses can be correlated positionally.
+// cancelAllSubs nils the subs map, so a subscribe arriving after teardown used
+// to assign into a nil map and take the process down. A forwarder hitting a
+// write error calls cancelAllSubs from its own goroutine while the read loop
+// may be mid-subscribe, so the two really do overlap.
+func TestConnContext_SubscribeAfterTeardown(t *testing.T) {
+	cctx := newConnContext(nil)
+	cctx.cancelAllSubs()
+
+	var cancelled bool
+	if cctx.addSub("sub-1", func() { cancelled = true }) {
+		t.Fatal("addSub accepted a subscription on a torn-down connection")
+	}
+	if cancelled {
+		t.Fatal("addSub invoked the cancel func; the caller owns that")
+	}
+
+	// The teardown path must stay idempotent and must not resurrect the map.
+	cctx.cancelAllSubs()
+	if cctx.addSub("sub-2", func() {}) {
+		t.Fatal("addSub accepted a subscription after a repeated teardown")
+	}
+}
+
+// Races a subscribe against the teardown that nils the map, which is the
+// interleaving the forwarder write-error path produces in production.
+func TestConnContext_SubscribeRacesTeardown(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		cctx := newConnContext(nil)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); cctx.cancelAllSubs() }()
+		go func() { defer wg.Done(); cctx.addSub("sub", func() {}) }()
+		wg.Wait()
+	}
+}
+
 func TestWSSubscribe_MaxSubsRejected(t *testing.T) {
 	bus := eventbus.New(256)
 	go bus.Run()

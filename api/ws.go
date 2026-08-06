@@ -263,12 +263,13 @@ func (c *connContext) safeWrite(v interface{}) error {
 	return c.conn.WriteMessage(websocket.TextMessage, c.encBuf.Bytes())
 }
 
-// addSub registers a cancel func under id. Returns false if the cap is hit.
-// The caller must not hold subsMu.
+// addSub registers a cancel func under id. Returns false if the cap is hit or
+// the connection is already tearing down — cancelAllSubs nils the map, and
+// assigning into a nil map panics. The caller must not hold subsMu.
 func (c *connContext) addSub(id string, cancel func()) bool {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
-	if len(c.subs) >= maxSubsPerConn {
+	if c.subs == nil || len(c.subs) >= maxSubsPerConn {
 		return false
 	}
 	c.subs[id] = cancel
@@ -538,7 +539,9 @@ func (ws *WSServer) handleSubscribe(cctx *connContext, raw json.RawMessage) (int
 	id, ch, cancel := ws.bus.Subscribe(filter)
 
 	if !cctx.addSub(id, cancel) {
-		// Cap hit — undo the bus-side registration so we don't leak.
+		// Cap hit, or the connection is tearing down. Either way undo the
+		// bus-side registration so we don't leak a subscriber; a peer that is
+		// already gone will never read the error.
 		cancel()
 		return nil, &jsonRPCError{Code: codeTooManySubs, Message: "too many subscriptions"}
 	}
