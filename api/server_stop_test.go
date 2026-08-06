@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,6 +139,49 @@ func TestServerStop_Idempotent(t *testing.T) {
 	case <-errCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after Stop")
+	}
+}
+
+// A caller that closes the store and RPC pool right after Stop relies on the
+// join being unconditional, so assert it directly: Stop stays blocked while a
+// background loop is parked, and the loop has finished by the time it returns.
+func TestServerStop_JoinsBackgroundLoops(t *testing.T) {
+	store := newStopTestStore(t)
+	s := NewServer(store, nil, "127.0.0.1:0", nil, nil, nil, nil, 1024)
+
+	release := make(chan struct{})
+	var exited atomic.Bool
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		<-release
+		exited.Store(true)
+	}()
+
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- s.Stop(ctx)
+	}()
+
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned (%v) while a background loop was still running", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the background loop exited")
+	}
+	if !exited.Load() {
+		t.Fatal("Stop returned before the background loop finished")
 	}
 }
 
