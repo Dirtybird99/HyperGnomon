@@ -623,6 +623,23 @@ func toStringBest(v interface{}) string {
 //   varint+bytes     : DURL
 //   varint+bytes     : Version
 //
+// Optional media tail (written only when at least one member is non-empty):
+//
+//   varint+bytes     : Image
+//   varint+bytes     : AltImage
+//   varint+bytes     : Audio
+//   varint+bytes     : Video
+//   varint+bytes     : ImagesJSON
+//
+// The tail needs no tag bump in either direction. Forward: the v1 reader
+// always ignored trailing bytes (see the `_ = pos` at the end of
+// UnmarshalTyped), so a pre-media binary reading a media record decodes the
+// six fixed fields and discards the rest. Backward: the reader below treats a
+// truncated tail as "absent → empty string" rather than an error, so a media
+// binary reads a pre-media record. Omitting the tail entirely when all five
+// are empty keeps non-G45 records (TELA, NFA, nameservice) byte-identical to
+// what the pre-media encoder produced.
+//
 // Backward-compat: existing class/class_scid bucket records are msgpack
 // fixmaps (tag 0x80-0x8f) or map16 (0xde). Tag 0x04 does not collide with
 // either, so reader dispatch by byte[0] is unambiguous. See IsClassMetaTyped.
@@ -656,7 +673,22 @@ func (m *ClassMeta) MarshalTyped() []byte {
 	size += uvarintLen(uint64(len(m.IconURL))) + len(m.IconURL)
 	size += uvarintLen(uint64(len(m.DURL))) + len(m.DURL)
 	size += uvarintLen(uint64(len(m.Version))) + len(m.Version)
+	if m.hasMedia() {
+		size += uvarintLen(uint64(len(m.Image))) + len(m.Image)
+		size += uvarintLen(uint64(len(m.AltImage))) + len(m.AltImage)
+		size += uvarintLen(uint64(len(m.Audio))) + len(m.Audio)
+		size += uvarintLen(uint64(len(m.Video))) + len(m.Video)
+		size += uvarintLen(uint64(len(m.ImagesJSON))) + len(m.ImagesJSON)
+	}
 	return m.MarshalTypedAppend(make([]byte, 0, size))
+}
+
+// hasMedia reports whether the optional media tail must be written. Gating on
+// this keeps every non-G45 record byte-identical to the pre-media encoding, so
+// existing size benchmarks and encoding goldens do not move.
+func (m *ClassMeta) hasMedia() bool {
+	return m.Image != "" || m.AltImage != "" || m.Audio != "" ||
+		m.Video != "" || m.ImagesJSON != ""
 }
 
 // MarshalTypedAppend writes into dst and returns the grown slice.
@@ -675,8 +707,22 @@ func (m *ClassMeta) MarshalTypedAppend(dst []byte) []byte {
 	dst = appendLenString(dst, m.IconURL)
 	dst = appendLenString(dst, m.DURL)
 	dst = appendLenString(dst, m.Version)
+	// Optional media tail — all five or none, so the reader's positional walk
+	// stays unambiguous. Stays in lockstep with MarshalTyped's sizing pass.
+	if m.hasMedia() {
+		dst = appendLenString(dst, m.Image)
+		dst = appendLenString(dst, m.AltImage)
+		dst = appendLenString(dst, m.Audio)
+		dst = appendLenString(dst, m.Video)
+		dst = appendLenString(dst, m.ImagesJSON)
+	}
 	return dst
 }
+
+// classMetaMediaFields is the number of optional media strings in the tail.
+// Named so the two decode passes cannot drift out of step — a mismatch between
+// them under-sizes sbuf and makes ownedCut misalign silently.
+const classMetaMediaFields = 5
 
 // UnmarshalTyped decodes a v1 typed ClassMeta from b. Six string fields
 // each get one allocation (unavoidable — they must outlive the bbolt View
@@ -719,6 +765,31 @@ func (m *ClassMeta) UnmarshalTyped(b []byte) error {
 		}
 		total += en - st
 		p = nx
+	}
+
+	// Optional media tail. The writer emits all five or none (see hasMedia), so
+	// the read is all-or-nothing: a short or malformed tail is treated as
+	// ABSENT rather than an error, which preserves this format's original
+	// "trailing bytes are forward-compat slack" contract instead of turning it
+	// into a decode failure. mediaOK is the single termination decision both
+	// passes obey — b is immutable between them, so pass 2 walking the same
+	// bytes reaches the same verdict.
+	mediaOK := false
+	if p < len(b) {
+		q, sum := p, 0
+		mediaOK = true
+		for i := 0; i < classMetaMediaFields; i++ {
+			st, en, nx, err := locLenString(b, q)
+			if err != nil {
+				mediaOK = false
+				break
+			}
+			sum += en - st
+			q = nx
+		}
+		if mediaOK {
+			total += sum
+		}
 	}
 
 	// Pass 2: at most one tags-slice alloc + one backing-buffer alloc.
@@ -766,6 +837,21 @@ func (m *ClassMeta) UnmarshalTyped(b []byte) error {
 		return err
 	}
 	m.Version, pos = ownedCut(sbuf, &off, b, st, en), nx
+
+	// Media tail, gated on pass 1's verdict. Always assigned — including the
+	// clear on the absent path — so decoding a pre-media record into a reused
+	// ClassMeta cannot leave a previous record's media behind.
+	m.Image, m.AltImage, m.Audio, m.Video, m.ImagesJSON = "", "", "", "", ""
+	if mediaOK {
+		for _, dst := range [classMetaMediaFields]*string{
+			&m.Image, &m.AltImage, &m.Audio, &m.Video, &m.ImagesJSON,
+		} {
+			if st, en, nx, err = locLenString(b, pos); err != nil {
+				return err
+			}
+			*dst, pos = ownedCut(sbuf, &off, b, st, en), nx
+		}
+	}
 	_ = pos // trailing bytes (forward-compat slack) are ignored
 	return nil
 }

@@ -34,6 +34,19 @@ type SCClass struct {
 	// DocShard reports whether this SCID is a TELA DocShard, detected via
 	// `dURL` suffix: `.shard` on DOCs, `.shards` on the parent INDEX.
 	DocShard bool
+
+	// Media URLs from the G45 `metadata` blob. IconURL stays empty for G45
+	// assets — `icon` appears zero times across the mainnet corpus — so these
+	// carry the artwork. URLs only; the bytes behind them are never fetched.
+	Image    string // `image`, else `backdropImage`
+	AltImage string // `alt-image`, else `alt-backdropImage`
+	Audio    string
+	Video    string
+	// ImagesJSON is the verbatim on-chain JSON text of the `images` object
+	// (named secondary artwork, e.g. {"Sculpture":"ipfs://…"}). Not
+	// re-encoded: key order and spacing are whatever the minter wrote. See
+	// g45ScanImagesRaw for why it is captured rather than decoded.
+	ImagesJSON string
 }
 
 // classRule maps a code-level pattern to its class and tag.
@@ -282,6 +295,7 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 	var headerDesc, legacyDesc, freeDesc string
 	var headerIcon, legacyIcon string
 	var durl, telaVersion, docVersion, docType, mods, metadata string
+	var fileURL, coverURL, imageURL string
 
 	// Stringify ONLY inside matched cases: a live TELA INDEX carries dozens
 	// of non-matching vars (rating-address keys with uint64 values, DOC
@@ -320,7 +334,31 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 		case "mods":
 			mods = decodeHexIfPrintable(varString(v.Value))
 		case "metadata":
-			metadata = varString(v.Value)
+			// decodeHexIfPrintable, same as every sibling string var above.
+			// derod returns STORE'd strings hex-encoded, so the raw value is
+			// hex of the JSON blob — feeding that to the JSON extractors
+			// yields nothing. The committed testdata corpus happens to hold
+			// `metadata` already decoded, which is why the unit gates passed
+			// while live extraction produced empty Name/Desc/media. Verified
+			// against a mainnet daemon at height 7,389,724.
+			//
+			// The guard makes this safe for both shapes: JSON starts with '{',
+			// which is not a hex digit, so an already-decoded blob fails the
+			// hex-charset test and passes through untouched.
+			metadata = decodeHexIfPrintable(varString(v.Value))
+		case "fileURL":
+			// NFA (Artificer NFA Market Standard) artwork. Live-sampled
+			// 2026-07-27: 21/21 NFAs carry it, e.g.
+			// raw.githubusercontent.com/DeroDesperados/…/Desperado750.png.
+			// NFAs put media URLs straight on the SC — no metadata blob.
+			fileURL = decodeHexIfPrintable(varString(v.Value))
+		case "coverURL":
+			// NFA cover art (21/21 in the same sample).
+			coverURL = decodeHexIfPrintable(varString(v.Value))
+		case "image_url":
+			// Free-form token logo (8 G45-classified bridged-token contracts
+			// in the corpus carry it and nothing else image-shaped).
+			imageURL = decodeHexIfPrintable(varString(v.Value))
 		}
 	}
 
@@ -345,6 +383,15 @@ func extractClassVars(sc *SCClass, vars []*structures.SCIDVariable) {
 		sc.IconURL = headerIcon
 	case legacyIcon != "":
 		sc.IconURL = legacyIcon
+	}
+	// Direct media vars (NFA fileURL/coverURL, free-form image_url) fill
+	// first; for G45 SCs these keys don't occur, so the metadata-blob
+	// extraction below still owns the G45 fields via its empty-guards.
+	if sc.Image == "" {
+		sc.Image = firstNonEmpty(fileURL, imageURL)
+	}
+	if sc.AltImage == "" {
+		sc.AltImage = coverURL
 	}
 
 	if len(sc.Tags) > 1 && sc.Tags[1] == "g45" && metadata != "" {
@@ -513,6 +560,24 @@ func extractHeaders(sc *SCClass, vars map[string]interface{}) {
 			sc.Desc = decodeHexIfPrintable(fmt.Sprintf("%v", v))
 		}
 	}
+	// Direct media vars — NFA fileURL/coverURL (Artificer NFA standard) and
+	// the free-form image_url token logo. Mirrors extractClassVars; keys are
+	// absent on G45 SCs, whose media comes from the metadata blob instead.
+	if sc.Image == "" {
+		if v, ok := vars["fileURL"]; ok {
+			sc.Image = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	if sc.Image == "" {
+		if v, ok := vars["image_url"]; ok {
+			sc.Image = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
+	if sc.AltImage == "" {
+		if v, ok := vars["coverURL"]; ok {
+			sc.AltImage = decodeHexIfPrintable(fmt.Sprintf("%v", v))
+		}
+	}
 }
 
 // decodeHexIfPrintable returns the hex-decoded form of s when s is a valid
@@ -547,7 +612,10 @@ func decodeHexIfPrintable(s string) string {
 	if !looksLikePrintableUTF8(decoded) {
 		return s
 	}
-	return string(decoded)
+	// `decoded` was allocated here, filled once, and is referenced by nothing
+	// else — hand it over as a string rather than copying it a second time.
+	// See ownedBytesToString for the ownership contract this relies on.
+	return ownedBytesToString(decoded)
 }
 
 func hexNibbleByte(c byte) byte {
@@ -612,7 +680,9 @@ func utf8RuneLen(lead byte) int {
 
 // extractG45Metadata parses the JSON "metadata" variable common to G45 assets.
 // If individual header fields were not already populated, this fills them in
-// from the metadata blob (keys: "name", "description", "icon").
+// from the metadata blob (keys: "name", "description", "icon", plus the media
+// keys "image"/"backdropImage", "alt-image"/"alt-backdropImage", "audio",
+// "video", "images").
 func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 	raw, ok := vars["metadata"]
 	if !ok {
@@ -622,7 +692,9 @@ func extractG45Metadata(sc *SCClass, vars map[string]interface{}) {
 	if !ok {
 		return
 	}
-	extractG45MetadataString(sc, str)
+	// See the "metadata" case in extractClassVars: derod hex-encodes STORE'd
+	// strings, and the guard is a no-op on an already-decoded blob.
+	extractG45MetadataString(sc, decodeHexIfPrintable(str))
 }
 
 func extractG45MetadataString(sc *SCClass, str string) {
@@ -640,27 +712,89 @@ func extractG45MetadataString(sc *SCClass, str string) {
 	// Name cannot pin a huge (potentially hostile) blob in ClassMeta held by
 	// eventbus queues or the seed cache. Real corpus blobs max out under 2KB,
 	// so the guard never fires on the benchmark path.
-	switch name, desc, icon, verdict := g45ScanMetaVerdict(str); verdict {
+	switch f, verdict := g45ScanMetaVerdict(str); verdict {
 	case g45vOK:
 		if len(str) > g45CloneThreshold {
-			name = strings.Clone(name)
-			desc = strings.Clone(desc)
-			icon = strings.Clone(icon)
+			f.name = strings.Clone(f.name)
+			f.desc = strings.Clone(f.desc)
+			f.icon = strings.Clone(f.icon)
+			f.image = strings.Clone(f.image)
+			f.backdropImage = strings.Clone(f.backdropImage)
+			f.altImage = strings.Clone(f.altImage)
+			f.altBackdropImage = strings.Clone(f.altBackdropImage)
+			f.audio = strings.Clone(f.audio)
+			f.video = strings.Clone(f.video)
+			f.images = strings.Clone(f.images)
 		}
 		if sc.Name == "" {
-			sc.Name = name
+			sc.Name = f.name
 		}
 		if sc.Desc == "" {
-			sc.Desc = desc
+			sc.Desc = f.desc
 		}
 		if sc.IconURL == "" {
-			sc.IconURL = icon
+			sc.IconURL = f.icon
+		}
+		// Media precedence: NFTs carry `image`/`alt-image`, collections carry
+		// `backdropImage`/`alt-backdropImage`. The pairs are disjoint in the
+		// corpus, so one field each serves both — same shape as the
+		// headerIcon → legacyIcon fallback above.
+		if sc.Image == "" {
+			sc.Image = firstNonEmpty(f.image, f.backdropImage)
+		}
+		if sc.AltImage == "" {
+			sc.AltImage = firstNonEmpty(f.altImage, f.altBackdropImage)
+		}
+		if sc.Audio == "" {
+			sc.Audio = f.audio
+		}
+		if sc.Video == "" {
+			sc.Video = f.video
+		}
+		if sc.ImagesJSON == "" {
+			sc.ImagesJSON = f.images
 		}
 		return
 	case g45vNoFields:
 		return
 	}
 	extractG45MetadataFallback(sc, str)
+}
+
+// setImagesJSON fills ImagesJSON on the FALLBACK path only — the fast path
+// gets the same text for free from the main scan (g45Fields.images).
+//
+// Both paths must produce identical text or the differential gate fails, which
+// is why they share g45ScanImagesRaw's extent logic rather than each deriving
+// the value their own way. That shared derivation also means the differential
+// cannot really audit this field, so TestG45ImagesRawMatchesMapDecode is what
+// gates it: the raw text must parse to exactly the value a map decode yields,
+// across every corpus blob and adversarial input.
+//
+// This runs only on blobs the scanner declined (58 of 45,586 in the corpus),
+// so its Contains pre-filter and second walk cost nothing measurable. The fast
+// path deliberately does NOT call it: running a pre-filter over all 45,586
+// blobs is exactly the cost the inline capture exists to avoid.
+func setImagesJSON(sc *SCClass, str string) {
+	if sc.ImagesJSON != "" {
+		return
+	}
+	raw, ok := g45ScanImagesRaw(str)
+	if !ok {
+		return
+	}
+	if len(str) > g45CloneThreshold {
+		raw = strings.Clone(raw)
+	}
+	sc.ImagesJSON = raw
+}
+
+// firstNonEmpty returns a if non-empty, else b.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // extractG45MetadataFallback is the ORIGINAL map[string]interface{} decode,
@@ -701,6 +835,31 @@ func extractG45MetadataFallback(sc *SCClass, str string) {
 			sc.IconURL = varString(v)
 		}
 	}
+	if sc.Image == "" {
+		sc.Image = firstNonEmpty(metaString(meta, "image"), metaString(meta, "backdropImage"))
+	}
+	if sc.AltImage == "" {
+		sc.AltImage = firstNonEmpty(metaString(meta, "alt-image"), metaString(meta, "alt-backdropImage"))
+	}
+	if sc.Audio == "" {
+		sc.Audio = metaString(meta, "audio")
+	}
+	if sc.Video == "" {
+		sc.Video = metaString(meta, "video")
+	}
+	setImagesJSON(sc, str)
+}
+
+// metaString renders meta[key] the way the original map decode does, or ""
+// when the key is absent. Absent and present-but-empty are deliberately
+// indistinguishable: both leave the SCClass field empty, which is what every
+// caller's empty-guard already tests.
+func metaString(meta map[string]interface{}, key string) string {
+	v, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	return varString(v)
 }
 
 func lookupVar(vars []*structures.SCIDVariable, key string) (interface{}, bool) {

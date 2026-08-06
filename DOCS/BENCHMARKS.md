@@ -231,30 +231,50 @@ now avoids entirely.)
 
 ### G45 corpus classify (July 2026)
 
-A real-mainnet corpus is committed under `indexer/testdata/` (45,514 G45-NFT +
-75 G45-C variable snapshots, 8 distinct code bodies); every benchmark iteration
-classifies the ENTIRE corpus, so allocs/op is the exact allocation total of one
-full pass — deterministic, immune to per-op rounding.
+A real-mainnet corpus is committed under `indexer/testdata/`, captured raw from
+`GetSC` at topoheight 7,389,814 — 45,539 NFT-class + 112 G45-C snapshots, see
+`indexer/testdata/corpus_manifest.json`. Every benchmark iteration classifies
+the ENTIRE corpus, so allocs/op is the exact allocation total of one full pass —
+deterministic, immune to per-op rounding.
 
 ```
-BenchmarkClassifyCorpus/Full   before: 1,970,788 allocs/op   79.3 MB/op   ~365 ms
-                               after:        415 allocs/op   ~34 KB/op    ~55 ms   (−99.98% allocs)
+BenchmarkClassifyCorpus/Full   naive hex decode:  91,759 allocs/op   24.7 MB/op   ~127 ms
+                               buffer handover:   46,123 allocs/op   12.4 MB/op   ~121 ms
 ```
+
+**These are not comparable to the figures published before 2026-07-27**
+(1,970,788 → 415 allocs). Those were measured against a corpus whose `metadata`
+values had been hex-DECODED by some step outside the capture. derod hex-encodes
+every DVM `STORE` string, so that fixture let the scanner return zero-copy
+substrings of text the daemon never sends in that form — and the 415 figure was
+never reachable in production. Worse, it hid a real bug: on a live chain the
+extractors were handed hex, parsed nothing, and left `Name`/`Desc`/`IconURL`
+empty for every G45 asset while every gate passed. See `cmd/corpusdump`.
+
+46,123 over 45,651 SCs is ~1.01 allocations per SC, and that is the floor. Hex
+input cannot be aliased: each extracted string is a different encoding from the
+bytes it came from, so it must be materialized exactly once. Getting there took
+handing the decode buffer over via `unsafe.String` instead of copying it a
+second time (`ownedBytesToString`), which halved both allocations and bytes.
 
 Reproduce: `bash scripts/measure_classify.sh` — one JSON line with the
 median-of-5 metric plus the gates: full `indexer` `-race` suite, a golden
-snapshot pinning the full `SCClass` output for all 45,589 SCs byte-identically
+snapshot pinning the full `SCClass` output for all 45,651 SCs byte-identically
 (regeneration is a deliberate human act, never part of an optimization), a
 map/slice path equivalence gate, and an allocs-determinism tripwire.
 
-What got it there: a zero-alloc hand scanner tier for simple metadata shapes
-(zero-copy substrings, tri-state verdict that skips decodes proven to set
-nothing), shared precomputed per-class Tags slices, and a differential fuzz
-gate against the stdlib decode. The residual ~415 is deliberate: unusual
-shapes (escaped values, case-fold keys) fall back to the ORIGINAL
-`map[string]interface{}` decode, kept for exact behavior parity with
-pre-optimization Gnomon (exact-case key matching, whole-blob strictness) —
-the last fraction of the win was traded for provable parity.
+Corpus regeneration is likewise a deliberate operator act: `cmd/corpusdump`
+needs a synced DB and a live daemon, so it cannot run in CI.
+`TestCorpusHoldsRawDaemonShape` is the tripwire that keeps the fixture honest
+between regenerations.
+
+The scanner tier still carries the classify path: zero-copy substrings within a
+decoded blob, a tri-state verdict that skips decodes proven to set nothing, and
+shared precomputed per-class `Tags` slices, all fenced by a differential fuzz
+gate against the stdlib decode. Unusual shapes (escaped values, case-fold keys)
+still fall back to the ORIGINAL `map[string]interface{}` decode, kept for exact
+behavior parity with pre-optimization Gnomon (exact-case key matching,
+whole-blob strictness).
 
 ### TruncateToHeight reorg rollback (July 2026)
 

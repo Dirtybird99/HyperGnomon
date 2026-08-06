@@ -299,6 +299,14 @@ func (idx *Indexer) applyClassifySeedCache(cache *classifySeedCache) error {
 		if scid == "" || meta == nil || meta.Class == "" {
 			continue
 		}
+		// Populate-only, same rule as fastsync's other-classes write: cached
+		// metas are snapshots from an earlier run (often bare — the cache is
+		// saved right after the classify probe, before any variable sweep),
+		// and seeding exists to warm a FRESH store. Overwriting an existing
+		// record can only downgrade it.
+		if existing, err := idx.Store.GetSCIDClass(scid); err == nil && existing != nil {
+			continue
+		}
 		batch.AddClass(scid, meta)
 	}
 	for scid, snapshot := range cache.Variables {

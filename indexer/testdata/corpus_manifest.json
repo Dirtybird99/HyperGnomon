@@ -1,0 +1,27 @@
+{
+  "topoheight": 7389814,
+  "captured_at": "2026-07-27T16:48:44Z",
+  "daemon_version": "3.5.5-142.DEROHE.STARGATE+13082025",
+  "endpoint": "192.168.2.251:10102",
+  "scids_by_class": {
+    "G45-AT": 6,
+    "G45-C": 112,
+    "G45-FAT": 17,
+    "G45-NAME": 0,
+    "G45-NFT": 45516,
+    "T345": 0
+  },
+  "files": {
+    "collections.json.gz": {
+      "entries": 112,
+      "sha256": "f110251541c064ca0a0888d159e7e64739397cfa20fee804c69f4cbf3d3c032b",
+      "bytes": 2096486
+    },
+    "nfts.json.gz": {
+      "entries": 45539,
+      "sha256": "43e93c0553ee9ed8513797dbb7b863739db438daab518a447c7f4d240b62a224",
+      "bytes": 10625772
+    }
+  },
+  "uint64_key_vars_skipped": 0
+}

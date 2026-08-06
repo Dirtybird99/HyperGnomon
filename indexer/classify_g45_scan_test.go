@@ -1,20 +1,26 @@
 package indexer
 
 import (
+	"reflect"
 	"testing"
 )
 
 // These gates prove the H9 scanner tier is behavior-neutral: for EVERY input,
 // extractG45MetadataString (scanner -> struct -> map) must produce the same
-// (Name, Desc, IconURL) as extractG45MetadataFallback (struct -> map), the
-// unchanged oracle. The only bug the scanner can introduce is a false ok=true,
-// so the fuzz target is the load-bearing check; the table pins the deviations
-// we specifically reasoned about, and the "fires" tests stop the differential
-// from being vacuously satisfied by a scanner that never accepts anything.
+// SCClass as extractG45MetadataFallback (struct -> map), the unchanged oracle.
+// The only bug the scanner can introduce is a false ok=true, so the fuzz target
+// is the load-bearing check; the table pins the deviations we specifically
+// reasoned about, and the "fires" tests stop the differential from being
+// vacuously satisfied by a scanner that never accepts anything.
 
 // g45DiffCheck runs both paths from an identical starting SCClass and fails if
-// the resulting triple diverges. Runs against both a fresh class and a
-// header-prefilled class (the empty-guard interaction).
+// the results diverge. Runs against a fresh class and several prefilled ones
+// (the empty-guard interaction).
+//
+// The comparison is DeepEqual over the whole SCClass, deliberately not a
+// hand-listed set of fields: a field-by-field check silently stops covering
+// anything added to the struct later, which is exactly how the media keys
+// could have shipped unverified.
 func g45DiffCheck(t *testing.T, meta string) {
 	t.Helper()
 	pres := []SCClass{
@@ -23,15 +29,23 @@ func g45DiffCheck(t *testing.T, meta string) {
 		{Name: "HDR"},
 		{Desc: "HDRD"},
 		{IconURL: "HDRI"},
+		// Media empty-guards: a prefilled media field must survive both paths
+		// identically, and a partially-filled class must not let one path fill
+		// a sibling the other leaves alone.
+		{Image: "HDRIMG"},
+		{AltImage: "HDRALT"},
+		{Audio: "HDRAUD", Video: "HDRVID"},
+		{ImagesJSON: `{"pre":"set"}`},
+		{Image: "HDRIMG", AltImage: "HDRALT", Audio: "HDRAUD", Video: "HDRVID", ImagesJSON: `{"a":"b"}`},
 	}
 	for _, pre := range pres {
 		got := pre
 		extractG45MetadataString(&got, meta)
 		want := pre
 		extractG45MetadataFallback(&want, meta)
-		if got.Name != want.Name || got.Desc != want.Desc || got.IconURL != want.IconURL {
-			t.Fatalf("scanner/fallback divergence for meta=%q pre=%+v:\n  scanner:  Name=%q Desc=%q Icon=%q\n  fallback: Name=%q Desc=%q Icon=%q",
-				meta, pre, got.Name, got.Desc, got.IconURL, want.Name, want.Desc, want.IconURL)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("scanner/fallback divergence for meta=%q pre=%+v:\n  scanner:  %+v\n  fallback: %+v",
+				meta, pre, got, want)
 		}
 	}
 }
@@ -145,6 +159,35 @@ var g45Adversarial = []string{
 	"{\"na\xc4\xb1me\":\"dotless-i\"}",         // "naıme" (dotless i) — not a fold of name
 	// large-ish attribute block
 	`{"attributes":{"a":"1","b":"2","c":"3","d":"4","e":"5","f":"6","g":"7","h":"8"},"id":9,"image":"ipfs://z","name":"Big #9"}`,
+	// media keys — real mainnet shapes plus the awkward edges, mirroring the
+	// name/desc/icon adversarial cases. The `images` entries are here for the
+	// differential too: both paths route it through g45ScanImagesRaw, so they
+	// must agree on it for every shape (its own oracle gate lives in
+	// TestG45ImagesRawMatchesMapDecode).
+	`{"image":"ipfs://bafy/low/1801.png","name":"Dero Duck #1801"}`,
+	`{"backdropImage":"ipfs://Qm/backdrop.jpg","name":"Coll","description":"d"}`,
+	`{"image":"ipfs://a","backdropImage":"ipfs://b"}`,
+	`{"alt-image":"https://dl/78.webp?dl=1"}`,
+	`{"alt-backdropImage":"https://dl/cards.jpg?dl=1"}`,
+	`{"alt-image":"https://a","alt-backdropImage":"https://b"}`,
+	`{"audio":"ipfs://Qm/282.mp3","video":"ipfs://Qm/T5%20VITAL.mp4"}`,
+	`{"images":{"Sculpture":"ipfs://Qm/hobosculpt93.jpg"}}`,
+	`{"images":{"b":"ipfs://2","a":"ipfs://1"}}`, // key order preserved verbatim
+	`{"images":{}}`,
+	`{"images":"ipfs://string-valued"}`, // string-valued, not an object
+	`{"images":[1,2]}`,
+	`{"images":null}`,
+	`{"image":""}`,
+	`{"image":null}`,
+	`{"image":123}`,
+	`{"image":"esc\/aped"}`,
+	`{"IMAGE":"fold-variant"}`,
+	`{"Backdropimage":"fold-variant"}`,
+	`{"alt-Image":"fold-variant"}`,
+	`{"image":"a","image":"b"}`, // dup: last wins
+	"{\"image\":\"raw\xffbyte\"}",
+	`{"image":"ipfs://x","supply":1e999}`, // whole-blob strictness: sets NOTHING
+	`{"attributes":{"Background":"White"},"id":1801,"image":"ipfs://abc/1801.png","name":"Dero Duck #1801","score":12}`,
 }
 
 func TestG45ScanDifferentialTable(t *testing.T) {
@@ -184,8 +227,13 @@ func TestG45ScanDifferentialCorpus(t *testing.T) {
 		for _, v := range all[i].Vars {
 			if k, ok := v.Key.(string); ok && k == "metadata" {
 				if s, ok := v.Value.(string); ok {
+					// Decode first: the corpus holds derod's raw hex, and the
+					// extractors decode before parsing. Passing hex straight in
+					// makes this gate VACUOUS — both paths see non-JSON, both
+					// set nothing, and they agree on nothing. That is precisely
+					// what TestG45ScanCorpusFireRate exists to catch.
 					blobs++
-					g45DiffCheck(t, s)
+					g45DiffCheck(t, decodeHexIfPrintable(s))
 				}
 			}
 		}
@@ -202,24 +250,45 @@ func TestG45ScanDifferentialCorpus(t *testing.T) {
 // the fallback on purpose.
 func TestG45ScanFires(t *testing.T) {
 	fires := []struct {
-		meta             string
-		name, desc, icon string
+		meta string
+		want g45Fields
 	}{
-		{`{"name":"n"}`, "n", "", ""},
-		{`{"name":"n","description":"d","icon":"i"}`, "n", "d", "i"},
-		{`{"attributes":{"x":"y"},"id":1,"image":"ipfs://z","name":"Real #1"}`, "Real #1", "", ""},
-		{`{}`, "", "", ""},
-		{`{"name":"a{b}","description":"c,d"}`, "a{b}", "c,d", ""},
-		{`{"name":"first","name":"last"}`, "last", "", ""}, // dup string: still fires, last wins
+		{`{"name":"n"}`, g45Fields{name: "n"}},
+		{`{"name":"n","description":"d","icon":"i"}`, g45Fields{name: "n", desc: "d", icon: "i"}},
+		{
+			`{"attributes":{"x":"y"},"id":1,"image":"ipfs://z","name":"Real #1"}`,
+			g45Fields{name: "Real #1", image: "ipfs://z"},
+		},
+		{`{}`, g45Fields{}},
+		{`{"name":"a{b}","description":"c,d"}`, g45Fields{name: "a{b}", desc: "c,d"}},
+		{`{"name":"first","name":"last"}`, g45Fields{name: "last"}}, // dup string: still fires, last wins
+		// Media keys, the shapes that actually occur on mainnet.
+		{
+			`{"backdropImage":"ipfs://b","name":"Coll"}`,
+			g45Fields{name: "Coll", backdropImage: "ipfs://b"},
+		},
+		{
+			`{"alt-image":"https://a","audio":"ipfs://s.mp3","video":"ipfs://v.mp4"}`,
+			g45Fields{altImage: "https://a", audio: "ipfs://s.mp3", video: "ipfs://v.mp4"},
+		},
+		{`{"alt-backdropImage":"https://b"}`, g45Fields{altBackdropImage: "https://b"}},
+		// `images` rides the skip branch, so an object value does NOT force
+		// the fallback — the scanner fires and captures the raw text verbatim.
+		{
+			`{"images":{"Sculpture":"ipfs://x"},"name":"Hobo"}`,
+			g45Fields{name: "Hobo", images: `{"Sculpture":"ipfs://x"}`},
+		},
+		{`{"images":{ "a" : "1" }}`, g45Fields{images: `{ "a" : "1" }`}},
+		{`{"images":{"a":"1"},"images":{"b":"2"}}`, g45Fields{images: `{"b":"2"}`}}, // last wins
 	}
 	for _, f := range fires {
-		n, d, i, ok := g45ScanMeta([]byte(f.meta))
+		got, ok := g45ScanMeta([]byte(f.meta))
 		if !ok {
 			t.Errorf("scanner should FIRE for %q but returned ok=false", f.meta)
 			continue
 		}
-		if n != f.name || d != f.desc || i != f.icon {
-			t.Errorf("scanner %q = (%q,%q,%q), want (%q,%q,%q)", f.meta, n, d, i, f.name, f.desc, f.icon)
+		if got != f.want {
+			t.Errorf("scanner %q =\n  got:  %+v\n  want: %+v", f.meta, got, f.want)
 		}
 	}
 
@@ -234,9 +303,16 @@ func TestG45ScanFires(t *testing.T) {
 		`{"DESCRIPTION":"d"}`,     // upper-case fold variant
 		`123`,                     // non-object
 		"{\"name\":\"raw\xffb\"}", // invalid utf8 target
+		// Media targets obey the same rules as name/desc/icon. `images` is
+		// absent here on purpose: it is NOT a scanner target (its object value
+		// would force every carrying blob to the fallback), so a blob carrying
+		// it still fires — see TestG45ImagesRawMatchesMapDecode.
+		`{"image":["ipfs://a"]}`,       // array-valued target
+		`{"IMAGE":"ipfs://a"}`,         // fold variant of a media target
+		`{"backdropimage":"ipfs://b"}`, // fold variant, differing case
 	}
 	for _, m := range declines {
-		if _, _, _, ok := g45ScanMeta([]byte(m)); ok {
+		if _, ok := g45ScanMeta([]byte(m)); ok {
 			t.Errorf("scanner should DECLINE %q but returned ok=true", m)
 		}
 	}
@@ -252,8 +328,9 @@ func TestG45ScanCorpusFireRate(t *testing.T) {
 		for _, v := range all[i].Vars {
 			if k, ok := v.Key.(string); ok && k == "metadata" {
 				if s, ok := v.Value.(string); ok {
+					blob := decodeHexIfPrintable(s) // corpus holds raw hex
 					total++
-					if _, _, _, ok := g45ScanMeta(readOnlyBytes(s)); ok {
+					if _, ok := g45ScanMeta(readOnlyBytes(blob)); ok {
 						fired++
 					}
 				}

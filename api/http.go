@@ -16,8 +16,11 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/hypergnomon/hypergnomon/eventbus"
 	"github.com/hypergnomon/hypergnomon/indexer"
+	"github.com/hypergnomon/hypergnomon/media"
 	"github.com/hypergnomon/hypergnomon/rpc"
 	"github.com/hypergnomon/hypergnomon/storage"
 	"github.com/hypergnomon/hypergnomon/structures"
@@ -72,6 +75,14 @@ type Server struct {
 	assetCatalogs        map[string]assetCatalogCacheEntry
 	assetCatalogTTL      time.Duration
 	assetCatalogEmptyTTL time.Duration
+
+	// Media cache wiring (see api/media.go). mediaDir empty disables the
+	// endpoint; mediaFetch gates on-demand network retrieval; mediaSF
+	// coalesces concurrent misses on the same file.
+	mediaDir     string
+	mediaFetch   bool
+	mediaFetcher *media.Fetcher
+	mediaSF      singleflight.Group
 }
 
 // NewServer creates a new API server.
@@ -133,6 +144,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/tela/count", s.handleGetTELACount).Methods(http.MethodGet)
 	r.HandleFunc("/api/tela/{scid}/ratings", s.handleGetTELARatings).Methods(http.MethodGet)
 	r.HandleFunc("/api/assets", s.handleGetAssets).Methods(http.MethodGet)
+	r.HandleFunc("/api/media/{scid}", s.handleGetMedia).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/api/assets/{scid}", s.handleGetAsset).Methods(http.MethodGet)
 	r.HandleFunc("/api/initialscidcode", s.handleGetInitialSCIDCode).Methods(http.MethodGet)
 	r.HandleFunc("/api/address/{address}/created-assets", s.handleGetAddressCreatedAssets).Methods(http.MethodGet)
@@ -506,11 +518,20 @@ func (s *Server) handleGetTELA(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// assetCatalogClasses is the default /api/assets result set.
+//
+// G45-C (collections) is included so a client can render a collection's
+// `backdropImage` and group its NFTs. Its absence was invisible while every
+// G45 media field was dropped at classify time, but a collection is an asset
+// contract by every other definition here, and G45 records carry tags
+// ["all","g45"] rather than "asset" — so isAssetMeta's tag branch never
+// reached them either.
 var assetCatalogClasses = []string{
 	"NFA",
 	"G45-NFT",
 	"G45-FAT",
 	"G45-AT",
+	"G45-C",
 	"DERO-ASSET",
 }
 
@@ -526,18 +547,31 @@ type assetCatalogCacheEntry struct {
 }
 
 type assetEntry struct {
-	SCID             string   `json:"scid"`
-	Class            string   `json:"class"`
-	Tags             []string `json:"tags"`
-	Name             string   `json:"name"`
-	Description      string   `json:"description"`
-	IconURL          string   `json:"icon_url"`
-	Owner            string   `json:"owner"`
-	InstallHeight    int64    `json:"install_height"`
-	LastHeight       int64    `json:"last_height"`
-	FirstTouchHeight int64    `json:"first_touch_height,omitempty"`
-	LastTouchHeight  int64    `json:"last_touch_height,omitempty"`
-	TouchCount       int64    `json:"touch_count,omitempty"`
+	SCID        string   `json:"scid"`
+	Class       string   `json:"class"`
+	Tags        []string `json:"tags"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	IconURL     string   `json:"icon_url"`
+	// Media URLs from the asset's on-chain metadata. Omitted when empty so
+	// existing consumers see an unchanged response shape for assets that carry
+	// none. G45 assets populate Image (from `image`, or `backdropImage` on a
+	// collection) rather than IconURL, which their metadata never sets.
+	//
+	// These are URLs, not content: HyperGnomon does not fetch, cache, or proxy
+	// the bytes behind them. Almost all are `ipfs://` and need a gateway or
+	// local node to resolve.
+	Image            string `json:"image,omitempty"`
+	AltImage         string `json:"alt_image,omitempty"`
+	Audio            string `json:"audio,omitempty"`
+	Video            string `json:"video,omitempty"`
+	ImagesJSON       string `json:"images,omitempty"`
+	Owner            string `json:"owner"`
+	InstallHeight    int64  `json:"install_height"`
+	LastHeight       int64  `json:"last_height"`
+	FirstTouchHeight int64  `json:"first_touch_height,omitempty"`
+	LastTouchHeight  int64  `json:"last_touch_height,omitempty"`
+	TouchCount       int64  `json:"touch_count,omitempty"`
 }
 
 func assetClassesForParam(class string) ([]string, bool) {
@@ -562,7 +596,7 @@ func assetCatalogCacheKey(class string) string {
 
 func isAssetClass(class string) bool {
 	switch class {
-	case "NFA", "G45-NFT", "G45-FAT", "G45-AT", "DERO-ASSET":
+	case "NFA", "G45-NFT", "G45-FAT", "G45-AT", "G45-C", "DERO-ASSET":
 		return true
 	default:
 		return false
@@ -620,6 +654,11 @@ func assetEntryFromMeta(scid, owner string, meta *structures.ClassMeta) assetEnt
 		entry.Name = meta.Name
 		entry.Description = meta.Desc
 		entry.IconURL = meta.IconURL
+		entry.Image = meta.Image
+		entry.AltImage = meta.AltImage
+		entry.Audio = meta.Audio
+		entry.Video = meta.Video
+		entry.ImagesJSON = meta.ImagesJSON
 		entry.InstallHeight = meta.InstallHeight
 		entry.LastHeight = meta.LastHeight
 	}

@@ -132,8 +132,9 @@ GET /api/scidprivtx?address=A     Normal (non-SC-invoke) TXs carrying SCID paylo
 GET /api/tela                     All TELA apps with metadata
 GET /api/tela/count               TELA app count (lightweight polling)
 GET /api/tela/{scid}/ratings      On-chain TELA ratings for one SCID (per-rater scores, count, average)
-GET /api/assets                   Asset/NFT catalog (NFA, G45, legacy DERO assets)
-GET /api/assets/{scid}            Asset/NFT metadata for one SCID
+GET /api/assets                   Asset/NFT catalog (NFA, G45 incl. collections, legacy DERO assets)
+GET /api/assets/{scid}            Asset/NFT metadata for one SCID (incl. media URLs)
+GET /api/media/{scid}             Asset media bytes from the local cache (?kind=image|alt|audio|video)
 GET /api/address/{addr}/created-assets  Asset contracts deployed by address
 GET /api/address/{addr}/touched-assets  Asset contracts the address interacted with
 GET /api/address/{addr}/scs       All SCIDs the address interacted with
@@ -145,6 +146,16 @@ GET /tela/{scid}/{path…}          TELA content server (INDEX routing, DOC body
 The `/tela/{scid}/…` endpoint is the content server. It resolves TELA-INDEX routes, fetches referenced TELA-DOC source, strips the `/* … */` body, decompresses `.gz` assets (base64→gunzip), and dispatches DocShard strict parsing when the dURL suffix is `.shard`/`.shards`. With `--tela-verify-sigs`, every response carries `X-TELA-Verify: disabled|unsigned|signed-unverified|passed|failed`.
 
 Asset endpoints are catalog and activity views. True "my held assets" should be wallet-assisted: fetch candidate asset SCIDs from `/api/assets`, then have the wallet check decrypted balances for each SCID at the latest topoheight. `/created-assets` means deployer/registry ownership; `/touched-assets` means interaction history. Neither endpoint claims current wallet balance.
+
+Asset entries carry the media URLs declared on the contract — for G45, from the `metadata` blob — `image` (an NFT's artwork, or a collection's `backdropImage`), `alt_image`, `audio`, `video`, and `images` (the raw JSON object of named secondary artwork). Each is omitted when empty. Note that G45 metadata does not use the `icon` key, so `icon_url` is empty for G45 assets and `image` is the field to render. NFA contracts publish their media as plain variables instead (`fileURL`/`coverURL`), which map to the same `image`/`alt_image` fields.
+
+**These are URLs, not content.** HyperGnomon never fetches, caches, or proxies the bytes behind them — it is an indexer, not a CDN. On current mainnet 45,347 of them are `ipfs://` and 52 are `https`, so a consumer needs a gateway or a local IPFS node to resolve them.
+
+Populating them requires the contract's variables, which turbo mode skips during scan. Run with `--postscan-vars=all`, or call `RefreshClassVars("G45-NFT")` from the Go library, to fill asset metadata; under the default `--postscan-vars=lazy` the class bucket holds the class name alone. This is pre-existing behavior for `Name`/`Desc` too, not specific to media.
+
+**Serving the bytes**: `GET /api/media/{scid}?kind=image|alt|audio|video` serves media from a local fetch-once cache (`--media-dir`). A cache miss returns 404 with the on-chain URL unless `--media-fetch` is enabled, in which case the bytes are fetched via a hedged race — local kubo gateway first (`--ipfs-gateway`), then the surviving public gateways — cached forever (content-addressed = immutable), and served with `immutable` cache headers, `nosniff`, and a CSP sandbox (metadata URLs are attacker-controlled; the proxy refuses non-`ipfs`/`https` schemes outright).
+
+Bulk-archive with `cmd/mediawarm`: it fills the same cache and writes `media-census.json` — a per-root-CID account of what is still retrievable. That census matters: as measured July 2026, most G45 root CIDs have **no** remaining public-gateway copy and many have no DHT provider either. A local [kubo](https://github.com/ipfs/kubo) node is the only route to the non-gateway remainder, and content cached today may be unobtainable tomorrow.
 
 ## 7. WebSocket API
 
@@ -222,9 +233,18 @@ Every number below has a reproducible harness. Hardware, date, daemon endpoint, 
 | `WorkItem_Pool` vs `New` | 2,300 ns / 5.7 KB | 18 ns / 0 B | **127×** |
 | `FlushBatch_100` vs individual writes | 88 µs/record | 6.1 µs/record | **14×** |
 | `FlushBatch` vs 100k-interaction history (heights) | 5,684 µs (blob layout) | 118 µs (composite keys) | **48×, flat in history size** |
-| `ClassifyCorpus/Full` — 45,589 real mainnet G45 SCs, golden-gated (July 2026) | 1,970,788 allocs / 79.3 MB | 415 allocs / 34 KB | **4,749× fewer allocs** |
+| `ClassifyCorpus/Full` — 45,651 real mainnet G45 SCs, golden-gated (July 2026) | 91,759 allocs / 24.7 MB | 46,123 allocs / 12.4 MB | **2× fewer allocs, at the floor** |
 
 Full table with reproduction command, hardware, and methodology: [DOCS/BENCHMARKS.md](DOCS/BENCHMARKS.md).
+
+The `ClassifyCorpus` row was restated on 2026-07-27 and no longer matches
+earlier releases. It previously read `1,970,788 → 415 allocs`, measured against
+a corpus whose `metadata` had been hex-decoded before it was committed. derod
+hex-encodes every DVM `STORE` string, so that figure was never reachable in
+production — and the unrepresentative fixture concealed a live bug in which G45
+metadata extraction silently produced nothing. The corpus is now captured raw
+via `cmd/corpusdump`; 46,123 allocations over 45,651 SCs is ~1.01 per SC, which
+is the floor for hex input.
 
 **TELA correctness**: content server output is byte-identical (SHA256) to civilware/tela `parseDocCode` for `.html`, `.js`, `.css`, `.gz`, and DocShard paths. Live-fixture test: `api/tela_content_test.go`.
 

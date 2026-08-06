@@ -908,8 +908,27 @@ func (idx *Indexer) postScanVariableFetch() {
 					}
 					vars := parseSCVariables(result)
 					if len(vars) > 0 {
+						// Re-classify off the freshly fetched vars. Turbo's
+						// scan-time AddClass ran with nil vars (code only), so
+						// without this the sweep pays for every GetSC and then
+						// throws away the only metadata those vars carry —
+						// Name/Desc/IconURL and the G45 media URLs all stay
+						// empty. Same shape as refreshClassMetaOnInvoke: keep
+						// the code-derived class, refresh the var-derived
+						// fields, preserve InstallHeight.
+						// One height for BOTH writes. ClassMeta.LastHeight is
+						// the key readers use to locate the matching snapshot,
+						// and GetSCIDVariableDetailsAtHeight builds an EXACT
+						// "<scid>:<height>" key with no floor scan — so a
+						// LastHeight that disagrees with the height the vars
+						// were written at silently resolves to nothing.
+						h := idx.ChainHeight.Load()
+						meta := idx.reclassifyFromVars(scid, vars, h)
 						mu.Lock()
-						batch.AddVariables(scid, idx.ChainHeight.Load(), vars)
+						batch.AddVariables(scid, h, vars)
+						if meta != nil {
+							batch.AddClass(scid, meta)
+						}
 						mu.Unlock()
 					}
 					return nil
@@ -924,6 +943,31 @@ func (idx *Indexer) postScanVariableFetch() {
 	}
 	storage.PutWriteBatch(batch)
 	logger.Info("Post-scan variable fetch complete")
+}
+
+// reclassifyFromVars rebuilds an SCID's ClassMeta from a variable snapshot,
+// keeping the class that was derived from SC code at install time. Returns nil
+// when the record should be left alone.
+//
+// Safe for concurrent use: it only reads the store (bbolt View) and returns a
+// fresh record; the caller serializes the batch write.
+//
+// The nil returns are the important part. Classifying var-only (no SC code)
+// can only ever produce UNKNOWN, and an UNKNOWN record would overwrite a good
+// install-time class permanently — the same trap documented on
+// refreshClassMetaOnInvoke. So a read error or a missing prior record means
+// "skip", never "reclassify from scratch".
+// height must be the SAME height the caller writes the variable snapshot at —
+// it becomes ClassMeta.LastHeight, which is how readers find that snapshot.
+// Only InstallHeight is carried forward; this is a refresh, not an install.
+// Matches refreshClassMetaOnInvoke and the fastsync/tela_refresher sites.
+func (idx *Indexer) reclassifyFromVars(scid string, vars []*structures.SCIDVariable, height int64) *structures.ClassMeta {
+	existing, err := idx.Store.GetSCIDClass(scid)
+	if err != nil || existing == nil {
+		return nil
+	}
+	sc := ClassifySCVarsWithClass(scid, existing.Class, vars)
+	return classMetaFrom(&sc, existing.InstallHeight, height)
 }
 
 // processSCTx handles a smart contract transaction.
@@ -986,11 +1030,7 @@ func (idx *Indexer) processSCTx(tx *transaction.Transaction, txInfo rpc.Tx_Relat
 			// Classify from code only (turbo skips variable fetch).
 			code := argString(scArgs, "SC_CODE", rpc.DataString)
 			sc := ClassifySC(scid, code, nil)
-			batch.AddClass(scid, &structures.ClassMeta{
-				Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
-				DURL: sc.DURL, Version: sc.Version,
-				InstallHeight: height, LastHeight: height,
-			})
+			batch.AddClass(scid, classMetaFrom(&sc, height, height))
 			if idx.shouldPersistCode(sc.Class) {
 				batch.AddSCCode(scid, height, code)
 			}
@@ -1040,6 +1080,33 @@ func scidArgString(v interface{}) string {
 		return ""
 	default:
 		return fmt.Sprintf("%v", x)
+	}
+}
+
+// classMetaFrom projects a classifier result onto the stored ClassMeta record.
+//
+// Every AddClass site funnels through here on purpose. The projection used to
+// be an inline struct literal repeated at four call sites, which meant adding a
+// field to SCClass populated it on whichever paths the author remembered and
+// silently dropped it on the rest — a bug with no failing test, because each
+// path is exercised by a different sync mode. One function, one place to keep
+// in sync with SCClass.
+func classMetaFrom(sc *SCClass, installHeight, lastHeight int64) *structures.ClassMeta {
+	return &structures.ClassMeta{
+		Class:         sc.Class,
+		Tags:          sc.Tags,
+		Name:          sc.Name,
+		Desc:          sc.Desc,
+		IconURL:       sc.IconURL,
+		DURL:          sc.DURL,
+		Version:       sc.Version,
+		Image:         sc.Image,
+		AltImage:      sc.AltImage,
+		Audio:         sc.Audio,
+		Video:         sc.Video,
+		ImagesJSON:    sc.ImagesJSON,
+		InstallHeight: installHeight,
+		LastHeight:    lastHeight,
 	}
 }
 
@@ -1136,11 +1203,7 @@ func (idx *Indexer) handleInstallSC(scid, sender, entrypoint string, height int6
 		Owner: sender, Entrypoint: entrypoint, Fees: fees,
 	})
 	sc := ClassifySCVars(scid, code, scVars)
-	batch.AddClass(scid, &structures.ClassMeta{
-		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
-		DURL: sc.DURL, Version: sc.Version,
-		InstallHeight: height, LastHeight: height,
-	})
+	batch.AddClass(scid, classMetaFrom(&sc, height, height))
 	if idx.shouldPersistCode(sc.Class) {
 		batch.AddSCCode(scid, height, code)
 	}
@@ -1329,11 +1392,7 @@ func (idx *Indexer) refreshClassMetaOnInvoke(scid string, height int64, scVars [
 		// indexed): classify code-less as before.
 		sc = ClassifySCVars(scid, "", scVars)
 	}
-	batch.AddClass(scid, &structures.ClassMeta{
-		Class: sc.Class, Tags: sc.Tags, Name: sc.Name, Desc: sc.Desc, IconURL: sc.IconURL,
-		DURL: sc.DURL, Version: sc.Version,
-		InstallHeight: installH, LastHeight: height,
-	})
+	batch.AddClass(scid, classMetaFrom(&sc, installH, height))
 }
 
 // processNormalTx handles a normal transaction with SCID payload.
@@ -1515,17 +1574,7 @@ func (idx *Indexer) IndexSingleSCID(scid string, varsonly, skipfsrecheck bool) (
 		}
 	}
 
-	meta := &structures.ClassMeta{
-		Class:         sc.Class,
-		Tags:          sc.Tags,
-		Name:          sc.Name,
-		Desc:          sc.Desc,
-		IconURL:       sc.IconURL,
-		DURL:          sc.DURL,
-		Version:       sc.Version,
-		InstallHeight: installH,
-		LastHeight:    height,
-	}
+	meta := classMetaFrom(&sc, installH, height)
 
 	// Build a one-shot batch — same shape as the scan-loop path so we benefit
 	// from the same atomic commit semantics (all or nothing).

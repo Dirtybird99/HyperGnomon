@@ -22,7 +22,10 @@ import (
 // correctness gates). It is IMMUTABLE to optimization experiments: a loop
 // that can edit its own ruler always wins. The paired benchmark lives in
 // classify_corpus_bench_test.go; both feed off the real-mainnet G45 corpus
-// committed under testdata/ (45,514 G45-NFT + 75 G45-C snapshots).
+// committed under testdata/ (45,539 NFT-class + 112 G45-C snapshots, captured
+// raw from GetSC at topoheight 7,389,814 — see corpus_manifest.json and
+// cmd/corpusdump). Values are stored exactly as derod returns them, hex and
+// all; TestCorpusHoldsRawDaemonShape guards that.
 
 // updateClassifyGolden rewrites testdata/classify_golden.json.gz from the
 // current classifier output:
@@ -81,7 +84,7 @@ func corpusAll(tb testing.TB) []corpusEntry {
 // loadCorpusFile stream-decodes one gzipped SCID->snapshot JSON map. The raw
 // JSON (108MB for nfts) never exists in memory as one blob: entries decode
 // one at a time. The "C" hex code decodes once per DISTINCT body (the corpus
-// has 8 across 45,589 entries) so template NFTs share one backing string.
+// has a handful across 45,651 entries) so template NFTs share one backing string.
 func loadCorpusFile(path string) ([]corpusEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -217,7 +220,7 @@ func gunzipFile(tb testing.TB, path string) []byte {
 }
 
 // TestClassifyCorpusGolden is the primary correctness gate for classify
-// optimizations: the full SCClass output over all 45,589 real SCs must stay
+// optimizations: the full SCClass output over all 45,651 real SCs must stay
 // byte-identical to the committed snapshot. Comparison is on DECOMPRESSED
 // bytes only — gzip output is not stable across Go releases.
 func TestClassifyCorpusGolden(t *testing.T) {

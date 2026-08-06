@@ -579,17 +579,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 							// probe, so seed it and let extractClassVars pull DURL/
 							// Version/DocType/Mods in the same walk (audit #8).
 							sc := ClassifySCVarsWithClass(item.scids[i], item.class, vars)
-							meta := &structures.ClassMeta{
-								Class:         sc.Class,
-								Tags:          sc.Tags,
-								Name:          sc.Name,
-								Desc:          sc.Desc,
-								IconURL:       sc.IconURL,
-								DURL:          sc.DURL,
-								Version:       sc.Version,
-								InstallHeight: chainHeight,
-								LastHeight:    chainHeight,
-							}
+							meta := classMetaFrom(&sc, chainHeight, chainHeight)
 							phase2ClassifyNanos.Add(time.Since(tClassify).Nanoseconds())
 
 							varMu.Lock()
@@ -856,6 +846,17 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 			LastHeight:    chainHeight,
 		}
 		for _, scid := range scids {
+			// Populate-only, never clobber. This meta is BARE — class + tags,
+			// no Name/Desc/media — and fastsync runs on every startup. Blind
+			// writes here silently wiped every G45 record's metadata on
+			// restart, undoing a --postscan-vars=all sweep or an operator's
+			// RefreshClassVars: caught live 2026-07-27 when a restarted node
+			// served an asset catalog whose every media field had reverted to
+			// empty. A record that already exists is always at least as good
+			// as this placeholder.
+			if existing, err := idx.Store.GetSCIDClass(scid); err == nil && existing != nil {
+				continue
+			}
 			varMu.Lock()
 			varBatch.AddClass(scid, meta)
 			varMu.Unlock()

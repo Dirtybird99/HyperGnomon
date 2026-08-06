@@ -4,6 +4,71 @@ All notable changes to HyperGnomon. Dates in UTC.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres to [SemVer](https://semver.org/) from v1.0 onward.
 
+## [Unreleased]
+
+### Added
+
+- **NFA media extraction.** The classifier now reads the Artificer NFA standard's direct media variables — `fileURL` → `image`, `coverURL` → `alt_image` (live-sampled: 21/21 NFAs carry both, largely GitHub-hosted) — plus the free-form `image_url` token-logo variable (8 bridged-token contracts in the corpus). All 2,626 mainnet NFAs now surface artwork on `/api/assets` and `/api/media`, and `cmd/mediawarm` warms them by default. GitHub `blob/` page URLs are rewritten to their `raw.githubusercontent.com` form at fetch time so the cache holds image bytes, not repository HTML.
+
+- **Wayback Machine recovery in `cmd/mediawarm`.** The G45 minting platform's own gateway (`ipfs.deronfts.com`) is DNS-dead, but the Internet Archive crawled it: 497 unique image captures across 95 root CIDs, retrievable verbatim via `id_` snapshot URLs (verified byte-for-byte against a 1.1 MB PNG). After the live pass, mediawarm queries the CDX index for each still-lost root — serial, politely paced — and lands recovered bytes at the exact cache path `/api/media` serves. The census marks these `via: wayback`, and now also inventories every G45-C collection's off-chain `links` as the manual follow-up list for content nothing automated can reach.
+
+- **`GET /api/media/{scid}` — asset media served from a local fetch-once cache.** New `media` package: deterministic URL→path mapping (the filesystem is the index), hedged multi-gateway race (local kubo first via `--ipfs-gateway`, then the surviving public gateways, 800 ms hedging, 429 cooldown, 50 MB cap, atomic temp+rename writes), immutable/`nosniff`/CSP-sandboxed responses. On-demand fetching is opt-in (`--media-fetch`); default serves pre-cached bytes only, so the API cannot be used as an open proxy. Non-`ipfs`/`https` schemes in on-chain metadata are refused — those URLs are attacker-controlled strings.
+
+- **`cmd/mediawarm`** — bulk archival warm + availability census. Groups all media URLs by root CID (most-referenced first), probes each root via gateways, consults the local kubo DHT (`routing/findprovs`, bounded) when gateways miss, fetches everything reachable into the shared cache, and writes `media-census.json`. Motivated by measurement, not hypothetical rot: as of 2026-07-27, 7 of the top 10 corpus roots (~19k images) had **no live public-gateway copy**, and spot-checked gateway-MISS roots had **zero DHT providers** — content cached today may be unobtainable tomorrow.
+
+  First full census (2026-07-27, mainnet, local kubo + 4 public gateways): of **45,740 media files across 2,352 root CIDs, 12,600 (27.5%, 8.07 GB) were retrievable; 2,131 roots holding 32,544 files (71%) had no reachable source anywhere** — including five of the six largest collections (Dero Heist 4,164, 4,139/3,354/3,037/2,647-file roots). The Dero Ducks root (3,379) is known to survive on Pinata's gateway but was rate-limited during the run; re-running mediawarm resumes for free and only touches misses.
+
+- G45 media URLs on the asset API. `ClassifySC` now lifts `image`, `backdropImage`, `alt-image`, `alt-backdropImage`, `audio`, `video`, and `images` out of the G45 `metadata` blob into new `ClassMeta` fields, surfaced as `image` / `alt_image` / `audio` / `video` / `images` on `/api/assets` and `/api/assets/{scid}` (omitted when empty). These are **URLs only** — HyperGnomon does not fetch, cache, or proxy the bytes, and 99.9% of them are `ipfs://`.
+
+  Motivation: the extractor only ever read `icon`, which appears **zero times** across the 45,651-SC mainnet corpus, so `ClassMeta.IconURL` — the only media-ish field the asset API exposed — was empty for every G45 asset. `image` is present on 45,414 of 45,539 NFT-class contracts and `backdropImage` on 87 of 112 collections.
+
+  `ImagesJSON` carries the `images` object as **verbatim on-chain JSON text**, not re-encoded: key order and spacing are whatever the minter wrote.
+
+- `G45-C` (collections) added to the `/api/assets` catalog and to `isAssetClass`, so a collection's `backdropImage` is reachable. This grows the default `/api/assets` response by the ~75 collection contracts on mainnet.
+
+- The new fields ride the `/ws` class-assignment event automatically — `publishBatchEvents` sends the whole `ClassMeta` as the event payload.
+
+### Changed
+
+- `ClassMeta` typed v1 encoding gained an optional five-string media tail, appended after `Version` with **no tag bump**. Forward-compat: the v1 reader always discarded trailing bytes, so a pre-media binary reads a media record. Backward-compat: a truncated or absent tail now decodes as empty rather than `ErrInvalidClassMeta`. Records without media encode byte-identically to before, so stored records and size benchmarks are untouched.
+
+- Turbo's post-scan variable sweep (`--postscan-vars=all`) now re-classifies from the variables it fetches instead of discarding them. Turbo's scan-time classify runs with nil vars (code only), so previously the sweep paid for every `GetSC` and still left `Name`/`Desc`/`IconURL` empty for non-TELA classes. Fixes pre-existing empty G45/NFA metadata, not just the new media fields.
+
+### Fixed
+
+- **Fastsync no longer wipes populated asset metadata on restart.** Fastsync's "other classes" path blind-wrote a bare ClassMeta (class + tags only) over every non-TELA record on every startup, and the classify seed cache's store-seeding did the same with cached (usually bare) snapshots — so a `--postscan-vars=all` sweep or an operator's `RefreshClassVars` was silently undone by the next restart. Caught live: a restarted node served an asset catalog whose every `name` and media field had reverted to empty. Both sites are now populate-only — they write a record only when none exists, since an existing record is always at least as good as the bare placeholder.
+
+- **The G45 `metadata` variable is now hex-decoded before parsing.** derod returns `STORE`'d strings hex-encoded, and every other string var in `extractClassVars` goes through `decodeHexIfPrintable` — `metadata` did not, at either read site. The JSON extractors were handed hex, parsed nothing, and left `Name`/`Desc`/`IconURL` empty for every G45 asset on a live chain. This was invisible to the entire suite because `indexer/testdata/nfts.json.gz` holds `metadata` already decoded, a shape the daemon never sends; only a live sync exposed it.
+
+- Every `ClassMeta` construction site now funnels through one `classMetaFrom` projection. The projection had been copy-pasted across seven sites in `indexer.go`, `fastsync.go`, and `tela_refresher.go`, so adding a field to `SCClass` populated it only on the paths the author remembered — with no failing test, because each path belongs to a different sync mode.
+
+- `reclassifyFromVars` wrote a `ClassMeta.LastHeight` that disagreed with the height its paired `AddVariables` used. `GetSCIDVariableDetailsAtHeight` builds an exact `"<scid>:<height>"` key with no floor scan, so the snapshot the post-scan sweep had just written was unreachable.
+
+- **The classify corpus is regenerated from raw `GetSC` output** and no longer holds decoded values. New `cmd/corpusdump` enumerates G45 SCIDs from a synced DB and captures every variable verbatim at one pinned topoheight (7,389,814: 45,539 NFT-class + 112 G45-C, recorded in `indexer/testdata/corpus_manifest.json`). The previous fixture held `metadata` decoded in both files and `type` decoded in `nfts.json.gz` — a shape derod never sends, which is why the hex bug above passed every gate.
+
+  The re-capture is verified faithful rather than merely different: across all 45,586 SCIDs present in both the old and new corpora, `ClassifySCVars` output is **identical**. `TestCorpusHoldsRawDaemonShape` now pins the hex shape so the fixture cannot drift back.
+
+  Three corpus-iterating tests had to start decoding before parsing. `TestG45ScanDifferentialCorpus` in particular was **vacuous** on hex input — both paths saw non-JSON, set nothing, and agreed on nothing; `TestG45ScanCorpusFireRate` is what caught it.
+
+### Changed (benchmarks)
+
+- **`BenchmarkClassifyCorpus/Full` is rebased and is not comparable to earlier releases.** The published `1,970,788 → 415 allocs` was measured on the decoded fixture, where the scanner could return zero-copy substrings of text the daemon never sends in that form; 415 was never reachable in production. Against the raw corpus the honest figures are **91,759 allocs / 24.7 MB**, cut to **46,123 allocs / 12.4 MB** by handing the hex-decode buffer over via `unsafe.String` instead of copying it (`ownedBytesToString`). That is ~1.01 allocations per SC — the floor, since hex input cannot be aliased.
+
+### Verified
+
+Against a DERO mainnet daemon at height 7,389,740 (`--fastsync --turbo --postscan-vars=all`, 50,245 SCIDs, 77s sweep), both on a fresh DB and on a DB written by the previous binary (the mixed-version upgrade path):
+
+| | `name` | `icon_url` | `image` | `alt_image` | `audio` | `video` | `images` |
+|---|---|---|---|---|---|---|---|
+| G45-NFT (45,516) | 45,503 | **0** | 45,401 | 239 | 295 | 148 | 23 |
+| G45-C (112) | 88 | **0** | 87 | 2 | 0 | 0 | 0 |
+
+`icon_url` is zero across all 45,628 G45 assets — the premise of the change. The media counts match the independently-derived corpus oracle exactly (`image` differs by the 2 NFTs minted since the corpus snapshot).
+
+### Performance
+
+- Adding the media fields costs nothing on the classify path. `images` is routed through the scanner's **skip** branch rather than made a target key — its value is an object, and a non-string target value forces the whole blob down the fallback map decode (measured on the pre-regeneration fixture: +1,111 allocs, +62 KB, for the 23 blobs that carry it). The skip branch has already walked the value's extent, so capturing the raw text is free. Absolute figures for this benchmark moved when the corpus was regenerated — see *Changed (benchmarks)* above; the media fields are not what moved them.
+
 ## [1.1.0] — 2026-06-29
 
 Pluggable storage backends + a large allocation-reduction pass, with a true civilware/Gnomon drop-in for HOLOGRAM.
