@@ -7,7 +7,7 @@ require (
 	github.com/deroproject/derohe v0.0.0-20230604143809-765b2db1f482
 	github.com/deroproject/graviton v0.0.0-20220130070622-2c248a53b2e1
 	github.com/gorilla/mux v1.8.1
-	github.com/gorilla/websocket v1.5.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/sirupsen/logrus v1.9.3
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.etcd.io/bbolt v1.3.6
